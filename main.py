@@ -143,7 +143,11 @@ class ExperienceBuffer:
         self.capacity=capacity
         self.lock=threading.Lock()
         self.data=[]
-        self.meta_log=os.path.join(self.manager.experience_dir,"exp.jsonl")
+        self.meta_log=""
+        self.refresh_paths()
+    def refresh_paths(self):
+        with self.lock:
+            self.meta_log=os.path.join(self.manager.experience_dir,"exp.jsonl")
     def add(self,frame_img,action,source,metrics,hero_dead,cooldowns,window_rect):
         ts=time.time()
         fname=os.path.join(self.manager.experience_dir,str(int(ts*1000))+".png")
@@ -552,7 +556,56 @@ def get_window_rect(hwnd):
     rect=win32gui.GetWindowRect(hwnd)
     return rect
 def window_visible(hwnd):
-    return hwnd is not None and win32gui.IsWindowVisible(hwnd) and not win32gui.IsIconic(hwnd)
+    if hwnd is None:
+        return False
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+    except:
+        return False
+    if not win32gui.IsWindowVisible(hwnd):
+        return False
+    if win32gui.IsIconic(hwnd):
+        return False
+    try:
+        rect=win32gui.GetWindowRect(hwnd)
+    except:
+        return False
+    if rect[2]<=rect[0] or rect[3]<=rect[1]:
+        return False
+    width=rect[2]-rect[0]
+    height=rect[3]-rect[1]
+    target_root=win32gui.GetAncestor(hwnd,win32con.GA_ROOT)
+    samples=[(0.5,0.5),(0.2,0.2),(0.8,0.2),(0.2,0.8),(0.8,0.8)]
+    for sx,sy in samples:
+        px=int(rect[0]+width*sx)
+        py=int(rect[1]+height*sy)
+        try:
+            top=win32gui.WindowFromPoint((px,py))
+            top_root=win32gui.GetAncestor(top,win32con.GA_ROOT) if top else None
+        except:
+            top_root=None
+        if top_root not in [target_root,hwnd]:
+            try:
+                ex=win32gui.GetWindowLong(top_root,win32con.GWL_EXSTYLE)
+            except:
+                ex=0
+            if (ex&win32con.WS_EX_TRANSPARENT)==0 or (ex&win32con.WS_EX_LAYERED)==0:
+                return False
+    try:
+        cloaked=ctypes.c_int()
+        if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd,14,ctypes.byref(cloaked),ctypes.sizeof(cloaked))==0 and cloaked.value!=0:
+            return False
+    except:
+        pass
+    try:
+        visible_rect=wintypes.RECT()
+        if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd,9,ctypes.byref(visible_rect),ctypes.sizeof(visible_rect))==0:
+            if max(0,visible_rect.right-visible_rect.left)==0 or max(0,visible_rect.bottom-visible_rect.top)==0:
+                return False
+    except:
+        pass
+    return True
 class AppState:
     def __init__(self,file_manager,agent,buffer):
         self.lock=threading.Lock()
@@ -654,9 +707,9 @@ class InputTracker:
         self.app_state=app_state
         self.last_action=None
         self.lock=threading.Lock()
-        self.left_down=False
-        self.drag_path=[]
         self.left_labels=["移动轮盘"]
+        self.button_paths={mouse.Button.left:[],mouse.Button.right:[],mouse.Button.middle:[]}
+        self.button_state=set()
         self.listener_mouse=mouse.Listener(on_click=self.on_click,on_move=self.on_move,on_scroll=self.on_scroll)
         self.listener_keyboard=keyboard.Listener(on_press=self.on_key_press)
         self.listener_mouse.start()
@@ -684,35 +737,51 @@ class InputTracker:
                 return m
         return None
     def on_click(self,x,y,button,pressed):
-        if button==mouse.Button.left:
-            if pressed:
-                if self.in_window(x,y):
-                    self.app_state.mark_user_input()
-                    self.left_down=True
-                    self.drag_path=[(x,y,time.time())]
-            else:
-                if self.left_down:
-                    self.app_state.mark_user_input()
-                    with self.app_state.lock:
-                        rect=self.app_state.window_rect
-                    marker=self.find_marker_by_pos(x,y)
-                    label=marker.label if marker else None
-                    hand="left" if (label in self.left_labels) else "right"
-                    if hand=="left":
-                        aid=random.randint(0,15)
-                    else:
-                        aid=random.randint(0,31)
-                    a={"type":"drag" if len(self.drag_path)>1 else "click","start":self.drag_path[0] if self.drag_path else (x,y,time.time()),"end":(x,y,time.time()),"label":label,"action_id":aid,"hand":hand,"pos":(x,y)}
-                    with self.lock:
-                        self.last_action=a
-                    self.drag_path=[]
-                    self.left_down=False
-    def on_move(self,x,y):
-        if self.left_down:
+        tracked=button in [mouse.Button.left,mouse.Button.right,mouse.Button.middle]
+        if pressed:
             if self.in_window(x,y):
-                self.drag_path.append((x,y,time.time()))
+                self.app_state.mark_user_input()
+                if tracked:
+                    self.button_state.add(button)
+                    self.button_paths[button]=[(x,y,time.time())]
+        else:
+            if tracked and button in self.button_state:
+                self.app_state.mark_user_input()
+                path=self.button_paths.get(button,[])
+                start=path[0] if path else (x,y,time.time())
+                end=(x,y,time.time())
+                marker=self.find_marker_by_pos(x,y)
+                label=marker.label if marker else None
+                if button==mouse.Button.left and label in self.left_labels:
+                    hand="left"
+                    aid=random.randint(0,15)
+                else:
+                    hand="right"
+                    aid=random.randint(0,31)
+                action_type="drag" if len(path)>1 else "click"
+                a={"type":action_type,"start":start,"end":end,"label":label,"action_id":aid,"hand":hand,"pos":(x,y)}
+                with self.lock:
+                    self.last_action=a
+                self.button_state.discard(button)
+                self.button_paths[button]=[]
+            elif not pressed and self.in_window(x,y):
+                self.app_state.mark_user_input()
+    def on_move(self,x,y):
+        inside=self.in_window(x,y)
+        if inside:
+            self.app_state.mark_user_input()
+        if self.button_state:
+            t=time.time()
+            for btn in list(self.button_state):
+                if btn not in self.button_paths:
+                    self.button_paths[btn]=[]
+                self.button_paths[btn].append((x,y,t))
     def on_scroll(self,x,y,dx,dy):
-        pass
+        if self.in_window(x,y):
+            self.app_state.mark_user_input()
+            a={"type":"scroll","delta":(dx,dy),"pos":(x,y),"label":None,"action_id":None,"hand":"right"}
+            with self.lock:
+                self.last_action=a
     def on_key_press(self,key):
         try:
             if key==keyboard.Key.esc:
@@ -1033,6 +1102,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.app_state.overlay.sync_with_window()
     def on_save_config(self):
         if self.app_state.mode==Mode.CONFIGURING:
+            reply=QtWidgets.QMessageBox.question(self,"确认保存","确认保存当前配置？",QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
+            if reply!=QtWidgets.QMessageBox.Yes:
+                return
             if self.app_state.overlay:
                 self.app_state.overlay.set_config_mode(False)
             self.saveConfigBtn.setEnabled(False)
@@ -1059,6 +1131,7 @@ class MainWindow(QtWidgets.QMainWindow):
         d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
         if d:
             self.app_state.file_manager.move_dir(d)
+            self.app_state.buffer.refresh_paths()
     def start_training_threads(self):
         if self.app_state.left_thread is None or not self.app_state.left_thread.is_alive():
             self.app_state.left_thread=LeftHandThread(self.app_state)
