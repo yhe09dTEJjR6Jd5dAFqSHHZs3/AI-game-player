@@ -68,13 +68,30 @@ class AAAFileManager:
                 torch.save({},self.neuro_model_path)
     def move_dir(self,new_parent):
         with self.lock:
-            old_base=self.base_path
-            new_base=os.path.join(new_parent,"AAA")
-            if os.path.abspath(new_base)==os.path.abspath(old_base):
+            old_base=os.path.abspath(self.base_path)
+            new_base=os.path.abspath(new_parent)
+            if new_base==old_base:
+                return old_base,new_base
+            try:
+                common=os.path.commonpath([new_base,old_base])
+            except ValueError:
+                common=None
+            if common==old_base and new_base!=old_base:
                 return old_base,old_base
-            if os.path.exists(new_base):
-                shutil.rmtree(new_base)
-            shutil.move(old_base,new_base)
+            os.makedirs(new_base,exist_ok=True)
+            for name in os.listdir(old_base):
+                src=os.path.join(old_base,name)
+                dst=os.path.join(new_base,name)
+                if os.path.exists(dst):
+                    if os.path.isdir(dst):
+                        shutil.rmtree(dst)
+                    else:
+                        os.remove(dst)
+                shutil.move(src,new_base)
+            try:
+                shutil.rmtree(old_base)
+            except:
+                pass
             self.base_path=new_base
             self.ensure_structure()
             self.update_config_path()
@@ -548,13 +565,32 @@ class OverlayWindow(QtWidgets.QWidget):
                 return m
         return None
     def sync_with_window(self):
-        if self.app_state.hwnd is None:
+        hwnd=self.app_state.hwnd
+        if hwnd is None:
+            self.hide()
+            for m in self.markers:
+                m.hide()
             return
-        rect=get_window_rect(self.app_state.hwnd)
+        rect=get_window_rect(hwnd)
         x,y,w,h=rect[0],rect[1],rect[2]-rect[0],rect[3]-rect[1]
         self.setGeometry(x,y,w,h)
         for m in self.markers:
             m.update_geometry_from_parent()
+        visible=window_visible(hwnd)
+        if not visible:
+            for m in self.markers:
+                m.hide()
+            if self.isVisible():
+                self.hide()
+            return
+        if not self.isVisible():
+            self.show()
+        for m in self.markers:
+            if self.config_mode:
+                if not m.isVisible():
+                    m.show()
+            else:
+                m.hide()
     def set_config_mode(self,enabled):
         self.config_mode=enabled
         if enabled:
@@ -562,14 +598,13 @@ class OverlayWindow(QtWidgets.QWidget):
             self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
             for m in self.markers:
                 m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
-                m.show()
         else:
             self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
             self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
             for m in self.markers:
                 m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
                 m.hide()
-        self.show()
+        self.sync_with_window()
     def add_marker(self,label,color):
         m=MarkerWidget(self,label,color,0.5,0.5,0.5,0.05)
         self.markers.append(m)
@@ -1203,18 +1238,22 @@ class MainWindow(QtWidgets.QMainWindow):
             reply=QtWidgets.QMessageBox.question(self,"确认保存","确认保存当前配置？",QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
             if reply!=QtWidgets.QMessageBox.Yes:
                 return
-            if self.app_state.overlay:
-                self.app_state.overlay.set_config_mode(False)
+            overlay=self.app_state.overlay
+            if overlay:
+                overlay.set_config_mode(False)
             self.saveConfigBtn.setEnabled(False)
             self.addMarkerBtn.setEnabled(False)
             self.delMarkerBtn.setEnabled(False)
+            if overlay:
+                overlay.sync_with_window()
+                self.app_state.file_manager.save_markers(overlay.get_marker_data(),self.app_state.window_rect)
+            QtWidgets.QMessageBox.information(self,"已保存","配置已保存")
+            self.app_state.mark_user_input()
             self.app_state.set_mode(Mode.LEARNING)
             self.modeLabel.setText("模式:学习")
             self.app_state.recording=True
-            if self.app_state.overlay:
-                self.app_state.overlay.sync_with_window()
-                self.app_state.file_manager.save_markers(self.app_state.overlay.get_marker_data(),self.app_state.window_rect)
-            QtWidgets.QMessageBox.information(self,"已保存","配置已保存")
+            if overlay:
+                overlay.sync_with_window()
     def on_add_marker(self):
         if self.app_state.overlay:
             tpl=self.marker_templates[self.marker_template_idx%len(self.marker_templates)]
