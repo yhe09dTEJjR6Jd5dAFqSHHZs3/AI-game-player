@@ -51,6 +51,7 @@ class AAAFileManager:
             self.vision_model_path=os.path.join(self.base_path,"vision_model.pt")
             self.left_model_path=os.path.join(self.base_path,"left_hand_model.pt")
             self.right_model_path=os.path.join(self.base_path,"right_hand_model.pt")
+            self.neuro_model_path=os.path.join(self.base_path,"neuro_module.pt")
             if not os.path.exists(self.config_path):
                 default_cfg={"markers":[],"aaa_path":self.base_path}
                 with open(self.config_path,"w",encoding="utf-8") as f:
@@ -61,6 +62,8 @@ class AAAFileManager:
                 torch.save({},self.left_model_path)
             if not os.path.exists(self.right_model_path):
                 torch.save({},self.right_model_path)
+            if not os.path.exists(self.neuro_model_path):
+                torch.save({},self.neuro_model_path)
     def move_dir(self,new_parent):
         with self.lock:
             new_base=os.path.join(new_parent,"AAA")
@@ -104,12 +107,13 @@ class AAAFileManager:
                     for m in cfg.get("markers",[]):
                         out.append(m)
             return out
-    def save_models(self,vision,left,right):
+    def save_models(self,vision,left,right,neuro):
         with self.lock:
             torch.save(vision.state_dict(),self.vision_model_path)
             torch.save(left.state_dict(),self.left_model_path)
             torch.save(right.state_dict(),self.right_model_path)
-    def load_models(self,vision,left,right):
+            torch.save(neuro.state_dict(),self.neuro_model_path)
+    def load_models(self,vision,left,right,neuro):
         with self.lock:
             if os.path.exists(self.vision_model_path):
                 try:
@@ -124,6 +128,11 @@ class AAAFileManager:
             if os.path.exists(self.right_model_path):
                 try:
                     right.load_state_dict(torch.load(self.right_model_path,map_location="cpu"))
+                except:
+                    pass
+            if os.path.exists(self.neuro_model_path):
+                try:
+                    neuro.load_state_dict(torch.load(self.neuro_model_path,map_location="cpu"))
                 except:
                     pass
 class ExperienceBuffer:
@@ -147,8 +156,7 @@ class ExperienceBuffer:
                 self.data.pop(0)
         try:
             with open(self.meta_log,"a",encoding="utf-8") as f:
-                f.write(json.dumps(rec)+"
-")
+                f.write(json.dumps(rec)+"\n")
         except:
             pass
     def sample(self,batch_size=32):
@@ -204,6 +212,17 @@ class VisionModel(nn.Module):
         metrics=F.relu(self.fc_metrics(h))
         flags=torch.sigmoid(self.fc_flags(h))
         return metrics,flags,h
+class BrainInspiredNeuroModule(nn.Module):
+    def __init__(self,dim):
+        super(BrainInspiredNeuroModule,self).__init__()
+        self.encoder=nn.Linear(dim,dim)
+        self.gate=nn.Linear(dim,dim)
+    def forward(self,x,state):
+        sensory=torch.tanh(self.encoder(x))
+        gating=torch.sigmoid(self.gate(x))
+        updated=state*0.9+gating*sensory
+        output=torch.tanh(updated)
+        return output,updated
 class HandPolicy(nn.Module):
     def __init__(self,in_dim,action_dim):
         super(HandPolicy,self).__init__()
@@ -221,14 +240,17 @@ class RLAgent:
         self.vision=VisionModel().to(self.device)
         self.left=HandPolicy(32,16).to(self.device)
         self.right=HandPolicy(32,32).to(self.device)
+        self.neuro_module=BrainInspiredNeuroModule(32).to(self.device)
         self.file_manager=file_manager
-        self.file_manager.load_models(self.vision,self.left,self.right)
+        self.file_manager.load_models(self.vision,self.left,self.right,self.neuro_module)
         self.left_opt=optim.Adam(self.left.parameters(),lr=1e-4,weight_decay=1e-5)
         self.right_opt=optim.Adam(self.right.parameters(),lr=1e-4,weight_decay=1e-5)
         self.vision_opt=optim.Adam(self.vision.parameters(),lr=1e-4,weight_decay=1e-5)
+        self.neuro_opt=optim.Adam(self.neuro_module.parameters(),lr=1e-4,weight_decay=1e-5)
         self.entropy_coef=0.01
         self.value_coef=0.5
         self.global_step=0
+        self.neuro_state=torch.zeros(32,device=self.device)
     def preprocess_frame(self,img):
         img=img.resize((240,240))
         arr=np.array(img).astype(np.float32)/255.0
@@ -239,12 +261,13 @@ class RLAgent:
         with torch.no_grad():
             t=self.preprocess_frame(img)
             metrics,flags,h=self.vision(t)
+            brain_output,self.neuro_state=self.neuro_module(h[0],self.neuro_state)
             metrics=metrics[0].cpu().numpy()
             flags=flags[0].cpu().numpy()
             hero_dead=bool(flags[0]>0.5)
             in_recall=bool(flags[1]>0.5)
             cooldowns={"recall":False,"heal":bool(flags[2]>0.5),"flash":bool(flags[3]>0.5),"basic":False,"skill1":bool(flags[4]>0.5),"skill2":bool(flags[5]>0.5),"skill3":bool(flags[6]>0.5),"skill4":bool(flags[7]>0.5),"active_item":bool(flags[8]>0.5),"cancel":False}
-            return {"A":int(max(metrics[0],0)),"B":int(max(metrics[1],0)),"C":int(max(metrics[2],0))},hero_dead,in_recall,cooldowns,h[0].detach().cpu()
+            return {"A":int(max(metrics[0],0)),"B":int(max(metrics[1],0)),"C":int(max(metrics[2],0))},hero_dead,in_recall,cooldowns,brain_output.detach().cpu()
     def select_actions(self,h_state,left_hidden,right_hidden):
         lf_in=h_state.unsqueeze(0).unsqueeze(0)
         rf_in=h_state.unsqueeze(0).unsqueeze(0)
@@ -255,6 +278,15 @@ class RLAgent:
         laction=torch.multinomial(lprob,1).item()
         raction=torch.multinomial(rprob,1).item()
         return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,left_hidden,right_hidden
+    def neuro_project(self,h_batch):
+        outputs=[]
+        state=torch.zeros(h_batch.size(1),device=self.device,dtype=h_batch.dtype)
+        for i in range(h_batch.size(0)):
+            out,state=self.neuro_module(h_batch[i],state)
+            outputs.append(out.unsqueeze(0))
+        return torch.cat(outputs,dim=0)
+    def reset_neuro_state(self):
+        self.neuro_state=torch.zeros(32,device=self.device)
     def optimize_from_buffer(self,buffer,progress_get_cancel,progress_set,markers_updater,max_iters=1000):
         for it in range(max_iters):
             if progress_get_cancel():
@@ -302,10 +334,11 @@ class RLAgent:
                 continue
             t_batch=torch.cat([self.preprocess_frame(f) for f in frames],dim=0)
             metrics,flags,h=self.vision(t_batch)
+            h_brain=self.neuro_project(h)
             with torch.no_grad():
                 R=torch.tensor(rewards,dtype=torch.float32,device=self.device).unsqueeze(1)
-            left_logits,left_val,_=self.left(h.unsqueeze(1))
-            right_logits,right_val,_=self.right(h.unsqueeze(1))
+            left_logits,left_val,_=self.left(h_brain.unsqueeze(1))
+            right_logits,right_val,_=self.right(h_brain.unsqueeze(1))
             left_logprob=F.log_softmax(left_logits,dim=-1)
             right_logprob=F.log_softmax(right_logits,dim=-1)
             left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
@@ -322,14 +355,15 @@ class RLAgent:
             rl_pg_right=-(right_logprob.gather(1,tr.unsqueeze(1))*adv_right).mean()
             v_loss=((left_val-R)**2+(right_val-R)**2).mean()
             l2_reg=0.0
-            for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters()):
+            for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters()):
                 l2_reg=l2_reg+p.pow(2).sum()*1e-6
             loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent)+l2_reg
             self.vision_opt.zero_grad()
             self.left_opt.zero_grad()
             self.right_opt.zero_grad()
+            self.neuro_opt.zero_grad()
             loss.backward()
-            for opt in [self.vision_opt,self.left_opt,self.right_opt]:
+            for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
                 for g in opt.param_groups:
                     base_lr=g["lr"]
                     scale=1.0/(1.0+0.0001*self.global_step)
@@ -340,7 +374,7 @@ class RLAgent:
                 markers_updater()
             progress_set(int(100.0*it/max_iters))
         progress_set(100)
-        self.file_manager.save_models(self.vision,self.left,self.right)
+        self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module)
 class MarkerWidget(QtWidgets.QWidget):
     def __init__(self,parent,label,color,alpha,x_pct,y_pct,r_pct):
         super(MarkerWidget,self).__init__(parent)
@@ -440,7 +474,7 @@ class OverlayWindow(QtWidgets.QWidget):
         self.config_mode=enabled
         if enabled:
             self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,False)
-            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
             for m in self.markers:
                 m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
                 m.show()
@@ -535,6 +569,7 @@ class AppState:
         with self.lock:
             self.hwnd=hwnd
             self.window_rect=get_window_rect(hwnd)
+            self.agent.reset_neuro_state()
     def update_window_rect(self):
         with self.lock:
             if self.hwnd is not None:
@@ -775,7 +810,7 @@ class OptimizationThread(threading.Thread):
                         m.r_pct=clamp(st["r_pct"],0.01,0.5)
                         m.update_geometry_from_parent()
         self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,1000)
-        self.app_state.file_manager.save_models(self.app_state.agent.vision,self.app_state.agent.left,self.app_state.agent.right)
+        self.app_state.file_manager.save_models(self.app_state.agent.vision,self.app_state.agent.left,self.app_state.agent.right,self.app_state.agent.neuro_module)
         self.app_state.set_progress(100)
 class WindowSelectorDialog(QtWidgets.QDialog):
     def __init__(self,parent):
@@ -808,7 +843,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.app_state=app_state
         self.rate_controller=rate_controller
         self.optimize_thread=None
-        self.setWindowTitle("AI控制面板")
+        self.setWindowTitle("AI控制面板-强化学习-深度学习-正则化-自适应-类脑智能")
         self.rootWidget=QtWidgets.QWidget(self)
         self.setCentralWidget(self.rootWidget)
         self.layout=QtWidgets.QGridLayout(self.rootWidget)
