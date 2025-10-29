@@ -68,15 +68,17 @@ class AAAFileManager:
                 torch.save({},self.neuro_model_path)
     def move_dir(self,new_parent):
         with self.lock:
+            old_base=self.base_path
             new_base=os.path.join(new_parent,"AAA")
-            if os.path.abspath(new_base)==os.path.abspath(self.base_path):
-                return
+            if os.path.abspath(new_base)==os.path.abspath(old_base):
+                return old_base,old_base
             if os.path.exists(new_base):
                 shutil.rmtree(new_base)
-            shutil.move(self.base_path,new_base)
+            shutil.move(old_base,new_base)
             self.base_path=new_base
             self.ensure_structure()
             self.update_config_path()
+            return old_base,new_base
     def update_config_path(self):
         with self.lock:
             if os.path.exists(self.config_path):
@@ -137,6 +139,24 @@ class AAAFileManager:
                     neuro.load_state_dict(torch.load(self.neuro_model_path,map_location="cpu"))
                 except:
                     pass
+    def to_relative(self,abs_path):
+        with self.lock:
+            base=self.base_path
+        try:
+            rel=os.path.relpath(abs_path,base)
+        except:
+            rel=abs_path
+        if rel.startswith("..") and not abs_path.startswith(base):
+            rel=abs_path
+        return rel
+    def to_absolute(self,path):
+        with self.lock:
+            base=self.base_path
+        if not path:
+            return path
+        if os.path.isabs(path):
+            return path
+        return os.path.join(base,path)
 class ExperienceBuffer:
     def __init__(self,manager,capacity=10000):
         self.manager=manager
@@ -147,7 +167,9 @@ class ExperienceBuffer:
         self.refresh_paths()
     def refresh_paths(self):
         with self.lock:
-            self.meta_log=os.path.join(self.manager.experience_dir,"exp.jsonl")
+            self._refresh_paths_locked()
+    def _refresh_paths_locked(self):
+        self.meta_log=os.path.join(self.manager.experience_dir,"exp.jsonl")
     def add(self,frame_img,action,source,metrics,hero_dead,cooldowns,window_rect):
         ts=time.time()
         fname=os.path.join(self.manager.experience_dir,str(int(ts*1000))+".png")
@@ -155,7 +177,7 @@ class ExperienceBuffer:
             frame_img.save(fname)
         except:
             pass
-        rec={"t":ts,"frame":fname,"action":action,"source":source,"metrics":metrics,"hero_dead":hero_dead,"cooldowns":cooldowns,"rect":window_rect}
+        rec={"t":ts,"frame":self.manager.to_relative(fname),"action":action,"source":source,"metrics":metrics,"hero_dead":hero_dead,"cooldowns":cooldowns,"rect":window_rect}
         with self.lock:
             self.data.append(rec)
             if len(self.data)>self.capacity:
@@ -165,6 +187,52 @@ class ExperienceBuffer:
                 f.write(json.dumps(rec)+"\n")
         except:
             pass
+    def _rewrite_locked(self):
+        try:
+            with open(self.meta_log,"w",encoding="utf-8") as f:
+                for rec in self.data:
+                    f.write(json.dumps(rec)+"\n")
+        except:
+            pass
+    def on_aaa_moved(self,old_base,new_base):
+        with self.lock:
+            self._refresh_paths_locked()
+            records=[]
+            try:
+                if os.path.exists(self.meta_log):
+                    with open(self.meta_log,"r",encoding="utf-8") as f:
+                        for line in f:
+                            line=line.strip()
+                            if not line:
+                                continue
+                            try:
+                                rec=json.loads(line)
+                                records.append(rec)
+                            except:
+                                continue
+            except:
+                records=[]
+            if not records:
+                records=list(self.data)
+            normalized=[]
+            for rec in records:
+                frame=rec.get("frame")
+                if frame:
+                    abs_old=frame if os.path.isabs(frame) else os.path.join(old_base,frame)
+                    try:
+                        rel_tail=os.path.relpath(abs_old,old_base)
+                    except:
+                        if abs_old.startswith(old_base):
+                            rel_tail=abs_old[len(old_base):].lstrip(os.sep)
+                        else:
+                            rel_tail=os.path.basename(abs_old)
+                    abs_new=os.path.join(new_base,rel_tail)
+                    rec["frame"]=self.manager.to_relative(abs_new)
+                normalized.append(rec)
+            self.data=normalized
+            if len(self.data)>self.capacity:
+                self.data=self.data[-self.capacity:]
+            self._rewrite_locked()
     def sample(self,batch_size=32):
         with self.lock:
             if len(self.data)==0:
@@ -310,7 +378,7 @@ class RLAgent:
             mask_right=[]
             for rec in batch:
                 try:
-                    img=Image.open(rec["frame"]).convert("RGB")
+                    img=Image.open(self.file_manager.to_absolute(rec["frame"])).convert("RGB")
                 except:
                     continue
                 frames.append(img)
@@ -705,7 +773,7 @@ class AppState:
 class InputTracker:
     def __init__(self,app_state):
         self.app_state=app_state
-        self.last_action=None
+        self.action_queue=deque()
         self.lock=threading.Lock()
         self.left_labels=["移动轮盘"]
         self.button_paths={mouse.Button.left:[],mouse.Button.right:[],mouse.Button.middle:[]}
@@ -761,7 +829,9 @@ class InputTracker:
                 action_type="drag" if len(path)>1 else "click"
                 a={"type":action_type,"start":start,"end":end,"label":label,"action_id":aid,"hand":hand,"pos":(x,y)}
                 with self.lock:
-                    self.last_action=a
+                    if len(self.action_queue)>256:
+                        self.action_queue.popleft()
+                    self.action_queue.append(a)
                 self.button_state.discard(button)
                 self.button_paths[button]=[]
             elif not pressed and self.in_window(x,y):
@@ -781,7 +851,9 @@ class InputTracker:
             self.app_state.mark_user_input()
             a={"type":"scroll","delta":(dx,dy),"pos":(x,y),"label":None,"action_id":None,"hand":"right"}
             with self.lock:
-                self.last_action=a
+                if len(self.action_queue)>256:
+                    self.action_queue.popleft()
+                self.action_queue.append(a)
     def on_key_press(self,key):
         try:
             if key==keyboard.Key.esc:
@@ -790,11 +862,11 @@ class InputTracker:
                 self.app_state.mark_user_input()
         except:
             pass
-    def get_last_action_and_reset(self):
+    def pop_action(self):
         with self.lock:
-            a=self.last_action
-            self.last_action=None
-            return a
+            if self.action_queue:
+                return self.action_queue.popleft()
+            return None
 class ScreenshotRecorder(threading.Thread):
     def __init__(self,app_state,buffer,rate_controller,input_tracker):
         super(ScreenshotRecorder,self).__init__()
@@ -822,12 +894,25 @@ class ScreenshotRecorder(threading.Thread):
                 if img is not None:
                     self.app_state.update_state_from_frame(img)
                     if mode==Mode.LEARNING:
-                        act=self.input_tracker.get_last_action_and_reset()
+                        actions=[]
+                        while True:
+                            act=self.input_tracker.pop_action()
+                            if act is None:
+                                break
+                            actions.append(act)
                         src="user"
                     else:
-                        act=self.app_state.consume_ai_action()
+                        actions=[]
+                        while True:
+                            act=self.app_state.consume_ai_action()
+                            if act is None:
+                                break
+                            actions.append(act)
                         src="ai"
-                    self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
+                    if not actions:
+                        actions=[None]
+                    for act in actions:
+                        self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
             time.sleep(dt)
 class LeftHandThread(threading.Thread):
     def __init__(self,app_state):
@@ -1130,8 +1215,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_move_aaa(self):
         d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
         if d:
-            self.app_state.file_manager.move_dir(d)
-            self.app_state.buffer.refresh_paths()
+            old_base,new_base=self.app_state.file_manager.move_dir(d)
+            self.app_state.buffer.on_aaa_moved(old_base,new_base)
     def start_training_threads(self):
         if self.app_state.left_thread is None or not self.app_state.left_thread.is_alive():
             self.app_state.left_thread=LeftHandThread(self.app_state)
