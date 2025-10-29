@@ -1156,6 +1156,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.layout.addWidget(self.addMarkerBtn,7,1)
         self.layout.addWidget(self.delMarkerBtn,8,0)
         self.layout.addWidget(self.moveAAABtn,8,1)
+        self.chooseWindowBtn.setEnabled(False)
         self.cancelOptimizeBtn.setEnabled(False)
         self.saveConfigBtn.setEnabled(False)
         self.addMarkerBtn.setEnabled(False)
@@ -1184,7 +1185,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.app_state.mode==Mode.INIT and (not self.app_state.ready) and self.hardware_ok() and self.file_ok():
             QtWidgets.QMessageBox.information(self,"准备就绪","请选择一个窗口")
             self.app_state.ready=True
+            self.chooseWindowBtn.setEnabled(True)
     def on_choose_window(self):
+        if not self.app_state.ready:
+            QtWidgets.QMessageBox.warning(self,"未就绪","初始化尚未完成")
+            return
         dlg=WindowSelectorDialog(self)
         if dlg.exec_()==QtWidgets.QDialog.Accepted:
             hwnd=dlg.get_selected_hwnd()
@@ -1205,7 +1210,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.modeLabel.setText("模式:学习")
                     self.app_state.recording=True
     def on_optimize(self):
-        if self.app_state.mode in [Mode.LEARNING,Mode.TRAINING]:
+        if self.app_state.mode==Mode.LEARNING:
             self.app_state.set_mode(Mode.OPTIMIZING)
             self.modeLabel.setText("模式:优化")
             self.app_state.recording=False
@@ -1214,6 +1219,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.app_state.cancel_optimization=False
             self.app_state.set_progress(0)
             self.optimize_thread.start()
+        elif self.app_state.mode==Mode.TRAINING:
+            QtWidgets.QMessageBox.information(self,"切换模式","请先返回学习模式后再开始优化")
     def on_cancel_optimize(self):
         if self.app_state.mode==Mode.OPTIMIZING:
             self.app_state.request_cancel_optimization()
@@ -1223,7 +1230,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.modeLabel.setText("模式:学习")
             self.app_state.recording=True
     def on_config(self):
-        if self.app_state.mode in [Mode.LEARNING,Mode.TRAINING]:
+        if self.app_state.mode==Mode.LEARNING:
             self.app_state.set_mode(Mode.CONFIGURING)
             self.modeLabel.setText("模式:配置")
             self.app_state.recording=False
@@ -1233,6 +1240,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.app_state.overlay:
                 self.app_state.overlay.set_config_mode(True)
                 self.app_state.overlay.sync_with_window()
+        elif self.app_state.mode==Mode.TRAINING:
+            QtWidgets.QMessageBox.information(self,"切换模式","请在学习模式下进行配置")
     def on_save_config(self):
         if self.app_state.mode==Mode.CONFIGURING:
             reply=QtWidgets.QMessageBox.question(self,"确认保存","确认保存当前配置？",QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
