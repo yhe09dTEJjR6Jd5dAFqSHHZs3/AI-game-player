@@ -383,6 +383,7 @@ class RLAgent:
             progress_set(100)
             self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module)
         return not cancelled
+class MarkerWidget(QtWidgets.QWidget):
     def __init__(self,parent,label,color,alpha,x_pct,y_pct,r_pct):
         super(MarkerWidget,self).__init__(parent)
         self.label=label
