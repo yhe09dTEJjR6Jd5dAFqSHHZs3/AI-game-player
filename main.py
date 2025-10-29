@@ -2354,10 +2354,13 @@ class VisionAnalyzer:
   if isinstance(analysis.get("cooldowns"),dict):
    snapshot["cooldowns"]=dict(analysis["cooldowns"])
   self.app.latest_analysis=snapshot
-  if analysis.get("recall_active",1.0)>=0.5 and analysis.get("alive",True):
-   with self.app.state_lock:
-    if self.app.recalling and analysis["cooldowns"]["items"]=="可用":
-     self.app.recalling=False
+  recall_metric=analysis.get("recall_active",0.0)
+  alive_flag=analysis.get("alive",True)
+  with self.app.state_lock:
+   if recall_metric>=0.5 and alive_flag:
+    self.app.recalling=True
+   elif self.app.recalling and (not alive_flag or recall_metric<0.2 or analysis["cooldowns"]["items"]=="可用"):
+    self.app.recalling=False
   self.app.update_state(snapshot["A"],snapshot["B"],snapshot["C"],snapshot["alive"],snapshot["cooldowns"]["skills"],snapshot["cooldowns"]["items"],snapshot["cooldowns"]["heal"],snapshot["cooldowns"]["flash"])
   mode=self.app.get_mode()
   if mode in (Mode.LEARNING,Mode.TRAINING):
