@@ -212,16 +212,32 @@ class ExperiencePool:
      path.write_text(json.dumps(entry,ensure_ascii=False),encoding="utf-8")
    except Exception:
     pass
- def get_records(self,limit=512):
+ def _quality_score(self,record,index,total):
+  a=float(record.get("A",0))
+  b=float(record.get("B",0))
+  c=float(record.get("C",0))
+  recency=1.0-(float(index)/float(total) if total else 0.0)
+  source=str(record.get("source",""))
+  user_bonus=2.0 if source.startswith("user") else 1.0
+  marker_bonus=len(record.get("markers",{}))*0.5
+  survival_bonus=4.0 if record.get("hero_alive",True) else -6.0
+  recall_penalty=-2.0 if record.get("recalling",False) else 0.0
+  return a*3.0-b*2.2+c*1.6+recency*18.0+user_bonus*6.0+marker_bonus+survival_bonus+recall_penalty
+ def get_records(self,limit=None):
   records=[]
   files=sorted(self.exp_folder.glob("exp_*.json"),key=lambda p:p.name,reverse=True)
-  for path in files:
-   if len(records)>=limit:
-    break
+  total=len(files)
+  for idx,path in enumerate(files):
    try:
-    records.append(json.loads(path.read_text(encoding="utf-8")))
+    record=json.loads(path.read_text(encoding="utf-8"))
    except Exception:
     continue
+   record["_quality"]=self._quality_score(record,idx,total)
+   records.append(record)
+  if limit is not None:
+   limit=max(0,int(limit))
+   if limit<len(records):
+    return records[:limit]
   return records
  def update_metrics(self,metrics):
   with self.lock:
@@ -419,6 +435,37 @@ class RLTrainer:
  def _notify(self,value):
   if self.progress_callback:
    self.progress_callback(max(0,min(100,int(value))))
+ def _quality_weight(self,record):
+  try:
+   return max(0.1,float(record.get("_quality",1.0)))
+  except Exception:
+   return 1.0
+ def _capacity(self,size):
+  if size<=0:
+   return 0
+  try:
+   available=psutil.virtual_memory().available
+  except Exception:
+   available=0
+  scaled=int(max(512,min(16384,available//(1024*256)+size//6+512)))
+  return min(size,scaled)
+ def _select_weighted(self,data,weights):
+  if not data:
+   return []
+  capacity=self._capacity(len(data))
+  if capacity<=0 or capacity>=len(data):
+   return data
+  indexed=[(weights[i] if i<len(weights) else 1.0,i,data[i]) for i in range(len(data))]
+  indexed.sort(key=lambda x:x[0],reverse=True)
+  top_count=max(1,int(capacity*0.7))
+  selected=indexed[:top_count]
+  remaining=indexed[top_count:]
+  random_count=capacity-len(selected)
+  if random_count>0 and remaining:
+   random.shuffle(remaining)
+   selected.extend(remaining[:random_count])
+  selected.sort(key=lambda x:x[1])
+  return [item[2] for item in selected]
  def _frame_vector(self,path):
   if not path or not os.path.exists(path):
    return [0.0]*144
@@ -462,6 +509,9 @@ class RLTrainer:
   left_transitions=[]
   right_transitions=[]
   vision_samples=[]
+  left_weights=[]
+  right_weights=[]
+  vision_weights=[]
   last_state=None
   last_metrics={"A":0,"B":0,"C":0,"hero_alive":True,"recalling":False}
   pending_left=None
@@ -473,27 +523,33 @@ class RLTrainer:
    metrics={"A":record.get("A",0),"B":record.get("B",0),"C":record.get("C",0),"hero_alive":record.get("hero_alive",True),"recalling":record.get("recalling",False)}
    vision_target=[1.0 if metrics["hero_alive"] else 0.0,float(metrics["A"])/100.0,float(metrics["B"])/100.0,float(metrics["C"])/100.0]
    vision_samples.append((state,vision_target))
+   vision_weights.append(self._quality_weight(record))
    if pending_left:
     reward=self._reward(pending_left["metrics"],metrics)
     done=0.0 if metrics["hero_alive"] else 1.0
     left_transitions.append((pending_left["state"],pending_left["action"],reward,state,done))
+    left_weights.append((pending_left.get("quality",1.0)+self._quality_weight(record))*0.5)
     pending_left=None
    if pending_right:
     reward=self._reward(pending_right["metrics"],metrics)
     done=0.0 if metrics["hero_alive"] else 1.0
     right_transitions.append((pending_right["state"],pending_right["action"],reward,state,done))
+    right_weights.append((pending_right.get("quality",1.0)+self._quality_weight(record))*0.5)
     pending_right=None
    source=str(record.get("source",""))
    action=str(record.get("action",""))
    pre_state=last_state if last_state is not None else state
    pre_metrics=last_metrics
    if source=="ai-left" and action in self.left_actions:
-    pending_left={"state":pre_state,"action":self.left_actions.index(action),"metrics":pre_metrics}
+    pending_left={"state":pre_state,"action":self.left_actions.index(action),"metrics":pre_metrics,"quality":self._quality_weight(record)}
    if source=="ai-right" and action in self.right_actions:
-    pending_right={"state":pre_state,"action":self.right_actions.index(action),"metrics":pre_metrics}
+    pending_right={"state":pre_state,"action":self.right_actions.index(action),"metrics":pre_metrics,"quality":self._quality_weight(record)}
    last_state=state
    last_metrics=metrics
   self.vision_dim=4
+  left_transitions=self._select_weighted(left_transitions,left_weights)
+  right_transitions=self._select_weighted(right_transitions,right_weights)
+  vision_samples=self._select_weighted(vision_samples,vision_weights)
   return left_transitions,right_transitions,vision_samples
  def execute(self):
   self._notify(5)
