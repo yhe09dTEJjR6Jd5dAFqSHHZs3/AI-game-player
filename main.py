@@ -69,33 +69,49 @@ class AAAFileManager:
     def move_dir(self,new_parent):
         with self.lock:
             old_base=os.path.abspath(self.base_path)
-            new_base=os.path.abspath(new_parent)
-            if new_base==old_base:
-                return old_base,new_base
+            requested=os.path.abspath(new_parent)
+            if os.path.basename(requested).lower()=="aaa":
+                target_parent=os.path.dirname(requested)
+                target_base=requested
+            else:
+                target_parent=requested
+                target_base=os.path.join(target_parent,"AAA")
+            if not target_parent:
+                return old_base,old_base
             try:
-                common=os.path.commonpath([new_base,old_base])
+                common=os.path.commonpath([old_base,target_base])
             except ValueError:
                 common=None
-            if common==old_base and new_base!=old_base:
+            if target_base==old_base or common==old_base:
                 return old_base,old_base
-            os.makedirs(new_base,exist_ok=True)
-            for name in os.listdir(old_base):
-                src=os.path.join(old_base,name)
-                dst=os.path.join(new_base,name)
-                if os.path.exists(dst):
-                    if os.path.isdir(dst):
-                        shutil.rmtree(dst)
-                    else:
-                        os.remove(dst)
-                shutil.move(src,new_base)
+            os.makedirs(target_parent,exist_ok=True)
+            if os.path.exists(target_base):
+                try:
+                    shutil.rmtree(target_base)
+                except:
+                    pass
+            moved=False
             try:
-                shutil.rmtree(old_base)
+                shutil.move(old_base,target_base)
+                moved=True
             except:
-                pass
-            self.base_path=new_base
+                try:
+                    os.makedirs(target_base,exist_ok=True)
+                    for name in os.listdir(old_base):
+                        shutil.move(os.path.join(old_base,name),target_base)
+                    moved=True
+                    try:
+                        shutil.rmtree(old_base)
+                    except:
+                        pass
+                except:
+                    moved=False
+            if not moved:
+                return old_base,old_base
+            self.base_path=target_base
             self.ensure_structure()
             self.update_config_path()
-            return old_base,new_base
+            return old_base,target_base
     def update_config_path(self):
         with self.lock:
             if os.path.exists(self.config_path):
@@ -828,12 +844,85 @@ class InputTracker:
         self.action_queue=deque()
         self.lock=threading.Lock()
         self.left_labels=["移动轮盘"]
+        self.right_mapping=self.build_right_mapping()
         self.button_paths={mouse.Button.left:[],mouse.Button.right:[],mouse.Button.middle:[]}
         self.button_state=set()
         self.listener_mouse=mouse.Listener(on_click=self.on_click,on_move=self.on_move,on_scroll=self.on_scroll)
         self.listener_keyboard=keyboard.Listener(on_press=self.on_key_press)
         self.listener_mouse.start()
         self.listener_keyboard.start()
+    def build_right_mapping(self):
+        mapping={}
+        offset=0
+        mapping["回城"]=(offset,1)
+        offset+=1
+        mapping["恢复"]=(offset,1)
+        offset+=1
+        mapping["闪现"]=(offset,4)
+        offset+=4
+        mapping["普攻"]=(offset,1)
+        offset+=1
+        mapping["一技能"]=(offset,4)
+        offset+=4
+        mapping["二技能"]=(offset,4)
+        offset+=4
+        mapping["三技能"]=(offset,4)
+        offset+=4
+        mapping["四技能"]=(offset,4)
+        offset+=4
+        mapping["取消施法"]=(offset,4)
+        offset+=4
+        mapping["主动装备"]=(offset,1)
+        offset+=1
+        mapping["数据A"]=(offset,1)
+        offset+=1
+        mapping["数据B"]=(offset,1)
+        offset+=1
+        mapping["数据C"]=(offset,1)
+        offset+=1
+        mapping["其他"]=(31,1)
+        return mapping
+    def summarize_path(self,path,max_points=6):
+        if not path:
+            return []
+        pts=[]
+        n=len(path)
+        step=max(1,n//max(1,max_points-1))
+        for idx in range(0,n,step):
+            pts.append((path[idx][0],path[idx][1]))
+        if pts[-1]!=(path[-1][0],path[-1][1]):
+            pts.append((path[-1][0],path[-1][1]))
+        return pts
+    def quantize_angle(self,angle,count):
+        if count<=1:
+            return 0
+        return int((angle%360.0)/(360.0/count))%count
+    def encode_action(self,label,hand,action_type,path,start,end):
+        summary=self.summarize_path(path)
+        sx,sy=start[0],start[1]
+        ex,ey=end[0],end[1]
+        st=start[2] if len(start)>2 else end[2] if len(end)>2 else time.time()
+        et=end[2] if len(end)>2 else st
+        duration=max(0.0,et-st)
+        angle=None
+        if hand=="left":
+            cx,cy,_=self.app_state.get_marker_geometry("移动轮盘")
+            angle=(math.degrees(math.atan2(ey-cy,ex-cx))+360.0)%360.0
+            aid=self.quantize_angle(angle,16)
+            return aid,angle,summary,duration,st,et
+        mapping=self.right_mapping
+        base,count=mapping.get(label,mapping["其他"])
+        if label:
+            cx,cy,_=self.app_state.get_marker_geometry(label)
+        else:
+            cx,cy,_=self.app_state.get_marker_geometry("普攻")
+        if count>1:
+            angle=(math.degrees(math.atan2(ey-cy,ex-cx))+360.0)%360.0
+            aid=base+self.quantize_angle(angle,count)
+            return aid,angle,summary,duration,st,et
+        if action_type=="drag" and (ex!=sx or ey!=sy):
+            angle=(math.degrees(math.atan2(ey-sy,ex-sx))+360.0)%360.0
+        return base,angle,summary,duration,st,et
     def in_window(self,x,y):
         with self.app_state.lock:
             rect=self.app_state.window_rect
@@ -868,18 +957,25 @@ class InputTracker:
             if tracked and button in self.button_state:
                 self.app_state.mark_user_input()
                 path=self.button_paths.get(button,[])
-                start=path[0] if path else (x,y,time.time())
-                end=(x,y,time.time())
+                t=time.time()
+                if path:
+                    if path[-1][0]!=x or path[-1][1]!=y:
+                        path.append((x,y,t))
+                else:
+                    path=[(x,y,t)]
+                start=path[0]
+                end=path[-1]
                 marker=self.find_marker_by_pos(x,y)
+                if not marker and path:
+                    marker=self.find_marker_by_pos(start[0],start[1])
                 label=marker.label if marker else None
+                action_type="drag" if len(path)>1 else "click"
                 if button==mouse.Button.left and label in self.left_labels:
                     hand="left"
-                    aid=random.randint(0,15)
                 else:
                     hand="right"
-                    aid=random.randint(0,31)
-                action_type="drag" if len(path)>1 else "click"
-                a={"type":action_type,"start":start,"end":end,"label":label,"action_id":aid,"hand":hand,"pos":(x,y)}
+                aid,angle,points,duration,st,et=self.encode_action(label,hand,action_type,path,start,end)
+                a={"type":action_type,"start":(start[0],start[1]),"end":(end[0],end[1]),"label":label,"action_id":aid,"hand":hand,"pos":(x,y),"angle":angle,"key_points":points,"duration":duration,"delta":(end[0]-start[0],end[1]-start[1]),"start_time":st,"end_time":et}
                 with self.lock:
                     if len(self.action_queue)>256:
                         self.action_queue.popleft()
