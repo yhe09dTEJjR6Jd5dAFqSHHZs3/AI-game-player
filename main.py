@@ -77,7 +77,7 @@ class ConfigManager:
  def __init__(self,folder):
   self.folder=folder
   self.path=self.folder/"config.json"
-  self.defaults={"adb_path":"D:/LDPlayer9/adb.exe","emulator_path":"D:/LDPlayer9/dnplayer.exe","screenshot_hz":30,"optimize_steps":100,"markers":{},"aaa_folder":str(self.folder),"state_timeout":10}
+  self.defaults={"adb_path":"D:\LDPlayer9\adb.exe","emulator_path":"D:\LDPlayer9\dnplayer.exe","screenshot_hz":30,"optimize_steps":100,"markers":{},"aaa_folder":str(self.folder),"state_timeout":10}
   self.data={}
   self.load()
  def load(self):
