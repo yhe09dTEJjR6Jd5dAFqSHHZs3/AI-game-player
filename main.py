@@ -275,6 +275,8 @@ class ReinforcementAnalyzer:
  def evaluate(self,records):
   totals={"A":0.0,"B":0.0,"C":0.0}
   marker_stats={}
+  user_samples={}
+  frame_cache={}
   for rec in records:
    totals["A"]+=float(rec.get("A",0))
    totals["B"]+=float(rec.get("B",0))
@@ -286,6 +288,7 @@ class ReinforcementAnalyzer:
     stat["y"]+=float(data.get("y",0.5))
     stat["radius"]+=float(data.get("radius",0.1))
     stat["count"]+=1
+   self._collect_user_samples(user_samples,rec,markers,frame_cache)
   count=max(1,len(records))
   avg_a=totals["A"]/count
   avg_b=totals["B"]/count
@@ -295,7 +298,204 @@ class ReinforcementAnalyzer:
   regularized_b=max(0,avg_b-self.regularization*adaptive*10)
   enhanced_c=avg_c+self.deep_learning_scale*adaptive*3
   metrics={"A":int(round(enhanced_a)),"B":int(round(regularized_b)),"C":int(round(enhanced_c))}
-  return metrics,marker_stats
+  adjustments=self._derive_adjustments(user_samples,frame_cache)
+  return metrics,marker_stats,adjustments
+ def _collect_user_samples(self,user_samples,record,markers,frame_cache):
+  source=str(record.get("source",""))
+  frame=str(record.get("frame","") or "")
+  analysis=record.get("analysis",{})
+  weight=self._quality_from_record(record,analysis)
+  if source=="user-gesture":
+   gesture=record.get("gesture",{})
+   name=gesture.get("marker")
+   if name:
+    path=gesture.get("path",[])
+    pts=[]
+    for item in path:
+     if isinstance(item,(list,tuple)) and len(item)>=2:
+      try:
+       x=float(item[0])
+       y=float(item[1])
+      except Exception:
+       continue
+      pts.append((x,y))
+    if pts:
+     entry={"points":pts,"weight":weight,"frame":frame,"analysis":analysis}
+     user_samples.setdefault(name,[]).append(entry)
+  elif source=="user-mouse":
+   norm=record.get("normalized",[])
+   if isinstance(norm,(list,tuple)) and len(norm)>=2:
+    try:
+     x=float(norm[0])
+     y=float(norm[1])
+    except Exception:
+     x=None
+     y=None
+    if x is not None and y is not None:
+     target=self._assign_point_to_marker(x,y,markers)
+     if target:
+      entry={"points":[(x,y)],"weight":weight*0.5,"frame":frame,"analysis":analysis}
+      user_samples.setdefault(target,[]).append(entry)
+ def _assign_point_to_marker(self,x,y,markers):
+  best=None
+  best_score=-1.0
+  fallback=None
+  fallback_dist=1e9
+  for name,data in markers.items():
+   try:
+    cx=float(data.get("x",0.5))
+    cy=float(data.get("y",0.5))
+    radius=float(data.get("radius",0.1))
+   except Exception:
+    continue
+   dx=x-cx
+   dy=y-cy
+   dist=math.sqrt(dx*dx+dy*dy)
+   if dist<fallback_dist:
+    fallback=name
+    fallback_dist=dist
+   if radius<=0:
+    continue
+   if dist<=radius*1.6:
+    score=(radius-dist)/max(radius,1e-3)
+    if score>best_score:
+     best=name
+     best_score=score
+  return best if best else fallback
+ def _quality_from_record(self,record,analysis):
+  base=max(0.05,float(record.get("_quality",1.0)))
+  a=float(record.get("A",0))
+  b=float(record.get("B",0))
+  c=float(record.get("C",0))
+  if isinstance(analysis,dict):
+   try:
+    a=max(a,float(analysis.get("A",a)))
+    b=max(b,float(analysis.get("B",b)))
+    c=max(c,float(analysis.get("C",c)))
+   except Exception:
+    pass
+  reinforcement=1.0+a/200.0
+  penalty=1.0/(1.0+b/300.0)
+  creativity=1.0+c/400.0
+  adaptive=self.adaptive_factor+self.brain_like_synapse*0.5
+  return max(0.05,base*reinforcement*penalty*(creativity+adaptive))
+ def _derive_adjustments(self,user_samples,frame_cache):
+  adjustments={}
+  for name,entries in user_samples.items():
+   coords=[]
+   weights=[]
+   frames=[]
+   for entry in entries:
+    pts=entry.get("points",[])
+    weight=float(entry.get("weight",1.0))
+    if weight<=0:
+     continue
+    for point in pts:
+     if isinstance(point,(list,tuple)) and len(point)>=2:
+      coords.append((float(point[0]),float(point[1])))
+      weights.append(weight)
+    frame=entry.get("frame","")
+    if frame:
+     frames.append((frame,weight))
+   if not coords or not weights:
+    continue
+   total=sum(weights)
+   if total<=0:
+    continue
+   sum_x=0.0
+   sum_y=0.0
+   for idx,(x,y) in enumerate(coords):
+    sum_x+=x*weights[idx]
+    sum_y+=y*weights[idx]
+   cx=sum_x/total
+   cy=sum_y/total
+   variance=0.0
+   for idx,(x,y) in enumerate(coords):
+    dx=x-cx
+    dy=y-cy
+    variance+=weights[idx]*(dx*dx+dy*dy)
+   variance=variance/total
+   base_radius=math.sqrt(max(1e-6,variance))*2.0
+   heat=self._density_score(coords,weights)
+   frame_radius=self._frame_radius(frames,cx,cy,frame_cache)
+   combined=max(base_radius,frame_radius)
+   combined=combined*(1.0+heat*0.3)
+   combined=min(0.4,max(0.05,combined))
+   adjustments[name]={"x":min(0.95,max(0.05,cx)),"y":min(0.95,max(0.05,cy)),"radius":combined,"confidence":min(1.0,heat)}
+  return adjustments
+ def _density_score(self,coords,weights):
+  if not coords or not weights:
+   return 0.0
+  total=sum(weights)
+  if total<=0:
+   return 0.0
+  grid={}
+  for idx,(x,y) in enumerate(coords):
+   ix=int(max(0,min(19,math.floor(x*19))))
+   iy=int(max(0,min(19,math.floor(y*19))))
+   key=(ix,iy)
+   grid[key]=grid.get(key,0.0)+weights[idx]
+  peak=max(grid.values()) if grid else 0.0
+  density=peak/total if total>0 else 0.0
+  return max(0.1,min(1.0,density*4.0))
+ def _frame_radius(self,frames,cx,cy,frame_cache):
+  weighted=0.0
+  weight_sum=0.0
+  for frame,weight in frames:
+   arr=self._load_frame(frame,frame_cache)
+   if arr is None:
+    continue
+   radius=self._analyze_frame(arr,cx,cy)
+   if radius>0:
+    weighted+=radius*weight
+    weight_sum+=weight
+  if weight_sum<=0:
+   return 0.08
+  return weighted/weight_sum
+ def _load_frame(self,path,frame_cache):
+  key=str(path)
+  if not key:
+   return None
+  if key in frame_cache:
+   return frame_cache[key]
+  try:
+   with Image.open(key) as img:
+    arr=np.asarray(img.convert("L"),dtype=np.float32)/255.0
+  except Exception:
+   arr=None
+  frame_cache[key]=arr
+  return arr
+ def _analyze_frame(self,arr,cx,cy):
+  if arr is None or arr.size==0:
+   return 0.08
+  height,width=arr.shape
+  if height<=0 or width<=0:
+   return 0.08
+  px=int(max(0,min(width-1,int(cx*width))))
+  py=int(max(0,min(height-1,int(cy*height))))
+  max_dim=float(min(width,height))
+  if max_dim<=0:
+   return 0.08
+  step=max(1,int(max_dim*0.03))
+  samples=[]
+  for radius in range(step,int(max_dim*0.4)+step,step):
+   x0=max(0,px-radius)
+   x1=min(width,px+radius)
+   y0=max(0,py-radius)
+   y1=min(height,py+radius)
+   region=arr[y0:y1,x0:x1]
+   if region.size==0:
+    continue
+   samples.append((radius/max_dim,float(np.mean(region))))
+  if not samples:
+   return 0.08
+  base=samples[0][1]
+  best_ratio=samples[-1][0]
+  for ratio,value in samples:
+   if abs(value-base)>0.07:
+    best_ratio=ratio
+    break
+  return max(0.05,min(0.4,best_ratio))
 class OptimizationCancelled(Exception):
  pass
 class RLNetwork:
@@ -555,7 +755,7 @@ class RLTrainer:
   self._notify(5)
   left_transitions,right_transitions,vision_samples=self._build_transitions()
   self._notify(15)
-  metrics,marker_stats=self.analyzer.evaluate(self.records)
+  metrics,marker_stats,marker_adjustments=self.analyzer.evaluate(self.records)
   input_dim=self.state_dim if self.state_dim>0 else 144+11
   left_net=RLNetwork(input_dim,len(self.left_actions),64,0.0005,0.2,1.1)
   right_net=RLNetwork(input_dim,len(self.right_actions),96,0.0005,0.25,1.05)
@@ -569,7 +769,7 @@ class RLTrainer:
   self._notify(85)
   vision_net.train_supervised(vision_samples,8,64,0.008,self._check_cancel)
   self._notify(100)
-  return metrics,marker_stats,{self.pool.left_model:left_net.serialize(),self.pool.right_model:right_net.serialize(),self.pool.vision_model:vision_net.serialize()}
+  return metrics,marker_stats,marker_adjustments,{self.pool.left_model:left_net.serialize(),self.pool.right_model:right_net.serialize(),self.pool.vision_model:vision_net.serialize()}
 class AIModelHandler:
  def __init__(self,experience_pool):
   self.pool=experience_pool
@@ -579,6 +779,7 @@ class AIModelHandler:
   self.cancel_flag=threading.Event()
   self.analyzer=ReinforcementAnalyzer()
   self.last_marker_stats={}
+  self.last_marker_adjustments={}
   self.last_metrics={"A":0,"B":0,"C":0}
  def optimize(self,callback=None,done=None):
   if self.optimizing:
@@ -590,7 +791,7 @@ class AIModelHandler:
    records=self.pool.get_records()
    trainer=RLTrainer(self.pool,self.analyzer,records,lambda value:self._update_progress(value,callback),self.cancel_flag)
    try:
-    metrics,marker_stats,payload=trainer.execute()
+    metrics,marker_stats,marker_adjustments,payload=trainer.execute()
    except OptimizationCancelled:
     self.progress=0
     self.optimizing=False
@@ -612,6 +813,7 @@ class AIModelHandler:
      path.write_bytes(os.urandom(max(1024,len(data) if data else 0)))
    self.pool.update_metrics(metrics)
    self.last_marker_stats=marker_stats
+   self.last_marker_adjustments=marker_adjustments
    self.last_metrics=metrics
    self.optimizing=False
    self.thread=None
@@ -2724,24 +2926,37 @@ class MainApp:
    self.root.after(0,finish)
   self.model_handler.optimize(callback,done)
  def adjust_markers(self):
+  adjustments=self.model_handler.last_marker_adjustments if self.model_handler.last_marker_adjustments else {}
   stats=self.model_handler.last_marker_stats if self.model_handler.last_marker_stats else {}
   updated=False
   for name,marker in self.overlay.markers.items():
-   data=stats.get(name)
-   if data and data.get('count'):
-    count=max(1,data.get('count',1))
-    avg_x=data.get('x',marker.x*count)/count
-    avg_y=data.get('y',marker.y*count)/count
-    avg_r=data.get('radius',marker.radius*count)/count
-    marker.x=min(0.95,max(0.05,avg_x))
-    marker.y=min(0.95,max(0.05,avg_y))
-    marker.radius=min(0.4,max(0.05,avg_r))
+   info=adjustments.get(name)
+   if info:
+    confidence=float(info.get('confidence',0.5))
+    blend=max(0.25,min(0.85,confidence))
+    target_x=float(info.get('x',marker.x))
+    target_y=float(info.get('y',marker.y))
+    target_r=float(info.get('radius',marker.radius))
+    marker.x=min(0.95,max(0.05,marker.x*(1.0-blend)+target_x*blend))
+    marker.y=min(0.95,max(0.05,marker.y*(1.0-blend)+target_y*blend))
+    marker.radius=min(0.4,max(0.05,marker.radius*(1.0-blend)+target_r*blend))
     updated=True
    else:
-    marker.x=min(0.95,max(0.05,marker.x+random.uniform(-0.02,0.02)))
-    marker.y=min(0.95,max(0.05,marker.y+random.uniform(-0.02,0.02)))
-    marker.radius=min(0.4,max(0.05,marker.radius+random.uniform(-0.01,0.01)))
-    updated=True
+    data=stats.get(name)
+    if data and data.get('count'):
+     count=max(1,data.get('count',1))
+     avg_x=data.get('x',marker.x*count)/count
+     avg_y=data.get('y',marker.y*count)/count
+     avg_r=data.get('radius',marker.radius*count)/count
+     marker.x=min(0.95,max(0.05,avg_x))
+     marker.y=min(0.95,max(0.05,avg_y))
+     marker.radius=min(0.4,max(0.05,avg_r))
+     updated=True
+    else:
+     marker.x=min(0.95,max(0.05,marker.x+random.uniform(-0.02,0.02)))
+     marker.y=min(0.95,max(0.05,marker.y+random.uniform(-0.02,0.02)))
+     marker.radius=min(0.4,max(0.05,marker.radius+random.uniform(-0.01,0.01)))
+     updated=True
   if updated:
    self.overlay.draw_markers()
    self.save_markers()
@@ -2881,6 +3096,7 @@ class MainApp:
    config_window.destroy()
    self.set_mode(Mode.LEARNING)
    self.start_learning()
+   self.check_environment()
   Button(config_window,text='保存',command=save_and_close).pack(fill='x')
   refresh_list()
   config_window.protocol('WM_DELETE_WINDOW',save_and_close)
@@ -2899,6 +3115,7 @@ class MainApp:
    self.reload_models()
    self.save_markers()
    self.status_var.set('已迁移')
+   self.check_environment()
   except Exception as e:
    showinfo('错误',str(e))
  def save_config(self):
@@ -2906,6 +3123,7 @@ class MainApp:
   data.update({'screenshot_hz':self.resource_monitor.frequency,'markers':self.overlay.get_markers_data(),'aaa_folder':str(self.pool.folder)})
   self.pool.config_manager.save()
   showinfo('提示','配置已保存')
+  self.check_environment()
  def load_config(self):
   self.pool.config_manager.load()
   folder_path=Path(self.pool.config_manager.data.get('aaa_folder',str(self.pool.folder)))
@@ -2918,6 +3136,7 @@ class MainApp:
   self.emulator_controller.update_paths()
   self.reload_models()
   self.status_var.set('配置已加载')
+  self.check_environment()
  def update_emulator_geometry(self,x,y,width,height,visible):
   geometry=(int(x),int(y),max(0,int(width)),max(0,int(height)))
   changed=geometry!=self.emu_geometry or visible!=self.emu_visible
