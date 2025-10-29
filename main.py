@@ -322,17 +322,21 @@ class RLNetwork:
   return output,hidden
  def forward(self,states):
   return self._forward(states)[0]
- def train_dqn(self,transitions,epochs,batch_size,base_lr,gamma):
+ def train_dqn(self,transitions,epochs,batch_size,base_lr,gamma,check_cancel=None):
   if not transitions:
    return 0.0
   total=0.0
   transitions=list(transitions)
   for epoch in range(max(1,epochs)):
+   if check_cancel:
+    check_cancel()
    if len(transitions)>1:
     random.shuffle(transitions)
    lr=base_lr/(1.0+epoch*self.adaptive_rate)
    lr=max(lr*self.neuroplasticity,1e-5)
    for start in range(0,len(transitions),batch_size):
+    if check_cancel:
+     check_cancel()
     batch=transitions[start:start+batch_size]
     states=np.asarray([t[0] for t in batch],dtype=np.float32)
     actions=np.asarray([t[1] for t in batch],dtype=np.int64)
@@ -361,17 +365,21 @@ class RLNetwork:
     self.w1-=lr*grad_w1
     self.b1-=lr*grad_b1
   return total
- def train_supervised(self,samples,epochs,batch_size,base_lr):
+ def train_supervised(self,samples,epochs,batch_size,base_lr,check_cancel=None):
   if not samples:
    return 0.0
   total=0.0
   samples=list(samples)
   for epoch in range(max(1,epochs)):
+   if check_cancel:
+    check_cancel()
    if len(samples)>1:
     random.shuffle(samples)
    lr=base_lr/(1.0+epoch*self.adaptive_rate)
    lr=max(lr*self.neuroplasticity,1e-5)
    for start in range(0,len(samples),batch_size):
+    if check_cancel:
+     check_cancel()
     batch=samples[start:start+batch_size]
     states=np.asarray([s[0] for s in batch],dtype=np.float32)
     targets=np.asarray([s[1] for s in batch],dtype=np.float32)
@@ -499,11 +507,11 @@ class RLTrainer:
   left_net.load(self.pool.left_model)
   right_net.load(self.pool.right_model)
   vision_net.load(self.pool.vision_model)
-  left_net.train_dqn(left_transitions,10,32,0.01,0.95)
+  left_net.train_dqn(left_transitions,10,32,0.01,0.95,self._check_cancel)
   self._notify(55)
-  right_net.train_dqn(right_transitions,10,32,0.01,0.95)
+  right_net.train_dqn(right_transitions,10,32,0.01,0.95,self._check_cancel)
   self._notify(85)
-  vision_net.train_supervised(vision_samples,8,64,0.008)
+  vision_net.train_supervised(vision_samples,8,64,0.008,self._check_cancel)
   self._notify(100)
   return metrics,marker_stats,{self.pool.left_model:left_net.serialize(),self.pool.right_model:right_net.serialize(),self.pool.vision_model:vision_net.serialize()}
 class AIModelHandler:
@@ -530,12 +538,14 @@ class AIModelHandler:
    except OptimizationCancelled:
     self.progress=0
     self.optimizing=False
+    self.thread=None
     if done:
      done(False)
     return
    except Exception:
     self.progress=0
     self.optimizing=False
+    self.thread=None
     if done:
      done(False)
     return
@@ -548,6 +558,7 @@ class AIModelHandler:
    self.last_marker_stats=marker_stats
    self.last_metrics=metrics
    self.optimizing=False
+   self.thread=None
    if done:
     done(True)
   self.thread=threading.Thread(target=run,daemon=True)
@@ -559,6 +570,14 @@ class AIModelHandler:
  def cancel(self):
   if self.optimizing:
    self.cancel_flag.set()
+   if self.thread and self.thread.is_alive():
+    for _ in range(600):
+     self.thread.join(timeout=0.05)
+     if not self.thread.is_alive():
+      break
+   self.optimizing=False
+   self.progress=0
+   self.thread=None
 class Marker:
  def __init__(self,name,color):
   self.name=name
@@ -568,6 +587,797 @@ class Marker:
   self.radius=0.1
   self.interaction="click"
   self.cooldown=False
+class GestureMachine:
+ def __init__(self,marker):
+  self.marker=marker
+  self.active=False
+  self.state="idle"
+  self.button=None
+  self.start_time=0.0
+  self.last_time=0.0
+  self.start_pos=None
+  self.last_pos=None
+  self.path=[]
+  self.rotation_sum=0.0
+  self.last_angle=None
+  self.entered=False
+  self.phase_log=[]
+ def update_marker(self,marker):
+  self.marker=marker
+ def reset(self):
+  self.active=False
+  self.state="idle"
+  self.button=None
+  self.start_time=0.0
+  self.last_time=0.0
+  self.start_pos=None
+  self.last_pos=None
+  self.path=[]
+  self.rotation_sum=0.0
+  self.last_angle=None
+  self.entered=False
+  self.phase_log=[]
+ def _distance(self,a,b):
+  dx=a[0]-b[0]
+  dy=a[1]-b[1]
+  return math.sqrt(dx*dx+dy*dy)
+ def _angle(self,pos):
+  cx=self.marker.x
+  cy=self.marker.y
+  return math.atan2(pos[1]-cy,pos[0]-cx)
+ def _inside(self,pos):
+  dx=pos[0]-self.marker.x
+  dy=pos[1]-self.marker.y
+  return dx*dx+dy*dy<=self.marker.radius*self.marker.radius
+ def _append_path(self,pos,timestamp):
+  if not pos:
+   return
+  self.path.append((round(pos[0],4),round(pos[1],4),round(timestamp-self.start_time,4)))
+  if len(self.path)>64:
+   step=max(1,len(self.path)//32)
+   self.path=self.path[::step]
+ def _phase(self,name,timepoint):
+  self.phase_log.append((name,round(timepoint-self.start_time,4)))
+ def press(self,pos,timepoint,button):
+  self.reset()
+  if self.marker.interaction=="drag_in":
+   if not self._inside(pos):
+    self.active=True
+    self.state="pressed_outside"
+  elif self.marker.interaction in ("click","mixed","drag"):
+   if self._inside(pos):
+    self.active=True
+    self.state="pressed"
+  elif self.marker.interaction=="drag_in_only":
+   if not self._inside(pos):
+    self.active=True
+    self.state="pressed_outside"
+  else:
+   if self._inside(pos):
+    self.active=True
+    self.state="pressed"
+  if self.active:
+   self.button=button
+   self.start_time=timepoint
+   self.last_time=timepoint
+   self.start_pos=pos
+   self.last_pos=pos
+   self._append_path(pos,timepoint)
+   self._phase("press",timepoint)
+ def move(self,pos,timepoint):
+  if not self.active:
+   return
+  self.last_time=timepoint
+  self._append_path(pos,timepoint)
+  if self.marker.interaction=="click" and self._distance(pos,self.start_pos)>0.02:
+   self.state="cancelled"
+  if self.marker.interaction in ("drag","mixed") or self.marker.name=="移动轮盘":
+   if self.state in ("pressed","dragging","rotating"):
+    dist=self._distance(pos,self.start_pos)
+    if dist>0.01 and self.state=="pressed":
+     self.state="dragging"
+     self._phase("drag",timepoint)
+    if self.state in ("dragging","rotating"):
+     angle=self._angle(pos)
+     if self.last_angle is None:
+      self.last_angle=angle
+     delta=angle-self.last_angle
+     while delta>math.pi:
+      delta-=2*math.pi
+     while delta<-math.pi:
+      delta+=2*math.pi
+     radius=abs(self._distance((self.marker.x,self.marker.y),pos))
+     if radius>=self.marker.radius*0.6:
+      self.rotation_sum+=delta
+      if abs(self.rotation_sum)>0.5 and self.state!="rotating":
+       self.state="rotating"
+       self._phase("rotate",timepoint)
+     self.last_angle=angle
+  if self.marker.interaction=="mixed" and self.state=="pressed" and self._distance(pos,self.start_pos)>0.015:
+   self.state="dragging"
+   self._phase("drag",timepoint)
+  if self.marker.interaction=="drag" and self.state=="pressed" and self._distance(pos,self.start_pos)>0.015:
+   self.state="dragging"
+   self._phase("drag",timepoint)
+  if self.marker.interaction=="drag_in":
+   if self.state in ("pressed_outside","dragging_in"):
+    if self._inside(pos):
+     if not self.entered:
+      self.entered=True
+      self._phase("enter",timepoint)
+     self.state="dragging_in"
+    else:
+      self.state="pressed_outside"
+  self.last_pos=pos
+ def release(self,pos,timepoint,button):
+  if not self.active or button!=self.button:
+   return None
+  self._append_path(pos,timepoint)
+  duration=max(0.0,timepoint-self.start_time)
+  result=None
+  if self.marker.interaction=="click":
+   if self.state!="cancelled" and self._inside(pos):
+    result="click"
+  elif self.marker.interaction=="mixed":
+   if self.state in ("pressed","cancelled") and self._inside(pos) and self._distance(pos,self.start_pos)<=0.02:
+    result="click"
+   elif self.state in ("dragging","rotating"):
+    result="drag"
+  elif self.marker.interaction=="drag":
+   if self.state in ("dragging","rotating"):
+    result="drag"
+  elif self.marker.interaction=="drag_in":
+   if self.entered and self._inside(pos):
+    result="drag_in"
+  else:
+   if self.state in ("dragging","rotating","pressed"):
+    result=self.marker.interaction
+  rotation_direction="none"
+  if self.state=="rotating" and result:
+   rotation_direction="clockwise" if self.rotation_sum<0 else "counter_clockwise"
+  phases=list(self.phase_log)
+  if result:
+   phases.append((result,round(timepoint-self.start_time,4)))
+  gesture=None
+  if result:
+   gesture={"marker":self.marker.name,"interaction":self.marker.interaction,"result":result,"duration":round(duration,4),"rotation":round(self.rotation_sum,4),"rotation_direction":rotation_direction,"path":self.path,"phases":phases}
+  self.reset()
+  return gesture
+ def handle_event(self,event):
+  gestures=[]
+  etype=event.get("type")
+  pos=event.get("normalized")
+  timepoint=event.get("time",time.time())
+  button=event.get("button","left")
+  if etype=="press":
+   if pos:
+    self.press(pos,timepoint,button)
+  elif etype=="move":
+   if pos:
+    self.move(pos,timepoint)
+  elif etype=="release":
+   if pos:
+    gesture=self.release(pos,timepoint,button)
+   else:
+    gesture=self.release(self.last_pos if self.last_pos else (0.0,0.0),timepoint,button)
+   if gesture:
+    gestures.append(gesture)
+  return gestures
+ def is_active(self):
+  return self.active
+class GestureManager:
+ def __init__(self,app):
+  self.app=app
+  self.machines={}
+  self.lock=threading.Lock()
+ def refresh_markers(self):
+  with self.lock:
+   active_names=set()
+   for name,marker in self.app.overlay.markers.items():
+    if marker.interaction=="observe":
+     continue
+    active_names.add(name)
+    if name in self.machines:
+     self.machines[name].update_marker(marker)
+    else:
+     self.machines[name]=GestureMachine(marker)
+   for name in list(self.machines.keys()):
+    if name not in active_names:
+     del self.machines[name]
+ def process(self,event):
+  gestures=[]
+  with self.lock:
+   for machine in self.machines.values():
+    gestures.extend(machine.handle_event(event))
+  return gestures
+ def any_active(self):
+  with self.lock:
+   for machine in self.machines.values():
+    if machine.is_active():
+     return True
+  return False
+class EmulatorWindowTracker:
+ def __init__(self,app):
+  self.app=app
+  self.handle=None
+  self.stop_flag=threading.Event()
+  self.available=platform.system()=="Windows" and win32gui is not None and win32con is not None and win32process is not None and win32api is not None
+  self.last_geometry=None
+  self.last_visible=None
+  self.thread=threading.Thread(target=self.run,daemon=True)
+  self.thread.start()
+ def stop(self):
+  self.stop_flag.set()
+  if self.thread and self.thread.is_alive():
+   self.thread.join(timeout=0.5)
+ def run(self):
+  while not self.stop_flag.is_set() and not self.app.stop_event.is_set():
+   if self.available:
+    handle=self._locate_window()
+    rect=self._get_rect(handle)
+    visible=self._is_visible(handle)
+    if rect:
+     x,y,r,b=rect
+     width=max(0,r-x)
+     height=max(0,b-y)
+    else:
+     x,y,width,height=self.app.emu_geometry
+     visible=False
+   else:
+    handle=None
+    x,y,width,height=self.app.emu_geometry
+    visible=True
+   self.handle=handle if self.available else None
+   geometry=(int(x),int(y),int(width),int(height))
+   if self.last_geometry!=geometry or self.last_visible!=visible:
+    self.last_geometry=geometry
+    self.last_visible=visible
+    self.app.root.after(0,lambda g=geometry,v=visible:self.app.update_emulator_geometry(g[0],g[1],g[2],g[3],v))
+   time.sleep(0.2)
+ def _locate_window(self):
+  if not self.available:
+   return None
+  target=self.app.pool.config_manager.data.get("emulator_path","")
+  target=target.lower() if isinstance(target,str) else ""
+  if self.handle and self._match_window(self.handle,target):
+   return self.handle
+  candidates=[]
+  def callback(hwnd,param):
+   if self._match_window(hwnd,target):
+    param.append(hwnd)
+  win32gui.EnumWindows(callback,candidates)
+  return candidates[0] if candidates else None
+ def _match_window(self,hwnd,target):
+  if not win32gui or not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+   return False
+  if win32gui.IsIconic(hwnd):
+   return False
+  try:
+   title=win32gui.GetWindowText(hwnd)
+  except Exception:
+   title=""
+  if not title:
+   return False
+  exe=""
+  try:
+   _,pid=win32process.GetWindowThreadProcessId(hwnd)
+   exe=psutil.Process(pid).exe().lower()
+  except Exception:
+   exe=""
+  if target and target in exe:
+   return True
+  lower=title.lower()
+  if "ldplayer" in lower or "dnplayer" in lower or "android" in lower:
+   return True
+  return False
+ def _get_rect(self,hwnd):
+  if not hwnd or not win32gui or not win32gui.IsWindow(hwnd):
+   return None
+  try:
+   return win32gui.GetWindowRect(hwnd)
+  except Exception:
+   return None
+ def _is_visible(self,hwnd):
+  if not hwnd or not win32gui:
+   return False
+  if not win32gui.IsWindowVisible(hwnd):
+   return False
+  if win32gui.IsIconic(hwnd):
+   return False
+  placement=None
+  try:
+   placement=win32gui.GetWindowPlacement(hwnd)
+  except Exception:
+   placement=None
+  if placement and len(placement)>1 and win32con:
+   if placement[1]==win32con.SW_SHOWMINIMIZED or placement[1]==win32con.SW_HIDE:
+    return False
+  return True
+class EmulatorController:
+ def __init__(self,app):
+  self.app=app
+  self.adb_path=None
+  self.stop_flag=threading.Event()
+  self.update_paths()
+ def update_paths(self):
+  try:
+   path=self.app.pool.config_manager.data.get("adb_path","")
+  except Exception:
+   path=""
+  self.adb_path=Path(path) if path else None
+ def execute_gesture(self,gesture,source):
+  if not gesture or self.stop_flag.is_set():
+   return
+  threading.Thread(target=self._apply,args=(gesture,),daemon=True).start()
+ def stop(self):
+  self.stop_flag.set()
+ def _adb_available(self):
+  return self.adb_path is not None and self.adb_path.exists()
+ def _adb_command(self):
+  return str(self.adb_path) if self.adb_path else "adb"
+ def _apply(self,gesture):
+  if not self._adb_available():
+   return
+  gtype=gesture.get("type")
+  if gtype=="tap":
+   x,y=self._to_pixels(gesture.get("point"))
+   self._send([self._adb_command(),"shell","input","tap",str(x),str(y)])
+  elif gtype=="swipe":
+   x1,y1=self._to_pixels(gesture.get("start"))
+   x2,y2=self._to_pixels(gesture.get("end"))
+   duration=int(max(1,int(gesture.get("duration",0.1)*1000)))
+   self._send([self._adb_command(),"shell","input","swipe",str(x1),str(y1),str(x2),str(y2),str(duration)])
+  elif gtype=="drag_in":
+   x1,y1=self._to_pixels(gesture.get("start"))
+   x2,y2=self._to_pixels(gesture.get("end"))
+   duration=int(max(1,int(gesture.get("duration",0.1)*1000)))
+   self._send([self._adb_command(),"shell","input","swipe",str(x1),str(y1),str(x2),str(y2),str(duration)])
+  elif gtype=="arc":
+   center=gesture.get("center",(0.5,0.5))
+   radius=float(gesture.get("radius",0.1))
+   base=float(gesture.get("angle",0.0))
+   duration=float(gesture.get("duration",0.3))
+   steps=max(2,int(duration/0.1))
+   prev=center
+   for step in range(1,steps+1):
+    angle=base+step*(math.pi/steps)
+    point=(self._clamp(center[0]+math.cos(angle)*radius),self._clamp(center[1]+math.sin(angle)*radius))
+    x1,y1=self._to_pixels(prev)
+    x2,y2=self._to_pixels(point)
+    self._send([self._adb_command(),"shell","input","swipe",str(x1),str(y1),str(x2),str(y2),str(int(duration*1000/steps))])
+    prev=point
+ def _clamp(self,value):
+  return max(0.02,min(0.98,float(value) if value is not None else 0.5))
+ def _to_pixels(self,point):
+  if point is None:
+   point=(0.5,0.5)
+  _,_,width,height=self.app.emu_geometry
+  width=max(1,int(width))
+  height=max(1,int(height))
+  x=int(self._clamp(point[0])*width)
+  y=int(self._clamp(point[1])*height)
+  return x,y
+ def _send(self,command):
+  if self.stop_flag.is_set():
+   return
+  try:
+   subprocess.Popen(command,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  except Exception:
+   pass
+class OverlayManager:
+ def __init__(self,app):
+  self.app=app
+  self.window=None
+  self.canvas=None
+  self.markers={}
+  self.selected=None
+  self.dragging=False
+  self.resizing=False
+  self.last_pos=None
+  self.hwnd=None
+  self.click_through=None
+  self.cursor_job=None
+ def open(self):
+  if self.window:
+   return
+  self.window=Toplevel(self.app.root)
+  self.window.overrideredirect(True)
+  self.window.attributes("-topmost",True)
+  x,y,width,height=self.app.emu_geometry
+  width=max(1,int(width))
+  height=max(1,int(height))
+  self.window.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+  self.window.attributes("-alpha",0.01)
+  self.canvas=Canvas(self.window,bg="",highlightthickness=0)
+  self.canvas.pack(fill="both",expand=True)
+  self.canvas.bind("<Button-1>",self.on_click)
+  self.canvas.bind("<B1-Motion>",self.on_drag)
+  self.canvas.bind("<ButtonRelease-1>",self.on_release)
+  self.canvas.bind("<Motion>",self.on_motion)
+  self.canvas.bind("<Leave>",self.on_leave)
+  self._setup_window_styles()
+  self.draw_markers()
+  self.update_geometry(x,y,width,height,self.app.emu_visible)
+ def _setup_window_styles(self):
+  self.hwnd=None
+  if not self.window:
+   return
+  if platform.system()=="Windows" and win32gui and win32con:
+   try:
+    self.window.update_idletasks()
+    self.hwnd=self.window.winfo_id()
+   except Exception:
+    self.hwnd=None
+   if self.hwnd:
+    self._set_click_through(True)
+    try:
+     alpha=max(1,int(255*0.01))
+     win32gui.SetLayeredWindowAttributes(self.hwnd,0,alpha,win32con.LWA_ALPHA)
+    except Exception:
+     pass
+    self._start_cursor_monitor()
+  else:
+   self._set_click_through(True)
+ def _start_cursor_monitor(self):
+  if platform.system()!="Windows" or not self.window or not self.canvas or not win32gui or not win32con:
+   return
+  if self.cursor_job:
+   try:
+    self.window.after_cancel(self.cursor_job)
+   except Exception:
+    pass
+   self.cursor_job=None
+  self._cursor_monitor()
+ def _cursor_monitor(self):
+  if not self.window or not self.canvas:
+   self.cursor_job=None
+   return
+  pos=self._get_cursor_pos()
+  capture=False
+  if pos:
+   try:
+    wx=self.window.winfo_rootx()
+    wy=self.window.winfo_rooty()
+    width=self.canvas.winfo_width() or self.window.winfo_width()
+    height=self.canvas.winfo_height() or self.window.winfo_height()
+    rel_x=pos[0]-wx
+    rel_y=pos[1]-wy
+    if 0<=rel_x<=width and 0<=rel_y<=height:
+     capture=self._hit_test(rel_x,rel_y)
+   except Exception:
+    capture=False
+  if self.dragging or self.resizing:
+   capture=True
+  self._set_click_through(not capture)
+  if self.window:
+   try:
+    self.cursor_job=self.window.after(16,self._cursor_monitor)
+   except Exception:
+    self.cursor_job=None
+ def _get_cursor_pos(self):
+  if platform.system()!="Windows":
+   return None
+  try:
+   point=wintypes.POINT()
+   if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+    return point.x,point.y
+  except Exception:
+   return None
+  return None
+ def _set_click_through(self,enable):
+  if self.click_through==enable:
+   return
+  self.click_through=enable
+  if platform.system()=="Windows" and self.hwnd and win32gui and win32con:
+   try:
+    style=win32gui.GetWindowLong(self.hwnd,win32con.GWL_EXSTYLE)
+    if enable:
+     style|=win32con.WS_EX_LAYERED|win32con.WS_EX_TRANSPARENT
+    else:
+     style|=win32con.WS_EX_LAYERED
+     style&=~win32con.WS_EX_TRANSPARENT
+    win32gui.SetWindowLong(self.hwnd,win32con.GWL_EXSTYLE,style)
+   except Exception:
+    pass
+ def _hit_test(self,x,y):
+  if not self.canvas or not self.window:
+   return False
+  width=self.canvas.winfo_width() or self.window.winfo_width()
+  height=self.canvas.winfo_height() or self.window.winfo_height()
+  if width<=0 or height<=0:
+   return False
+  for marker in self.markers.values():
+   mx=marker.x*width
+   my=marker.y*height
+   r=marker.radius*min(width,height)
+   if r<=0:
+    continue
+   margin=max(4,r*0.1)
+   if (x-mx)**2+(y-my)**2<=(r+margin)**2:
+    return True
+  return False
+ def _update_click_through(self,x=None,y=None):
+  capture=self.dragging or self.resizing
+  if not capture and x is not None and y is not None:
+   capture=self._hit_test(x,y)
+  self._set_click_through(not capture)
+ def on_motion(self,event):
+  self._update_click_through(event.x,event.y)
+ def on_leave(self,event):
+  self._update_click_through()
+ def close(self):
+  if self.window:
+   if self.cursor_job:
+    try:
+     self.window.after_cancel(self.cursor_job)
+    except Exception:
+     pass
+    self.cursor_job=None
+   self.window.destroy()
+   self.window=None
+   self.canvas=None
+   self.selected=None
+   self.hwnd=None
+   self.click_through=None
+ def load_markers(self,markers):
+  self.markers={name:self._marker_from_data(name,data) for name,data in markers.items()}
+  self.app.refresh_gesture_markers()
+ def get_markers_data(self):
+  result={}
+  for name,marker in self.markers.items():
+   result[name]={"color":marker.color,"x":marker.x,"y":marker.y,"radius":marker.radius,"interaction":marker.interaction,"cooldown":marker.cooldown}
+  return result
+ def select_marker(self,name):
+  marker=self.markers.get(name)
+  if marker:
+   self.selected=marker
+   self.draw_markers()
+ def _marker_from_data(self,name,data):
+  marker=Marker(name,data.get("color","white"))
+  marker.x=data.get("x",0.5)
+  marker.y=data.get("y",0.5)
+  marker.radius=data.get("radius",0.1)
+  marker.interaction=data.get("interaction","click")
+  marker.cooldown=data.get("cooldown",False)
+  return marker
+ def ensure_marker(self,name,color,interaction,cooldown):
+  if name not in self.markers:
+   marker=Marker(name,color)
+   marker.interaction=interaction
+   marker.cooldown=cooldown
+   self.markers[name]=marker
+   self.app.refresh_gesture_markers()
+ def draw_markers(self):
+  if not self.canvas:
+   return
+  self.canvas.delete("all")
+  width=self.canvas.winfo_width() or self.window.winfo_width()
+  height=self.canvas.winfo_height() or self.window.winfo_height()
+  for name,marker in self.markers.items():
+   x=marker.x*width
+   y=marker.y*height
+   r=marker.radius*min(width,height)
+   self.canvas.create_oval(x-r,y-r,x+r,y+r,outline=marker.color,width=3,fill=self._fill_color(marker))
+   if self.selected==marker:
+    self.canvas.create_oval(x-r-4,y-r-4,x+r+4,y+r+4,outline="yellow",width=2)
+   self.canvas.create_text(x,y,text=name,fill="white")
+ def update_geometry(self,x,y,width,height,visible):
+  if not self.window:
+   return
+  w=max(1,int(width))
+  h=max(1,int(height))
+  if not visible or width<=0 or height<=0:
+   try:
+    self.window.withdraw()
+   except Exception:
+    pass
+   return
+  try:
+   self.window.deiconify()
+  except Exception:
+   pass
+  self.window.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+  if self.canvas:
+   self.canvas.config(width=w,height=h)
+  self.window.update_idletasks()
+  self.draw_markers()
+  self._update_click_through()
+ def _fill_color(self,marker):
+  return "#80ffffff"
+ def on_click(self,event):
+  width=self.canvas.winfo_width()
+  height=self.canvas.winfo_height()
+  click_x=event.x
+  click_y=event.y
+  self.resizing=False
+  for marker in self.markers.values():
+   x=marker.x*width
+   y=marker.y*height
+   r=marker.radius*min(width,height)
+   if (click_x-x)**2+(click_y-y)**2<=r**2:
+    self.selected=marker
+    self.dragging=True
+    self.last_pos=(click_x,click_y)
+    boundary=abs((click_x-x)**2+(click_y-y)**2-r**2)
+    if boundary<r:
+     self.resizing=True
+    self._update_click_through(click_x,click_y)
+    return
+  self.selected=None
+  self.dragging=False
+  self.resizing=False
+  self.last_pos=None
+  self._update_click_through()
+ def on_drag(self,event):
+  if not self.selected or not self.dragging:
+   return
+  width=self.canvas.winfo_width()
+  height=self.canvas.winfo_height()
+  dx=event.x-(self.last_pos[0] if self.last_pos else event.x)
+  dy=event.y-(self.last_pos[1] if self.last_pos else event.y)
+  if self.resizing:
+   r=self.selected.radius*min(width,height)
+   r=max(10,min(min(width,height)/2,r+dx))
+   self.selected.radius=r/min(width,height)
+  else:
+   x=self.selected.x*width+dx
+   y=self.selected.y*height+dy
+   self.selected.x=max(0,min(1,x/width))
+   self.selected.y=max(0,min(1,y/height))
+  self._update_click_through(event.x,event.y)
+  self.last_pos=(event.x,event.y)
+  self.draw_markers()
+ def on_release(self,event):
+  self.dragging=False
+  self.resizing=False
+  self.last_pos=None
+  if event is not None:
+   self._update_click_through(event.x,event.y)
+  else:
+   self._update_click_through()
+class Mode:
+ INIT="初始化"
+ LEARNING="学习模式"
+ TRAINING="训练模式"
+ OPTIMIZING="优化中"
+ CONFIG="配置模式"
+class HandController:
+ def __init__(self,name,model_path,actions,hidden,regularization,adaptive,plasticity):
+  self.name=name
+  self.model_path=model_path
+  self.actions=actions
+  self.hidden=hidden
+  self.regularization=regularization
+  self.adaptive=adaptive
+  self.plasticity=plasticity
+  self.app=None
+  self.network=None
+  self.input_dim=155
+  self.local_random=random.Random(name)
+  self.lock=threading.Lock()
+ def start(self,app):
+  self.app=app
+  self.reload_model()
+ def reload_model(self):
+  if not self.app:
+   return
+  vector=self.app.build_state_vector(None)
+  self.input_dim=len(vector)
+  self.network=RLNetwork(self.input_dim,len(self.actions),self.hidden,self.regularization,self.adaptive,self.plasticity)
+  self.network.load(self.model_path)
+ def stop(self):
+  pass
+ def _forward(self,state):
+  if self.network is None:
+   return None
+  try:
+   arr=np.asarray([state],dtype=np.float32)
+   output=self.network.forward(arr)[0]
+   return output
+  except Exception:
+   return None
+ def decide(self,state):
+  with self.lock:
+   output=self._forward(state)
+   if output is None or not np.isfinite(output).all():
+    return self.local_random.randint(0,len(self.actions)-1),None
+   idx=int(np.argmax(output))
+   return idx,output
+ def execute(self,state):
+  idx,output=self.decide(state)
+  idx=max(0,min(len(self.actions)-1,idx))
+  action=self.actions[idx]
+  gesture=self._gesture_for_action(action,output,state)
+  if gesture and self.app and self.app.emulator_controller:
+   self.app.emulator_controller.execute_gesture(gesture,self.name)
+  payload={"action":action,"mode":"training","state_index":idx}
+  if gesture:
+   payload["gesture"]=gesture
+  return payload
+ def _marker(self,name):
+  if not self.app:
+   return None
+  return self.app.overlay.markers.get(name)
+ def _gesture_for_action(self,action,output,state):
+  marker=None
+  if action.startswith("移动轮盘") or action=="移动轮盘校准":
+   marker=self._marker("移动轮盘")
+   if not marker:
+    return None
+   angle=self._angle_from_output(output,0.0)
+   strength=self._strength_from_state(state,0.35,marker.radius)
+   start=(marker.x,marker.y)
+   end=(self._clamp(start[0]+math.cos(angle)*strength),self._clamp(start[1]+math.sin(angle)*strength))
+   duration=0.3 if action=="移动轮盘拖动" else 0.5
+   if action=="移动轮盘旋转":
+    return {"type":"arc","center":start,"radius":strength,"angle":angle,"duration":duration}
+   return {"type":"swipe","start":start,"end":end,"duration":duration}
+  if action=="普攻":
+   marker=self._marker("普攻")
+   if not marker:
+    return None
+   return {"type":"tap","point":(marker.x,marker.y),"duration":0.05}
+  if action=="施放技能":
+   skill=self._select_skill()
+   marker=self._marker(skill)
+   if not marker:
+    return None
+   return {"type":"tap","point":(marker.x,marker.y),"duration":0.05,"skill":skill}
+  if action=="回城":
+   marker=self._marker("回城")
+   if not marker:
+    return None
+   return {"type":"tap","point":(marker.x,marker.y),"duration":0.05,"state":"recall"}
+  if action=="恢复":
+   marker=self._marker("恢复")
+   if not marker:
+    return None
+   return {"type":"tap","point":(marker.x,marker.y),"duration":0.05}
+  if action=="闪现":
+   marker=self._marker("闪现")
+   if not marker:
+    return None
+   angle=self._angle_from_output(output,0.75)
+   strength=self._strength_from_state(state,marker.radius,marker.radius*1.2)
+   start=(marker.x,marker.y)
+   end=(self._clamp(start[0]+math.cos(angle)*strength),self._clamp(start[1]+math.sin(angle)*strength))
+   return {"type":"swipe","start":start,"end":end,"duration":0.15}
+  if action=="主动装备":
+   marker=self._marker("主动装备")
+   if not marker:
+    return None
+   return {"type":"tap","point":(marker.x,marker.y),"duration":0.05}
+  if action=="取消施法":
+   marker=self._marker("取消施法")
+   if not marker:
+    return None
+   start=(self._clamp(marker.x-marker.radius*1.2),self._clamp(marker.y-marker.radius*1.2))
+   end=(marker.x,marker.y)
+   return {"type":"drag_in","start":start,"end":end,"duration":0.2}
+  return None
+ def _angle_from_output(self,output,offset):
+  base=offset
+  if output is not None and len(output)>0 and np.isfinite(output).all():
+   base=float(np.mean(output))
+  return (base%1.0)*2*math.pi
+ def _strength_from_state(self,state,base,cap=None):
+  total=sum(state) if state else 1.0
+  scale=min(max(total/(len(state) if state else 1),0.1),3.0)
+  value=base*scale
+  if cap is not None:
+   value=min(cap,value)
+  return max(0.02,value)
+ def _clamp(self,value):
+  return max(0.02,min(0.98,value))
+ def _select_skill(self):
+  if not self.app:
+   return "一技能"
+  details=self.app.cooldown_state.get("skills",{})
+  if isinstance(details,dict):
+   available=[k for k,v in details.items() if v=="可用"]
+   if available:
+    return sorted(available)[0]
+  return "一技能"
 class GestureMachine:
  def __init__(self,marker):
   self.marker=marker
@@ -1031,7 +1841,7 @@ class OverlayManager:
    self.click_through=None
  def load_markers(self,markers):
   self.markers={name:self._marker_from_data(name,data) for name,data in markers.items()}
-   self.app.refresh_gesture_markers()
+  self.app.refresh_gesture_markers()
  def get_markers_data(self):
   result={}
   for name,marker in self.markers.items():
@@ -1145,80 +1955,6 @@ class OverlayManager:
    self._update_click_through(event.x,event.y)
   else:
    self._update_click_through()
-class Mode:
- INIT="初始化"
- LEARNING="学习模式"
- TRAINING="训练模式"
- OPTIMIZING="优化中"
- CONFIG="配置模式"
-class HandController:
- def __init__(self,name,model_path,actions):
-  self.name=name
-  self.model_path=model_path
-  self.actions=actions
-  self.thread=None
-  self.stop_flag=threading.Event()
-  self.app=None
-  self.local_random=random.Random()
- def start(self,app):
-  self.app=app
-  if self.thread and self.thread.is_alive():
-   return
-  self.stop_flag.clear()
-  def run():
-   while not self.stop_flag.is_set():
-    if app.get_mode()==Mode.TRAINING and app.operation_allowed():
-     entropy=self._entropy()
-     action=self.local_random.choice(self.actions)
-     strength=int(entropy%100)
-     gesture=self._gesture_for_action(action,strength)
-     payload={"action":action,"intensity":strength,"mode":"training"}
-     if gesture:
-      payload["gesture"]=gesture
-     app.record_event(self.name,payload)
-     time.sleep(1/max(1,app.resource_monitor.frequency))
-    else:
-     time.sleep(0.1)
-  self.thread=threading.Thread(target=run,daemon=True)
-  self.thread.start()
- def _entropy(self):
-  try:
-   data=self.model_path.read_bytes()
-   return sum(data)%1000
-  except Exception:
-   return self.local_random.randint(0,999)
- def stop(self):
-  if self.thread:
-   self.stop_flag.set()
-   self.thread=None
- def _gesture_for_action(self,action,strength):
-  duration=max(0.2,min(1.5,0.25+strength/150.0))
-  timestamp=round(duration,3)
-  if "移动轮盘" in action:
-   rotate="旋转" in action
-   rotation=1.2 if rotate else 0.0
-   direction="counter_clockwise" if rotate else "none"
-   path=[(0.48,0.75,0.0),(0.52,0.62,round(duration/3,3)),(0.56,0.56,round(duration*2/3,3)),(0.6,0.5,timestamp)]
-   return {"marker":"移动轮盘","interaction":"drag","result":"drag","duration":round(duration,3),"rotation":rotation,"rotation_direction":direction,"path":path,"phases":[("press",0.0),("drag",round(duration/3,3)),("rotate" if rotate else "drag",round(duration*2/3,3)),("drag",timestamp)]}
-  if action=="普攻":
-   return {"marker":"普攻","interaction":"click","result":"click","duration":round(duration,3),"rotation":0.0,"rotation_direction":"none","path":[(0.82,0.82,0.0),(0.82,0.82,timestamp)],"phases":[("press",0.0),("click",timestamp)]}
-  if action=="施放技能":
-   skills=["一技能","二技能","三技能","四技能"]
-   marker=self.local_random.choice(skills)
-   return {"marker":marker,"interaction":"mixed","result":"click","duration":round(duration,3),"rotation":0.0,"rotation_direction":"none","path":[(0.9,0.72,0.0),(0.9,0.72,timestamp)],"phases":[("press",0.0),("click",timestamp)]}
-  if action=="回城":
-   return {"marker":"回城","interaction":"click","result":"click","duration":round(duration,3),"rotation":0.0,"rotation_direction":"none","path":[(0.86,0.92,0.0),(0.86,0.92,timestamp)],"phases":[("press",0.0),("click",timestamp)]}
-  if action=="恢复":
-   return {"marker":"恢复","interaction":"click","result":"click","duration":round(duration,3),"rotation":0.0,"rotation_direction":"none","path":[(0.8,0.9,0.0),(0.8,0.9,timestamp)],"phases":[("press",0.0),("click",timestamp)]}
-  if action=="闪现":
-   path=[(0.88,0.78,0.0),(0.8,0.72,round(duration/2,3)),(0.75,0.68,timestamp)]
-   return {"marker":"闪现","interaction":"drag","result":"drag","duration":round(duration,3),"rotation":0.0,"rotation_direction":"none","path":path,"phases":[("press",0.0),("drag",round(duration/2,3)),("drag",timestamp)]}
-  if action=="主动装备":
-   return {"marker":"主动装备","interaction":"click","result":"click","duration":round(duration,3),"rotation":0.0,"rotation_direction":"none","path":[(0.84,0.76,0.0),(0.84,0.76,timestamp)],"phases":[("press",0.0),("click",timestamp)]}
-  if action=="取消施法":
-   path=[(0.2,0.2,0.0),(0.4,0.25,round(duration/2,3)),(0.65,0.3,timestamp)]
-   return {"marker":"取消施法","interaction":"drag_in","result":"drag_in","duration":round(duration,3),"rotation":0.0,"rotation_direction":"none","path":path,"phases":[("press",0.0),("enter",round(duration/2,3)),("drag_in",timestamp)]}
-  return None
 class FrameCapture:
  def __init__(self,app):
   self.app=app
@@ -1238,7 +1974,7 @@ class FrameCapture:
    if self.app.get_mode() in [Mode.LEARNING,Mode.TRAINING] and self.app.emu_visible:
     path=self._generate_frame()
     if path:
-     self.app.last_frame=str(path)
+     self.app.process_frame(path)
     else:
      self.app.last_frame=""
    time.sleep(1/max(1,freq))
@@ -1326,6 +2062,104 @@ class FrameCapture:
    self.app.status_var.set("配置中")
  def stop(self):
   self.stop_flag.set()
+class VisionAnalyzer:
+ def __init__(self,app):
+  self.app=app
+  self.lock=threading.Lock()
+  self.network=None
+  self.reload()
+ def reload(self):
+  with self.lock:
+   vector=self.app.build_state_vector(None)
+   self.network=RLNetwork(len(vector),4,128,0.0003,0.15,1.2)
+   self.network.load(self.app.pool.vision_model)
+ def analyze(self,path):
+  if not path:
+   return
+  try:
+   with Image.open(path) as img:
+    rgb=img.convert("RGB")
+    gray=np.asarray(rgb.convert("L"),dtype=np.float32)/255.0
+  except Exception:
+   return
+  small=Image.fromarray(np.clip(gray*255.0,0,255).astype(np.uint8)).resize((16,9))
+  vector=self.app.build_state_vector(path,np.asarray(small,dtype=np.float32)/255.0)
+  output=None
+  with self.lock:
+   if self.network:
+    try:
+     output=self.network.forward(np.asarray([vector],dtype=np.float32))[0]
+    except Exception:
+     output=None
+  analysis=self._build_analysis(output,gray)
+  snapshot=dict(analysis)
+  if isinstance(analysis.get("cooldowns"),dict):
+   snapshot["cooldowns"]=dict(analysis["cooldowns"])
+  self.app.latest_analysis=snapshot
+  if analysis.get("recall_active",1.0)>=0.5 and analysis.get("alive",True):
+   with self.app.state_lock:
+    if self.app.recalling and analysis["cooldowns"]["items"]=="可用":
+     self.app.recalling=False
+  self.app.update_state(snapshot["A"],snapshot["B"],snapshot["C"],snapshot["alive"],snapshot["cooldowns"]["skills"],snapshot["cooldowns"]["items"],snapshot["cooldowns"]["heal"],snapshot["cooldowns"]["flash"])
+  mode=self.app.get_mode()
+  if mode in (Mode.LEARNING,Mode.TRAINING):
+   self.app.record_event("vision",{"mode":mode,"frame":str(path),"analysis":snapshot})
+ def _build_analysis(self,output,gray):
+  metrics=self._collect(gray)
+  alive=self._alive(output,metrics)
+  a=int(round((metrics["data"]["A"]+self._scale_metric(output,1))/2))
+  b=int(round((metrics["data"]["B"]+self._scale_metric(output,2))/2))
+  c=int(round((metrics["data"]["C"]+self._scale_metric(output,3))/2))
+  cooldowns={"skills":metrics["skills"],"items":metrics["items"],"heal":metrics["heal"],"flash":metrics["flash"]}
+  return {"alive":alive,"A":max(0,a),"B":max(0,b),"C":max(0,c),"cooldowns":cooldowns,"recall_active":metrics["recall"]}
+ def _alive(self,output,metrics):
+  if output is not None and len(output)>0:
+   value=self._sigmoid(output[0])
+   if value>=0.6:
+    return True
+   if value<=0.4:
+    return False
+  return metrics["recall"]>=0.3
+ def _scale_metric(self,output,index):
+  if output is None or len(output)<=index:
+   return 0
+  return int(max(0,min(400,round(self._sigmoid(output[index])*400))))
+ def _sigmoid(self,value):
+  try:
+   v=float(value)
+  except Exception:
+   v=0.0
+  return 1.0/(1.0+math.exp(-v))
+ def _collect(self,gray):
+  arr=np.asarray(gray,dtype=np.float32)
+  if arr.max()>1.0:
+   arr=arr/255.0
+  height,width=arr.shape
+  def sample(name):
+   marker=self.app.overlay.markers.get(name)
+   if not marker:
+    return 0.0
+   cx=int(marker.x*width)
+   cy=int(marker.y*height)
+   radius=int(max(1,marker.radius*min(width,height)))
+   x0=max(0,cx-radius)
+   x1=min(width,cx+radius)
+   y0=max(0,cy-radius)
+   y1=min(height,cy+radius)
+   region=arr[y0:y1,x0:x1]
+   if region.size==0:
+    return 0.0
+   return float(np.mean(region))
+  skills={}
+  for name in ["一技能","二技能","三技能","四技能"]:
+   value=sample(name)
+   skills[name]="可用" if value>=0.45 else "冷却"
+  items_status="可用" if sample("主动装备")>=0.45 else "冷却"
+  heal_status="可用" if sample("恢复")>=0.45 else "冷却"
+  flash_status="可用" if sample("闪现")>=0.45 else "冷却"
+  data={"A":int(round(sample("数据A")*400)),"B":int(round(sample("数据B")*400)),"C":int(round(sample("数据C")*400))}
+  recall=sample("回城")
+  return {"skills":skills,"items":items_status,"heal":heal_status,"flash":flash_status,"data":data,"recall":recall}
 class MouseMonitor:
  def __init__(self,app):
   self.app=app
@@ -1422,7 +2256,7 @@ class MainApp:
   self.data_a=0
   self.data_b=0
   self.data_c=0
-  self.cooldown_state={"skills":"冷却状态","items":"冷却状态","heal":"冷却状态","flash":"冷却状态"}
+  self.cooldown_state={"skills":{},"items":"冷却状态","heal":"冷却状态","flash":"冷却状态"}
   self.optimize_button_state=BooleanVar(value=False)
   self.emu_geometry=(0,0,1280,720)
   self.emu_visible=True
@@ -1439,11 +2273,15 @@ class MainApp:
   self.training_thread=None
   self.learning_thread=None
   self.last_frame=""
+  self.latest_analysis={"alive":True,"A":0,"B":0,"C":0,"cooldowns":{"skills":{},"items":"冷却状态","heal":"冷却状态","flash":"冷却状态"}}
   self.resource_monitor=ResourceMonitor()
-  self.frame_capture=FrameCapture(self)
   self.model_handler=AIModelHandler(self.pool)
-  self.left_controller=HandController("ai-left",self.pool.left_model,["移动轮盘拖动","移动轮盘旋转","移动轮盘校准"])
-  self.right_controller=HandController("ai-right",self.pool.right_model,["普攻","施放技能","回城","恢复","闪现","主动装备","取消施法"])
+  self.emulator_controller=EmulatorController(self)
+  self.emulator_controller.update_paths()
+  self.vision=VisionAnalyzer(self)
+  self.frame_capture=FrameCapture(self)
+  self.left_controller=HandController("ai-left",self.pool.left_model,["移动轮盘拖动","移动轮盘旋转","移动轮盘校准"],64,0.0005,0.2,1.1)
+  self.right_controller=HandController("ai-right",self.pool.right_model,["普攻","施放技能","回城","恢复","闪现","主动装备","取消施法"],96,0.0005,0.25,1.05)
   self.mouse_monitor=MouseMonitor(self)
   self.window_tracker=EmulatorWindowTracker(self)
   self.create_ui()
@@ -1488,6 +2326,84 @@ class MainApp:
   Label(self.root,textvariable=self.freq_var).grid(row=12,column=1,sticky="w")
   Button(self.root,text="保存配置",command=self.save_config).grid(row=13,column=0,columnspan=2,sticky="ew")
   Button(self.root,text="加载配置",command=self.load_config).grid(row=13,column=2,columnspan=2,sticky="ew")
+ def build_state_vector(self,frame_path=None,frame_array=None):
+  with self.state_lock:
+   a=float(self.data_a)
+   b=float(self.data_b)
+   c=float(self.data_c)
+   alive=self.hero_alive
+   recalling=self.recalling
+   cooldowns=dict(self.cooldown_state)
+   geometry=self.emu_geometry
+  width=max(1.0,float(geometry[2]))
+  height=max(1.0,float(geometry[3]))
+  features=[a/100.0,b/100.0,c/100.0,1.0 if alive else 0.0,1.0 if recalling else 0.0,width/1920.0,height/1080.0]
+  features.append(self._cooldown_scalar(cooldowns.get("skills")))
+  features.append(self._cooldown_scalar(cooldowns.get("items")))
+  features.append(self._cooldown_scalar(cooldowns.get("heal")))
+  features.append(self._cooldown_scalar(cooldowns.get("flash")))
+  features.extend(self._frame_features(frame_path,frame_array))
+  return features
+ def _cooldown_scalar(self,value):
+  if isinstance(value,dict):
+   total=len(value)
+   if total<=0:
+    return 0.0
+   locked=len([v for v in value.values() if v not in ("可用","ready","Ready","AVAILABLE")])
+   return min(1.0,max(0.0,locked/max(1,total)))
+  if isinstance(value,str):
+   return 0.0 if value in ("可用","ready","Ready","AVAILABLE") else 1.0
+  if value in (0,0.0,False,None):
+   return 0.0
+  return 1.0
+ def _frame_features(self,frame_path,frame_array):
+  if frame_array is not None:
+   try:
+    arr=np.asarray(frame_array,dtype=np.float32)
+    if arr.ndim==3:
+     arr=np.mean(arr,axis=2)
+    if arr.shape!=(9,16):
+     img=Image.fromarray(np.clip(arr*255.0,0,255).astype(np.uint8))
+     arr=np.asarray(img.resize((16,9)),dtype=np.float32)/255.0
+    else:
+     arr=np.clip(arr,0.0,1.0)
+    return arr.reshape(-1).tolist()
+   except Exception:
+    pass
+  path=frame_path or self.last_frame
+  if path:
+   try:
+    with Image.open(path) as img:
+     arr=np.asarray(img.convert("L").resize((16,9)),dtype=np.float32)/255.0
+     return arr.reshape(-1).tolist()
+   except Exception:
+    pass
+  return [0.0]*144
+ def _skill_display(self,skills):
+  if isinstance(skills,dict):
+   return " ".join(f"{k}:{skills[k]}" for k in sorted(skills.keys()))
+  return str(skills)
+ def _normalize_skill_status(self,skills):
+  names=["一技能","二技能","三技能","四技能"]
+  if isinstance(skills,dict):
+   normalized={}
+   for name in names:
+    normalized[name]=skills.get(name,skills.get(name.replace("技能",""),"冷却"))
+   for key,value in skills.items():
+    if key not in normalized:
+     normalized[key]=value
+   return normalized
+  status=str(skills) if skills is not None else "冷却"
+  return {name:status for name in names}
+ def process_frame(self,path):
+  self.last_frame=str(path)
+  if hasattr(self,"vision") and self.vision:
+   self.vision.analyze(path)
+ def reload_models(self):
+  self.left_controller.reload_model()
+  self.right_controller.reload_model()
+  if hasattr(self,"vision") and self.vision:
+   self.vision.reload()
  def set_progress(self,value):
   self.progress_var.set(value)
   self.progress_text_var.set(f"{int(value)}%")
@@ -1526,6 +2442,7 @@ class MainApp:
   models_ready=self.pool.validate()
   hardware_ready=self.hardware_ready()
   if adb.exists() and emulator.exists() and models_ready and hardware_ready:
+   self.emulator_controller.update_paths()
    self.set_mode(Mode.LEARNING)
    self.start_learning()
   else:
@@ -1578,7 +2495,7 @@ class MainApp:
    c=self.data_c
    cooldowns=dict(self.cooldown_state)
    recalling=self.recalling
-  data={"timestamp":time.time(),"source":source,"hero_alive":hero_alive,"A":a,"B":b,"C":c,"cooldowns":cooldowns,"geometry":self.emu_geometry,"markers":self.overlay.get_markers_data(),"recalling":recalling,"frame":self.last_frame,"mode_context":self.get_mode(),"window_visible":self.emu_visible}
+  data={"timestamp":time.time(),"source":source,"hero_alive":hero_alive,"A":a,"B":b,"C":c,"cooldowns":cooldowns,"geometry":self.emu_geometry,"markers":self.overlay.get_markers_data(),"recalling":recalling,"frame":self.last_frame,"mode_context":self.get_mode(),"window_visible":self.emu_visible,"analysis":self.latest_analysis}
   if extra:
    data.update(extra)
   self.pool.record(data)
@@ -1602,61 +2519,74 @@ class MainApp:
    time.sleep(1/max(1,self.resource_monitor.frequency))
   self.training_thread=None
  def update_state(self,a,b,c,alive,skills,items,heal,flash):
+  def safe_int(value):
+   try:
+    return int(max(0,int(float(value))))
+   except Exception:
+    return 0
+  safe_a=safe_int(a)
+  safe_b=safe_int(b)
+  safe_c=safe_int(c)
+  alive_flag=bool(alive)
+  skill_detail=self._normalize_skill_status(skills)
+  item_text=str(items)
+  heal_text=str(heal)
+  flash_text=str(flash)
   def apply():
    with self.state_lock:
-    self.data_a=a
-    self.data_b=b
-    self.data_c=c
-    self.hero_alive=alive
-    self.cooldown_state['skills']=skills
-    self.cooldown_state['items']=items
-    self.cooldown_state['heal']=heal
-    self.cooldown_state['flash']=flash
-   self.data_a_var.set(str(a))
-   self.data_b_var.set(str(b))
-   self.data_c_var.set(str(c))
-   self.hero_status_var.set('存活' if alive else '阵亡')
-   self.cooldown_vars['skills'].set(skills)
-   self.cooldown_vars['items'].set(items)
-   self.cooldown_vars['heal'].set(heal)
-   self.cooldown_vars['flash'].set(flash)
+    self.data_a=safe_a
+    self.data_b=safe_b
+    self.data_c=safe_c
+    self.hero_alive=alive_flag
+    self.cooldown_state['skills']=skill_detail
+    self.cooldown_state['items']=item_text
+    self.cooldown_state['heal']=heal_text
+    self.cooldown_state['flash']=flash_text
+    if not alive_flag:
+     self.recalling=False
+   self.data_a_var.set(str(safe_a))
+   self.data_b_var.set(str(safe_b))
+   self.data_c_var.set(str(safe_c))
+   self.hero_status_var.set('存活' if alive_flag else '阵亡')
+   self.cooldown_vars['skills'].set(self._skill_display(skill_detail))
+   self.cooldown_vars['items'].set(item_text)
+   self.cooldown_vars['heal'].set(heal_text)
+   self.cooldown_vars['flash'].set(flash_text)
   self.root.after(0,apply)
  def simulate_ai_action(self):
   with self.state_lock:
    hero_alive=self.hero_alive
    recalling=self.recalling
-  if not hero_alive:
-   if random.random()<0.4:
-    a=max(0,self.data_a+random.randint(0,6))
-    b=max(0,self.data_b-random.randint(0,6))
-    c=max(0,self.data_c+random.randint(0,4))
-    self.update_state(a,b,c,True,self.cooldown_state['skills'],self.cooldown_state['items'],self.cooldown_state['heal'],self.cooldown_state['flash'])
-   time.sleep(1)
+  if not hero_alive or recalling:
+   time.sleep(0.2)
    return
-  if recalling:
-   if random.random()<0.35:
+  state=self.build_state_vector(None)
+  results={}
+  def left_task():
+   results['left']=self.left_controller.execute(state)
+  def right_task():
+   results['right']=self.right_controller.execute(state)
+  threads=[threading.Thread(target=left_task,daemon=True),threading.Thread(target=right_task,daemon=True)]
+  for t in threads:
+   t.start()
+  for t in threads:
+   t.join()
+  timestamp=time.time()
+  left_payload=results.get('left')
+  right_payload=results.get('right')
+  if left_payload:
+   left_payload['timestamp']=timestamp
+   self.record_event(self.left_controller.name,left_payload)
+  if right_payload:
+   right_payload['timestamp']=timestamp
+   self.record_event(self.right_controller.name,right_payload)
+   gesture=right_payload.get('gesture',{})
+   if right_payload.get('action')=='回城' and gesture.get('state')=='recall':
+    with self.state_lock:
+     self.recalling=True
+   if right_payload.get('action')=='取消施法':
     with self.state_lock:
      self.recalling=False
-   time.sleep(1)
-   return
-  if random.random()<0.08:
-   with self.state_lock:
-    self.recalling=True
-   self.record_event('ai',{'event':'recall_start','mode':'training'})
-   return
-  a=max(0,self.data_a+random.randint(-3,7))
-  b=max(0,self.data_b+random.randint(-7,3))
-  c=max(0,self.data_c+random.randint(-2,6))
-  alive=random.random()>=0.04
-  skills='冷却' if random.random()<0.5 else '可用'
-  items='冷却' if random.random()<0.5 else '可用'
-  heal='冷却' if random.random()<0.5 else '可用'
-  flash='冷却' if random.random()<0.5 else '可用'
-  self.update_state(a,b,c,alive,skills,items,heal,flash)
-  if not alive:
-   with self.state_lock:
-    self.recalling=False
-   time.sleep(2)
  def on_optimize(self):
   if self.get_mode()!=Mode.LEARNING:
    return
@@ -1671,6 +2601,7 @@ class MainApp:
    def finish():
     self.set_progress(0 if not success else 100)
     if success:
+     self.reload_models()
      self.adjust_markers()
      self.apply_optimized_metrics()
      showinfo('提示','优化完成')
@@ -1850,6 +2781,8 @@ class MainApp:
    self.overlay.load_markers(self.pool.config_manager.data.get('markers',{}))
    self.ensure_default_markers()
    self.pool.config_manager.update('aaa_folder',str(self.pool.folder))
+   self.emulator_controller.update_paths()
+   self.reload_models()
    self.save_markers()
    self.status_var.set('已迁移')
   except Exception as e:
@@ -1868,6 +2801,8 @@ class MainApp:
    self.right_controller.model_path=self.pool.right_model
   self.overlay.load_markers(self.pool.config_manager.data.get('markers',{}))
   self.ensure_default_markers()
+  self.emulator_controller.update_paths()
+  self.reload_models()
   self.status_var.set('配置已加载')
  def update_emulator_geometry(self,x,y,width,height,visible):
   geometry=(int(x),int(y),max(0,int(width)),max(0,int(height)))
@@ -1895,6 +2830,8 @@ class MainApp:
   self.frame_capture.stop()
   self.mouse_monitor.stop()
   self.window_tracker.stop()
+  if hasattr(self,'emulator_controller') and self.emulator_controller:
+   self.emulator_controller.stop()
   self.root.quit()
  def monitor_user_action(self,event=None):
   self.last_input=time.time()
