@@ -290,8 +290,10 @@ class RLAgent:
     def reset_neuro_state(self):
         self.neuro_state=torch.zeros(32,device=self.device)
     def optimize_from_buffer(self,buffer,progress_get_cancel,progress_set,markers_updater,max_iters=1000):
+        cancelled=False
         for it in range(max_iters):
             if progress_get_cancel():
+                cancelled=True
                 break
             batch=buffer.sample(32)
             if not batch:
@@ -375,9 +377,12 @@ class RLAgent:
             if it%10==0:
                 markers_updater()
             progress_set(int(100.0*it/max_iters))
-        progress_set(100)
-        self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module)
-class MarkerWidget(QtWidgets.QWidget):
+        if cancelled:
+            progress_set(0)
+        else:
+            progress_set(100)
+            self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module)
+        return not cancelled
     def __init__(self,parent,label,color,alpha,x_pct,y_pct,r_pct):
         super(MarkerWidget,self).__init__(parent)
         self.label=label
@@ -618,6 +623,9 @@ class AppState:
     def consume_cancel_request(self):
         with self.lock:
             return self.cancel_optimization
+    def clear_cancel_request(self):
+        with self.lock:
+            self.cancel_optimization=False
     def record_ai_action(self,action):
         with self.lock:
             if len(self.ai_action_queue)>64:
@@ -871,9 +879,12 @@ class OptimizationThread(threading.Thread):
                         m.y_pct=clamp(st["y_pct"],0.0,1.0)
                         m.r_pct=clamp(st["r_pct"],0.01,0.5)
                         m.update_geometry_from_parent()
-        self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,1000)
-        self.app_state.file_manager.save_models(self.app_state.agent.vision,self.app_state.agent.left,self.app_state.agent.right,self.app_state.agent.neuro_module)
-        self.app_state.set_progress(100)
+        completed=self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,1000)
+        self.app_state.clear_cancel_request()
+        if completed:
+            self.app_state.set_progress(100)
+        else:
+            self.app_state.set_progress(0)
 class WindowSelectorDialog(QtWidgets.QDialog):
     def __init__(self,parent):
         super(WindowSelectorDialog,self).__init__(parent)
