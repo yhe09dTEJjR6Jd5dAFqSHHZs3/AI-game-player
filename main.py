@@ -24,10 +24,10 @@ except ImportError:
  subprocess.check_call([sys.executable,"-m","pip","install","pillow"])
  from PIL import Image
 try:
- from pynput import mouse
+ from pynput import mouse,keyboard
 except ImportError:
  subprocess.check_call([sys.executable,"-m","pip","install","pynput"])
- from pynput import mouse
+ from pynput import mouse,keyboard
 try:
  import mss
 except ImportError:
@@ -2291,6 +2291,54 @@ class MouseMonitor:
    except Exception:
     pass
    self.listener=None
+class KeyboardMonitor:
+ def __init__(self,app):
+  self.app=app
+  self.listener=None
+  self.queue=queue.Queue()
+  self.thread=None
+  self.stop_flag=threading.Event()
+ def start(self):
+  if self.thread and self.thread.is_alive():
+   return
+  self.stop_flag.clear()
+  try:
+   self.listener=keyboard.Listener(on_press=self.on_press,on_release=self.on_release)
+   self.listener.daemon=True
+   self.listener.start()
+  except Exception:
+   self.listener=None
+  self.thread=threading.Thread(target=self.process,daemon=True)
+  self.thread.start()
+ def on_press(self,key):
+  self.queue.put({"type":"press","key":self.key_to_str(key),"time":time.time()})
+ def on_release(self,key):
+  self.queue.put({"type":"release","key":self.key_to_str(key),"time":time.time()})
+ def key_to_str(self,key):
+  try:
+   if hasattr(key,"char") and key.char:
+    return key.char
+  except Exception:
+   pass
+  return str(key)
+ def process(self):
+  while not self.stop_flag.is_set() and not self.app.stop_event.is_set():
+   try:
+    event=self.queue.get(timeout=0.5)
+   except queue.Empty:
+    continue
+   self.app.last_input=time.time()
+   if self.app.get_mode()==Mode.TRAINING:
+    self.app.request_training_interrupt()
+   self.queue.task_done()
+ def stop(self):
+  self.stop_flag.set()
+  if self.listener:
+   try:
+    self.listener.stop()
+   except Exception:
+    pass
+   self.listener=None
 class MainApp:
  def __init__(self):
   self.root=Tk()
@@ -2347,6 +2395,7 @@ class MainApp:
   self.left_controller=HandController("ai-left",self.pool.left_model,["移动轮盘拖动","移动轮盘旋转","移动轮盘校准"],64,0.0005,0.2,1.1)
   self.right_controller=HandController("ai-right",self.pool.right_model,["普攻","施放技能","回城","恢复","闪现","主动装备","取消施法"],96,0.0005,0.25,1.05)
   self.mouse_monitor=MouseMonitor(self)
+  self.keyboard_monitor=KeyboardMonitor(self)
   self.window_tracker=EmulatorWindowTracker(self)
   self.create_ui()
   self.root.protocol("WM_DELETE_WINDOW",self.stop)
@@ -2355,6 +2404,7 @@ class MainApp:
   self.left_controller.start(self)
   self.right_controller.start(self)
   self.mouse_monitor.start()
+  self.keyboard_monitor.start()
   self.input_monitor_thread=threading.Thread(target=self.monitor_input,daemon=True)
   self.input_monitor_thread.start()
   self.scheduler_thread=threading.Thread(target=self.scheduler,daemon=True)
@@ -2893,6 +2943,7 @@ class MainApp:
   self.right_controller.stop()
   self.frame_capture.stop()
   self.mouse_monitor.stop()
+  self.keyboard_monitor.stop()
   self.window_tracker.stop()
   if hasattr(self,'emulator_controller') and self.emulator_controller:
    self.emulator_controller.stop()
