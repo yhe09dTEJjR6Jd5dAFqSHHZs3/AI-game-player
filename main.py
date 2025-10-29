@@ -942,14 +942,27 @@ class LeftHandThread(threading.Thread):
             dy=math.sin(angle)*r
             end_x=center_x+dx
             end_y=center_y+dy
+            path=[(center_x,center_y)]
+            straight_x=end_x
+            straight_y=end_y
+            direction=1 if float(h_state.mean().item())>=0 else -1
+            arc_span=(0.35+0.05*((laction%8)+1))*math.pi
+            arc_steps=12
             try:
                 pyautogui.moveTo(center_x,center_y)
                 pyautogui.mouseDown()
-                pyautogui.dragTo(end_x,end_y,duration=0.05,button='left')
+                pyautogui.dragTo(straight_x,straight_y,duration=0.05,button='left',mouseDownUp=False)
+                path.append((straight_x,straight_y))
+                for step in range(1,arc_steps+1):
+                    theta=angle+direction*arc_span*step/arc_steps
+                    px=center_x+math.cos(theta)*r
+                    py=center_y+math.sin(theta)*r
+                    pyautogui.dragTo(px,py,duration=0.02,button='left',mouseDownUp=False)
+                    path.append((px,py))
                 pyautogui.mouseUp()
             except:
                 pass
-            self.app_state.record_ai_action({"hand":"left","action_id":laction,"label":"移动轮盘","type":"drag","start":(center_x,center_y),"end":(end_x,end_y),"timestamp":time.time()})
+            self.app_state.record_ai_action({"hand":"left","action_id":laction,"label":"移动轮盘","type":"drag","start":(center_x,center_y),"end":path[-1] if path else (center_x,center_y),"path":path,"timestamp":time.time(),"rotation_dir":"cw" if direction>0 else "ccw"})
             time.sleep(0.02)
 class RightHandThread(threading.Thread):
     def __init__(self,app_state):
