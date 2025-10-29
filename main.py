@@ -393,6 +393,8 @@ class RLAgent:
             rewards=[]
             mask_left=[]
             mask_right=[]
+            rl_mask_left=[]
+            rl_mask_right=[]
             for rec in batch:
                 try:
                     img=Image.open(self.file_manager.to_absolute(rec["frame"])).convert("RGB")
@@ -405,24 +407,31 @@ class RLAgent:
                 rew=1.0*A-0.5*B+0.2*C
                 rewards.append(rew)
                 act=rec["action"]
-                if act and rec["source"]=="user":
-                    if act.get("hand")=="left" and act.get("action_id") is not None:
-                        targets_left.append(int(act["action_id"]))
-                        mask_left.append(1)
-                    else:
-                        targets_left.append(0)
-                        mask_left.append(0)
-                    if act.get("hand")=="right" and act.get("action_id") is not None:
-                        targets_right.append(int(act["action_id"]))
-                        mask_right.append(1)
-                    else:
-                        targets_right.append(0)
-                        mask_right.append(0)
-                else:
-                    targets_left.append(0)
-                    targets_right.append(0)
-                    mask_left.append(0)
-                    mask_right.append(0)
+                left_target=0
+                right_target=0
+                left_super=0
+                right_super=0
+                left_rl=0
+                right_rl=0
+                if act and act.get("action_id") is not None:
+                    hand=act.get("hand")
+                    aid=int(act.get("action_id"))
+                    if hand=="left":
+                        left_target=aid
+                        left_rl=1
+                        if rec["source"]=="user":
+                            left_super=1
+                    elif hand=="right":
+                        right_target=aid
+                        right_rl=1
+                        if rec["source"]=="user":
+                            right_super=1
+                targets_left.append(left_target)
+                targets_right.append(right_target)
+                mask_left.append(left_super)
+                mask_right.append(right_super)
+                rl_mask_left.append(left_rl)
+                rl_mask_right.append(right_rl)
             if not frames:
                 continue
             t_batch=torch.cat([self.preprocess_frame(f) for f in frames],dim=0)
@@ -444,8 +453,16 @@ class RLAgent:
             rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum()>0 else torch.tensor(0.0,device=self.device)
             adv_left=(R-left_val).detach()
             adv_right=(R-right_val).detach()
-            rl_pg_left=-(left_logprob.gather(1,tl.unsqueeze(1))*adv_left).mean()
-            rl_pg_right=-(right_logprob.gather(1,tr.unsqueeze(1))*adv_right).mean()
+            rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=self.device).unsqueeze(1)
+            rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=self.device).unsqueeze(1)
+            if rl_ml.sum()>0:
+                rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
+            else:
+                rl_pg_left=torch.tensor(0.0,device=self.device)
+            if rl_mr.sum()>0:
+                rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
+            else:
+                rl_pg_right=torch.tensor(0.0,device=self.device)
             v_loss=((left_val-R)**2+(right_val-R)**2).mean()
             l2_reg=0.0
             for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters()):
