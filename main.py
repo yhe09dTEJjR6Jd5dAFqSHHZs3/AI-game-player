@@ -522,8 +522,8 @@ class AIModelHandler:
   self.thread=None
   self.cancel_flag=threading.Event()
   self.analyzer=ReinforcementAnalyzer()
- self.last_marker_stats={}
- self.last_metrics={"A":0,"B":0,"C":0}
+  self.last_marker_stats={}
+  self.last_metrics={"A":0,"B":0,"C":0}
  def optimize(self,callback=None,done=None):
   if self.optimizing:
    return
