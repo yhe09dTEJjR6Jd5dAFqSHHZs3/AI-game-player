@@ -20,6 +20,7 @@ import numpy as np
 import pyautogui
 from pynput import mouse,keyboard
 import win32gui,win32con,win32api
+from collections import deque
 from PyQt5 import QtCore,QtGui,QtWidgets
 class Mode(Enum):
     INIT=0
@@ -29,6 +30,7 @@ class Mode(Enum):
     TRAINING=4
 def clamp(v,a,b):
     return max(a,min(b,v))
+RIGHT_ACTION_LABELS=["回城","恢复","闪现","普攻","一技能","二技能","三技能","四技能","取消施法","主动装备","数据A","数据B","数据C"]
 def get_desktop_path():
     return os.path.join(os.path.expanduser("~"),"Desktop")
 class AAAFileManager:
@@ -462,6 +464,11 @@ class OverlayWindow(QtWidgets.QWidget):
         self.markers=[]
         self.selected_marker=None
         self.config_mode=False
+    def find_marker(self,label):
+        for m in self.markers:
+            if m.label==label:
+                return m
+        return None
     def sync_with_window(self):
         if self.app_state.hwnd is None:
             return
@@ -565,6 +572,7 @@ class AppState:
         self.idle_threshold=10.0
         self.paused_by_visibility=False
         self.current_hidden=torch.zeros(1,32)
+        self.ai_action_queue=deque()
     def set_hwnd(self,hwnd):
         with self.lock:
             self.hwnd=hwnd
@@ -610,6 +618,28 @@ class AppState:
     def consume_cancel_request(self):
         with self.lock:
             return self.cancel_optimization
+    def record_ai_action(self,action):
+        with self.lock:
+            if len(self.ai_action_queue)>64:
+                self.ai_action_queue.popleft()
+            self.ai_action_queue.append(action)
+    def consume_ai_action(self):
+        with self.lock:
+            if self.ai_action_queue:
+                return self.ai_action_queue.popleft()
+            return None
+    def get_marker_geometry(self,label):
+        with self.lock:
+            rect=self.window_rect
+            overlay=self.overlay
+        if overlay:
+            marker=overlay.find_marker(label)
+            if marker:
+                cx=rect[0]+marker.x_pct*(rect[2]-rect[0])
+                cy=rect[1]+marker.y_pct*(rect[3]-rect[1])
+                r=marker.r_pct*min(rect[2]-rect[0],rect[3]-rect[1])
+                return cx,cy,r
+        return rect[0]+(rect[2]-rect[0])*0.5,rect[1]+(rect[3]-rect[1])*0.5,min(rect[2]-rect[0],rect[3]-rect[1])*0.1
 class InputTracker:
     def __init__(self,app_state):
         self.app_state=app_state
@@ -713,8 +743,12 @@ class ScreenshotRecorder(threading.Thread):
                     img=None
                 if img is not None:
                     self.app_state.update_state_from_frame(img)
-                    act=self.input_tracker.get_last_action_and_reset()
-                    src="user" if mode==Mode.LEARNING else "ai"
+                    if mode==Mode.LEARNING:
+                        act=self.input_tracker.get_last_action_and_reset()
+                        src="user"
+                    else:
+                        act=self.app_state.consume_ai_action()
+                        src="ai"
                     self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
             time.sleep(dt)
 class LeftHandThread(threading.Thread):
@@ -739,17 +773,20 @@ class LeftHandThread(threading.Thread):
             with self.app_state.lock:
                 self.app_state.training_hidden_states["left"]=lh2
                 self.app_state.training_hidden_states["right"]=rh2
-            center_x=rect[0]+(rect[2]-rect[0])*0.2
-            center_y=rect[1]+(rect[3]-rect[1])*0.8
-            dx=math.cos(laction/16.0*2*math.pi)*100
-            dy=math.sin(laction/16.0*2*math.pi)*100
+            center_x,center_y,r=self.app_state.get_marker_geometry("移动轮盘")
+            angle=(laction/16.0)*2*math.pi
+            dx=math.cos(angle)*r
+            dy=math.sin(angle)*r
+            end_x=center_x+dx
+            end_y=center_y+dy
             try:
                 pyautogui.moveTo(center_x,center_y)
                 pyautogui.mouseDown()
-                pyautogui.dragTo(center_x+dx,center_y+dy,duration=0.05,button='left')
+                pyautogui.dragTo(end_x,end_y,duration=0.05,button='left')
                 pyautogui.mouseUp()
             except:
                 pass
+            self.app_state.record_ai_action({"hand":"left","action_id":laction,"label":"移动轮盘","type":"drag","start":(center_x,center_y),"end":(end_x,end_y),"timestamp":time.time()})
             time.sleep(0.02)
 class RightHandThread(threading.Thread):
     def __init__(self,app_state):
@@ -773,19 +810,44 @@ class RightHandThread(threading.Thread):
             with self.app_state.lock:
                 self.app_state.training_hidden_states["left"]=lh2
                 self.app_state.training_hidden_states["right"]=rh2
-            skill_index=raction%8
-            posx=rect[0]+(rect[2]-rect[0])*(0.7+0.03*skill_index)
-            posy=rect[1]+(rect[3]-rect[1])*0.8
+            label=RIGHT_ACTION_LABELS[raction%len(RIGHT_ACTION_LABELS)]
+            cx,cy,r=self.app_state.get_marker_geometry(label)
+            start_x=cx
+            start_y=cy
+            end_x=cx
+            end_y=cy
+            action_type="click"
             try:
-                pyautogui.moveTo(posx,posy)
-                if skill_index in [1,2,3]:
+                if label=="闪现":
+                    angle=(raction%len(RIGHT_ACTION_LABELS))/float(len(RIGHT_ACTION_LABELS))
+                    end_x=cx+math.cos(angle*2*math.pi)*r
+                    end_y=cy+math.sin(angle*2*math.pi)*r
+                    pyautogui.moveTo(cx,cy)
                     pyautogui.mouseDown()
-                    pyautogui.dragTo(posx-100,posy-100,duration=0.05,button='left')
+                    pyautogui.dragTo(end_x,end_y,duration=0.05,button='left')
                     pyautogui.mouseUp()
+                    action_type="drag"
+                elif label in ["一技能","二技能","三技能","四技能"]:
+                    end_y=cy-r
+                    pyautogui.moveTo(cx,cy)
+                    pyautogui.mouseDown()
+                    pyautogui.dragTo(cx,end_y,duration=0.05,button='left')
+                    pyautogui.mouseUp()
+                    action_type="drag"
+                elif label=="取消施法":
+                    start_x=cx+r*2
+                    start_y=cy+r*2
+                    pyautogui.moveTo(start_x,start_y)
+                    pyautogui.mouseDown()
+                    pyautogui.dragTo(cx,cy,duration=0.05,button='left')
+                    pyautogui.mouseUp()
+                    action_type="drag"
                 else:
+                    pyautogui.moveTo(cx,cy)
                     pyautogui.click()
             except:
                 pass
+            self.app_state.record_ai_action({"hand":"right","action_id":raction,"label":label,"type":action_type,"start":(start_x,start_y),"end":(end_x,end_y),"timestamp":time.time()})
             time.sleep(0.05)
 class OptimizationThread(threading.Thread):
     def __init__(self,app_state):
