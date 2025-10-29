@@ -2264,8 +2264,16 @@ class MainApp:
   self.gesture_manager=GestureManager(self)
   self.default_folder=Path(os.path.expanduser("~"))/"Desktop"/"AAA"
   self.pool=ExperiencePool(self.default_folder)
-  self.pool.config_manager.update("aaa_folder",str(self.default_folder))
-  self.overlay.load_markers(self.pool.config_manager.data.get("markers",{}))
+  config_data=self.pool.config_manager.data
+  if "aaa_folder" in config_data:
+   stored_folder=Path(config_data.get("aaa_folder",str(self.default_folder)))
+   if stored_folder.resolve()!=self.pool.folder.resolve():
+    self.pool.migrate(stored_folder)
+    config_data=self.pool.config_manager.data
+  else:
+   self.pool.config_manager.update("aaa_folder",str(self.pool.folder))
+   config_data=self.pool.config_manager.data
+  self.overlay.load_markers(config_data.get("markers",{}))
   self.ensure_default_markers()
   self.stop_event=threading.Event()
   self.user_active=True
