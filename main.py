@@ -472,8 +472,23 @@ class AAAFileManager:
                 state=payload.get("state",{})
             else:
                 state=payload
-            module.load_state_dict(state)
-            self._record_model_status(name,True,"已加载")
+            if not isinstance(state,dict):
+                raise ValueError("模型状态格式错误")
+            if not state:
+                self._reset_module_parameters(module)
+                self._record_model_status(name,False,"等待训练:空参数")
+                return
+            self._reset_module_parameters(module)
+            result=module.load_state_dict(state,strict=False)
+            missing=list(getattr(result,"missing_keys",[]))
+            unexpected=list(getattr(result,"unexpected_keys",[]))
+            if missing or unexpected:
+                logger.info("加载%s模型完成,缺失:%d,多余:%d",name,len(missing),len(unexpected))
+            status_ok=len(missing)==0
+            detail="已加载" if status_ok else "部分加载:缺少"+str(len(missing))
+            if unexpected:
+                detail+=";多余"+str(len(unexpected))
+            self._record_model_status(name,status_ok,detail)
         except (OSError,RuntimeError,ValueError) as e:
             logger.warning("加载%s模型失败:%s",name,e)
             self._reset_module_parameters(module)
