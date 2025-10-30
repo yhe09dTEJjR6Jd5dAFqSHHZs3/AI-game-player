@@ -1551,7 +1551,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.app_state.right_thread=RightHandThread(self.app_state)
             self.app_state.right_thread.start()
     def stop_training_threads(self):
-        pass
+        threads=[]
+        if self.app_state.left_thread is not None:
+            self.app_state.left_thread.stop_flag=True
+            threads.append(("left_thread",self.app_state.left_thread))
+        if self.app_state.right_thread is not None:
+            self.app_state.right_thread.stop_flag=True
+            threads.append(("right_thread",self.app_state.right_thread))
+        for name,thr in threads:
+            try:
+                thr.join(timeout=1.0)
+            except:
+                pass
+            setattr(self.app_state,name,None)
     def on_timer(self):
         self.maybe_init()
         self.app_state.update_window_rect()
