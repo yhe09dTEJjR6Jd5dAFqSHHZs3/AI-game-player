@@ -38,8 +38,9 @@ def enforce_agent_rules():
     with open(src_path,'r',encoding='utf-8') as fh:
         data=fh.read()
     normalized=data.replace('\r\n','\n').replace('\r','\n')
-    if '\n\n' in normalized:
-        raise RuntimeError('AGENTS_BLANK_LINE')
+    for line in normalized.splitlines():
+        if line.strip()=="":
+            raise RuntimeError('AGENTS_BLANK_LINE')
     reader=io.StringIO(data)
     for tok in tokenize.generate_tokens(reader.readline):
         if tok.type==tokenize.COMMENT:
