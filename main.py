@@ -728,11 +728,17 @@ class AdaptiveRewardModel:
         hero_factor=0.6+0.4*float(hero_dead)
         density=len(self.recent)/float(self.recent.maxlen if self.recent.maxlen else 1)
         skill_focus=0.5+density*0.5
-        emphasis=torch.stack([self.running[0]+resource_score,self.running[2]+skill_focus,self.running[1]+hero_factor])
-        weights=F.softmax(emphasis,dim=0)
-        adjust=torch.tensor([1.0+resource_score,hero_factor,skill_focus if is_ai else self.user_bias],dtype=torch.float32,device=device)
-        pref=torch.stack([weights[0]*adjust[0],-(weights[2]*adjust[1]),weights[1]*adjust[2]],dim=0)
-        self.preference=pref
+        emphasis=torch.stack([self.running[0]+resource_score,self.running[1]+hero_factor,self.running[2]+skill_focus])
+        context=torch.tanh(emphasis)
+        base=torch.tensor([1.0,0.6,0.3],dtype=torch.float32,device=device)
+        adjust=torch.tensor([1.0+resource_score*0.5,1.0+hero_factor*0.5,1.0+(skill_focus if is_ai else self.user_bias)*0.5],dtype=torch.float32,device=device)
+        scaled=base*(1.0+context*0.4)*adjust
+        pref_A=torch.clamp(scaled[0],min=0.2)
+        pref_B=torch.clamp(scaled[1],min=0.1)
+        pref_C=torch.clamp(scaled[2],min=0.05)
+        pref_B=torch.clamp(pref_B,max=pref_A*0.85)
+        pref_C=torch.clamp(pref_C,max=pref_B*0.85)
+        self.preference=torch.stack([pref_A,-pref_B,pref_C],dim=0)
         self.temperature=float(clamp(resource_score*1.8+0.4,0.5,2.5))
     def compute(self,metrics,source,hero_dead,is_ai):
         device=self.running.device
