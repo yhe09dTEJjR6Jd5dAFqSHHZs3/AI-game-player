@@ -31,6 +31,56 @@ class Mode(Enum):
 def clamp(v,a,b):
     return max(a,min(b,v))
 RIGHT_ACTION_LABELS=["回城","恢复","闪现","普攻","一技能","二技能","三技能","四技能","取消施法","主动装备","数据A","数据B","数据C"]
+def build_right_mapping():
+    mapping={}
+    offset=0
+    mapping["回城"]=(offset,1)
+    offset+=1
+    mapping["恢复"]=(offset,1)
+    offset+=1
+    mapping["闪现"]=(offset,4)
+    offset+=4
+    mapping["普攻"]=(offset,1)
+    offset+=1
+    mapping["一技能"]=(offset,4)
+    offset+=4
+    mapping["二技能"]=(offset,4)
+    offset+=4
+    mapping["三技能"]=(offset,4)
+    offset+=4
+    mapping["四技能"]=(offset,4)
+    offset+=4
+    mapping["取消施法"]=(offset,4)
+    offset+=4
+    mapping["主动装备"]=(offset,1)
+    offset+=1
+    mapping["数据A"]=(offset,1)
+    offset+=1
+    mapping["数据B"]=(offset,1)
+    offset+=1
+    mapping["数据C"]=(offset,1)
+    offset+=1
+    mapping["其他"]=(31,1)
+    return mapping
+def build_right_decode_table(mapping):
+    table=[]
+    size=32
+    for idx in range(size):
+        label="其他"
+        count=1
+        local=0
+        base=mapping.get("其他",(31,1))[0]
+        for name,(start,length) in mapping.items():
+            if start<=idx<start+length and name!="其他":
+                label=name
+                count=length
+                local=idx-start
+                base=start
+                break
+        table.append((label,count,local,base))
+    return table
+RIGHT_ACTION_MAPPING=build_right_mapping()
+RIGHT_ACTION_TABLE=build_right_decode_table(RIGHT_ACTION_MAPPING)
 def get_desktop_path():
     return os.path.join(os.path.expanduser("~"),"Desktop")
 class AAAFileManager:
@@ -342,8 +392,9 @@ class HandPolicy(nn.Module):
         val=self.critic(y[:,-1])
         return logits,val,hx
 class RLAgent:
-    def __init__(self,file_manager):
-        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self,file_manager,hardware_manager):
+        self.hardware=hardware_manager
+        self.device=self.hardware.suggest_device()
         self.vision=VisionModel().to(self.device)
         self.left=HandPolicy(32,16).to(self.device)
         self.right=HandPolicy(32,32).to(self.device)
@@ -358,13 +409,29 @@ class RLAgent:
         self.value_coef=0.5
         self.global_step=0
         self.neuro_state=torch.zeros(32,device=self.device)
+    def ensure_device(self):
+        target=self.hardware.suggest_device()
+        if target.type!=self.device.type:
+            self.vision.to(target)
+            self.left.to(target)
+            self.right.to(target)
+            self.neuro_module.to(target)
+            for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
+                for st in opt.state.values():
+                    for k,v in list(st.items()):
+                        if torch.is_tensor(v):
+                            st[k]=v.to(target)
+            self.neuro_state=self.neuro_state.to(target)
+            self.device=target
     def preprocess_frame(self,img):
+        self.ensure_device()
         img=img.resize((240,240))
         arr=np.array(img).astype(np.float32)/255.0
         arr=np.transpose(arr,(2,0,1))
         t=torch.tensor(arr,dtype=torch.float32).unsqueeze(0).to(self.device)
         return t
     def infer_state(self,img):
+        self.ensure_device()
         with torch.no_grad():
             t=self.preprocess_frame(img)
             metrics,flags,h=self.vision(t)
@@ -376,6 +443,7 @@ class RLAgent:
             cooldowns={"recall":False,"heal":bool(flags[2]>0.5),"flash":bool(flags[3]>0.5),"basic":False,"skill1":bool(flags[4]>0.5),"skill2":bool(flags[5]>0.5),"skill3":bool(flags[6]>0.5),"skill4":bool(flags[7]>0.5),"active_item":bool(flags[8]>0.5),"cancel":False}
             return {"A":int(max(metrics[0],0)),"B":int(max(metrics[1],0)),"C":int(max(metrics[2],0))},hero_dead,in_recall,cooldowns,brain_output.detach().cpu()
     def select_actions(self,h_state,left_hidden,right_hidden):
+        self.ensure_device()
         lf_in=h_state.unsqueeze(0).unsqueeze(0)
         rf_in=h_state.unsqueeze(0).unsqueeze(0)
         llogits,lval,left_hidden=self.left(lf_in,left_hidden)
@@ -386,6 +454,7 @@ class RLAgent:
         raction=torch.multinomial(rprob,1).item()
         return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,left_hidden,right_hidden
     def neuro_project(self,h_batch):
+        self.ensure_device()
         outputs=[]
         state=torch.zeros(h_batch.size(1),device=self.device,dtype=h_batch.dtype)
         for i in range(h_batch.size(0)):
@@ -393,117 +462,131 @@ class RLAgent:
             outputs.append(out.unsqueeze(0))
         return torch.cat(outputs,dim=0)
     def reset_neuro_state(self):
+        self.ensure_device()
         self.neuro_state=torch.zeros(32,device=self.device)
-    def optimize_from_buffer(self,buffer,progress_get_cancel,progress_set,markers_updater,max_iters=1000):
+    def optimize_from_buffer(self,buffer,progress_get_cancel,progress_set,markers_updater,markers_persist,max_iters=1000):
         cancelled=False
+        effective_steps=0
         for it in range(max_iters):
             if progress_get_cancel():
                 cancelled=True
                 break
-            batch=buffer.sample(32)
-            if not batch:
-                break
-            frames=[]
-            targets_left=[]
-            targets_right=[]
-            rewards=[]
-            mask_left=[]
-            mask_right=[]
-            rl_mask_left=[]
-            rl_mask_right=[]
-            for rec in batch:
-                try:
-                    img=Image.open(self.file_manager.to_absolute(rec["frame"])).convert("RGB")
-                except:
+            self.ensure_device()
+            inner_count=max(1,self.hardware.suggest_parallel())
+            any_step=False
+            for inner in range(inner_count):
+                batch=buffer.sample(self.hardware.suggest_batch_size())
+                if not batch:
                     continue
-                frames.append(img)
-                A=float(rec["metrics"]["A"])
-                B=float(rec["metrics"]["B"])
-                C=float(rec["metrics"]["C"])
-                rew=1.0*A-0.5*B+0.2*C
-                rewards.append(rew)
-                act=rec["action"]
-                left_target=0
-                right_target=0
-                left_super=0
-                right_super=0
-                left_rl=0
-                right_rl=0
-                if act and act.get("action_id") is not None:
-                    hand=act.get("hand")
-                    aid=int(act.get("action_id"))
-                    if hand=="left":
-                        left_target=aid
-                        left_rl=1
-                        if rec["source"]=="user":
-                            left_super=1
-                    elif hand=="right":
-                        right_target=aid
-                        right_rl=1
-                        if rec["source"]=="user":
-                            right_super=1
-                targets_left.append(left_target)
-                targets_right.append(right_target)
-                mask_left.append(left_super)
-                mask_right.append(right_super)
-                rl_mask_left.append(left_rl)
-                rl_mask_right.append(right_rl)
-            if not frames:
-                continue
-            t_batch=torch.cat([self.preprocess_frame(f) for f in frames],dim=0)
-            metrics,flags,h=self.vision(t_batch)
-            h_brain=self.neuro_project(h)
-            with torch.no_grad():
-                R=torch.tensor(rewards,dtype=torch.float32,device=self.device).unsqueeze(1)
-            left_logits,left_val,_=self.left(h_brain.unsqueeze(1))
-            right_logits,right_val,_=self.right(h_brain.unsqueeze(1))
-            left_logprob=F.log_softmax(left_logits,dim=-1)
-            right_logprob=F.log_softmax(right_logits,dim=-1)
-            left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
-            right_ent=(-right_logprob.exp()*right_logprob).sum(dim=-1).mean()
-            tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=self.device)
-            tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=self.device)
-            ml=torch.tensor(mask_left,dtype=torch.float32,device=self.device)
-            mr=torch.tensor(mask_right,dtype=torch.float32,device=self.device)
-            ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum()>0 else torch.tensor(0.0,device=self.device)
-            rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum()>0 else torch.tensor(0.0,device=self.device)
-            adv_left=(R-left_val).detach()
-            adv_right=(R-right_val).detach()
-            rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=self.device).unsqueeze(1)
-            rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=self.device).unsqueeze(1)
-            if rl_ml.sum()>0:
-                rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
-            else:
-                rl_pg_left=torch.tensor(0.0,device=self.device)
-            if rl_mr.sum()>0:
-                rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
-            else:
-                rl_pg_right=torch.tensor(0.0,device=self.device)
-            v_loss=((left_val-R)**2+(right_val-R)**2).mean()
-            l2_reg=0.0
-            for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters()):
-                l2_reg=l2_reg+p.pow(2).sum()*1e-6
-            loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent)+l2_reg
-            self.vision_opt.zero_grad()
-            self.left_opt.zero_grad()
-            self.right_opt.zero_grad()
-            self.neuro_opt.zero_grad()
-            loss.backward()
-            for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
-                for g in opt.param_groups:
-                    base_lr=g["lr"]
-                    scale=1.0/(1.0+0.0001*self.global_step)
-                    g["lr"]=base_lr*scale
-                opt.step()
-            self.global_step+=1
-            if it%10==0:
-                markers_updater()
-            progress_set(int(100.0*it/max_iters))
+                frames=[]
+                targets_left=[]
+                targets_right=[]
+                rewards=[]
+                mask_left=[]
+                mask_right=[]
+                rl_mask_left=[]
+                rl_mask_right=[]
+                for rec in batch:
+                    try:
+                        img=Image.open(self.file_manager.to_absolute(rec["frame"])).convert("RGB")
+                    except:
+                        continue
+                    frames.append(img)
+                    A=float(rec["metrics"]["A"])
+                    B=float(rec["metrics"]["B"])
+                    C=float(rec["metrics"]["C"])
+                    rew=1.0*A-0.5*B+0.2*C
+                    rewards.append(rew)
+                    act=rec["action"]
+                    left_target=0
+                    right_target=0
+                    left_super=0
+                    right_super=0
+                    left_rl=0
+                    right_rl=0
+                    if act and act.get("action_id") is not None:
+                        hand=act.get("hand")
+                        aid=int(act.get("action_id"))
+                        if hand=="left":
+                            left_target=aid
+                            left_rl=1
+                            if rec["source"]=="user":
+                                left_super=1
+                        elif hand=="right":
+                            right_target=aid
+                            right_rl=1
+                            if rec["source"]=="user":
+                                right_super=1
+                    targets_left.append(left_target)
+                    targets_right.append(right_target)
+                    mask_left.append(left_super)
+                    mask_right.append(right_super)
+                    rl_mask_left.append(left_rl)
+                    rl_mask_right.append(right_rl)
+                if not frames:
+                    continue
+                any_step=True
+                effective_steps+=1
+                t_batch=torch.cat([self.preprocess_frame(f) for f in frames],dim=0)
+                metrics,flags,h=self.vision(t_batch)
+                h_brain=self.neuro_project(h)
+                with torch.no_grad():
+                    R=torch.tensor(rewards,dtype=torch.float32,device=self.device).unsqueeze(1)
+                left_logits,left_val,_=self.left(h_brain.unsqueeze(1))
+                right_logits,right_val,_=self.right(h_brain.unsqueeze(1))
+                left_logprob=F.log_softmax(left_logits,dim=-1)
+                right_logprob=F.log_softmax(right_logits,dim=-1)
+                left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
+                right_ent=(-right_logprob.exp()*right_logprob).sum(dim=-1).mean()
+                tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=self.device)
+                tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=self.device)
+                ml=torch.tensor(mask_left,dtype=torch.float32,device=self.device)
+                mr=torch.tensor(mask_right,dtype=torch.float32,device=self.device)
+                ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum()>0 else torch.tensor(0.0,device=self.device)
+                rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum()>0 else torch.tensor(0.0,device=self.device)
+                adv_left=(R-left_val).detach()
+                adv_right=(R-right_val).detach()
+                rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=self.device).unsqueeze(1)
+                rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=self.device).unsqueeze(1)
+                if rl_ml.sum()>0:
+                    rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
+                else:
+                    rl_pg_left=torch.tensor(0.0,device=self.device)
+                if rl_mr.sum()>0:
+                    rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
+                else:
+                    rl_pg_right=torch.tensor(0.0,device=self.device)
+                v_loss=((left_val-R)**2+(right_val-R)**2).mean()
+                l2_reg=0.0
+                for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters()):
+                    l2_reg=l2_reg+p.pow(2).sum()*1e-6
+                loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent)+l2_reg
+                self.vision_opt.zero_grad()
+                self.left_opt.zero_grad()
+                self.right_opt.zero_grad()
+                self.neuro_opt.zero_grad()
+                loss.backward()
+                for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
+                    for g in opt.param_groups:
+                        base_lr=g["lr"]
+                        scale=1.0/(1.0+0.0001*self.global_step)
+                        g["lr"]=base_lr*scale
+                    opt.step()
+                self.global_step+=1
+                if effective_steps%10==0:
+                    markers_updater()
+                if markers_persist and effective_steps%50==0:
+                    markers_persist()
+            progress_set(int(100.0*(it+1)/max_iters))
+            if not any_step:
+                break
         if cancelled:
             progress_set(0)
         else:
             progress_set(100)
             self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module)
+        if markers_persist:
+            markers_persist()
         return not cancelled
 class MarkerWidget(QtWidgets.QWidget):
     def __init__(self,parent,label,color,alpha,x_pct,y_pct,r_pct):
@@ -656,25 +739,73 @@ class OverlayWindow(QtWidgets.QWidget):
         return out
 class HardwareAdaptiveRate:
     def __init__(self):
-        pass
-    def get_hz(self):
-        cpu_load=psutil.cpu_percent()
+        self.batch_size=32
+        self.parallel=1
+        self.hand_interval=0.05
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.cpu_load=0.0
+        self.mem_free=0.5
+        self.gpu_free=0.5
+        self.last_refresh=0.0
+    def refresh(self):
+        now=time.time()
+        if now-self.last_refresh<0.5:
+            return
+        self.cpu_load=psutil.cpu_percent()
         vm=psutil.virtual_memory()
-        mem_free_ratio=vm.available/float(vm.total if vm.total>0 else 1)
+        self.mem_free=vm.available/float(vm.total if vm.total>0 else 1)
         if torch.cuda.is_available():
             try:
-                total=torch.cuda.get_device_properties(0).total_memory
-                used=torch.cuda.memory_allocated(0)
-                gpu_free_ratio=(total-used)/float(total if total>0 else 1)
+                props=torch.cuda.get_device_properties(0)
+                total=float(props.total_memory)
+                allocated=float(torch.cuda.memory_allocated(0))
+                reserved=float(torch.cuda.memory_reserved(0))
+                used=max(allocated,reserved)
+                self.gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
             except:
-                gpu_free_ratio=0.5
+                self.gpu_free=0.5
         else:
-            gpu_free_ratio=0.5
-        score=(1.0-cpu_load/100.0)*0.4+mem_free_ratio*0.2+gpu_free_ratio*0.4
+            self.gpu_free=0.5
+        if self.cpu_load>85 or self.mem_free<0.1:
+            self.batch_size=max(16,self.batch_size-8)
+            self.parallel=max(1,self.parallel-1)
+            self.hand_interval=min(0.12,self.hand_interval+0.01)
+        else:
+            if self.cpu_load<60 and self.mem_free>0.2:
+                self.batch_size=min(64,self.batch_size+4)
+            if self.cpu_load<70:
+                self.parallel=min(4,self.parallel+1)
+            if self.hand_interval>0.025 and self.cpu_load<70:
+                self.hand_interval=max(0.02,self.hand_interval-0.005)
+        if torch.cuda.is_available():
+            if self.gpu_free>0.25 and self.cpu_load>70:
+                target=torch.device("cuda")
+            elif self.gpu_free<0.1:
+                target=torch.device("cpu")
+            else:
+                target=self.device
+        else:
+            target=torch.device("cpu")
+        self.device=target
+        self.last_refresh=now
+    def get_hz(self):
+        self.refresh()
+        score=(1.0-self.cpu_load/100.0)*0.4+self.mem_free*0.2+self.gpu_free*0.4
         score=clamp(score,0.0,1.0)
-        hz=1.0+score*(120.0-1.0)
-        hz=int(max(1,min(120,int(hz))))
+        hz=int(max(1,min(120,int(1.0+score*(120.0-1.0)))))
         return hz
+    def suggest_batch_size(self):
+        self.refresh()
+        return self.batch_size
+    def suggest_parallel(self):
+        self.refresh()
+        return self.parallel
+    def suggest_hand_interval(self):
+        self.refresh()
+        return self.hand_interval
+    def suggest_device(self):
+        self.refresh()
+        return self.device
 def enum_windows():
     result=[]
     def callback(hwnd,extra):
@@ -743,7 +874,7 @@ def window_visible(hwnd):
         pass
     return True
 class AppState:
-    def __init__(self,file_manager,agent,buffer):
+    def __init__(self,file_manager,agent,buffer,hardware_manager):
         self.lock=threading.Lock()
         self.mode=Mode.INIT
         self.ready=False
@@ -759,6 +890,7 @@ class AppState:
         self.file_manager=file_manager
         self.agent=agent
         self.buffer=buffer
+        self.hardware=hardware_manager
         self.overlay=None
         self.left_thread=None
         self.right_thread=None
@@ -844,44 +976,13 @@ class InputTracker:
         self.action_queue=deque()
         self.lock=threading.Lock()
         self.left_labels=["移动轮盘"]
-        self.right_mapping=self.build_right_mapping()
+        self.right_mapping=dict(RIGHT_ACTION_MAPPING)
         self.button_paths={mouse.Button.left:[],mouse.Button.right:[],mouse.Button.middle:[]}
         self.button_state=set()
         self.listener_mouse=mouse.Listener(on_click=self.on_click,on_move=self.on_move,on_scroll=self.on_scroll)
         self.listener_keyboard=keyboard.Listener(on_press=self.on_key_press)
         self.listener_mouse.start()
         self.listener_keyboard.start()
-    def build_right_mapping(self):
-        mapping={}
-        offset=0
-        mapping["回城"]=(offset,1)
-        offset+=1
-        mapping["恢复"]=(offset,1)
-        offset+=1
-        mapping["闪现"]=(offset,4)
-        offset+=4
-        mapping["普攻"]=(offset,1)
-        offset+=1
-        mapping["一技能"]=(offset,4)
-        offset+=4
-        mapping["二技能"]=(offset,4)
-        offset+=4
-        mapping["三技能"]=(offset,4)
-        offset+=4
-        mapping["四技能"]=(offset,4)
-        offset+=4
-        mapping["取消施法"]=(offset,4)
-        offset+=4
-        mapping["主动装备"]=(offset,1)
-        offset+=1
-        mapping["数据A"]=(offset,1)
-        offset+=1
-        mapping["数据B"]=(offset,1)
-        offset+=1
-        mapping["数据C"]=(offset,1)
-        offset+=1
-        mapping["其他"]=(31,1)
-        return mapping
     def summarize_path(self,path,max_points=6):
         if not path:
             return []
@@ -1079,8 +1180,15 @@ class LeftHandThread(threading.Thread):
             if not cond:
                 time.sleep(0.01)
                 continue
-            h_state=hidden_vec.to(self.app_state.agent.device)
+            device=self.app_state.agent.device
+            h_state=hidden_vec.to(device)
+            if lh is not None:
+                lh=lh.to(device)
+            if rh is not None:
+                rh=rh.to(device)
             laction,raction,lprob,rprob,lval,rval,lh2,rh2=self.app_state.agent.select_actions(h_state,lh,rh)
+            lh2=lh2.detach() if lh2 is not None else None
+            rh2=rh2.detach() if rh2 is not None else None
             with self.app_state.lock:
                 self.app_state.training_hidden_states["left"]=lh2
                 self.app_state.training_hidden_states["right"]=rh2
@@ -1096,22 +1204,25 @@ class LeftHandThread(threading.Thread):
             direction=1 if float(h_state.mean().item())>=0 else -1
             arc_span=(0.35+0.05*((laction%8)+1))*math.pi
             arc_steps=12
+            hand_interval=self.app_state.hardware.suggest_hand_interval()
+            drag_duration=max(0.02,hand_interval*1.5)
+            arc_duration=max(0.01,hand_interval)
             try:
                 pyautogui.moveTo(center_x,center_y)
                 pyautogui.mouseDown()
-                pyautogui.dragTo(straight_x,straight_y,duration=0.05,button='left',mouseDownUp=False)
+                pyautogui.dragTo(straight_x,straight_y,duration=drag_duration,button='left',mouseDownUp=False)
                 path.append((straight_x,straight_y))
                 for step in range(1,arc_steps+1):
                     theta=angle+direction*arc_span*step/arc_steps
                     px=center_x+math.cos(theta)*r
                     py=center_y+math.sin(theta)*r
-                    pyautogui.dragTo(px,py,duration=0.02,button='left',mouseDownUp=False)
+                    pyautogui.dragTo(px,py,duration=arc_duration,button='left',mouseDownUp=False)
                     path.append((px,py))
                 pyautogui.mouseUp()
             except:
                 pass
             self.app_state.record_ai_action({"hand":"left","action_id":laction,"label":"移动轮盘","type":"drag","start":(center_x,center_y),"end":path[-1] if path else (center_x,center_y),"path":path,"timestamp":time.time(),"rotation_dir":"cw" if direction>0 else "ccw"})
-            time.sleep(0.02)
+            time.sleep(max(0.01,hand_interval))
 class RightHandThread(threading.Thread):
     def __init__(self,app_state):
         super(RightHandThread,self).__init__()
@@ -1129,50 +1240,62 @@ class RightHandThread(threading.Thread):
             if not cond:
                 time.sleep(0.01)
                 continue
-            h_state=hidden_vec.to(self.app_state.agent.device)
+            device=self.app_state.agent.device
+            h_state=hidden_vec.to(device)
+            if lh is not None:
+                lh=lh.to(device)
+            if rh is not None:
+                rh=rh.to(device)
             laction,raction,lprob,rprob,lval,rval,lh2,rh2=self.app_state.agent.select_actions(h_state,lh,rh)
+            lh2=lh2.detach() if lh2 is not None else None
+            rh2=rh2.detach() if rh2 is not None else None
             with self.app_state.lock:
                 self.app_state.training_hidden_states["left"]=lh2
                 self.app_state.training_hidden_states["right"]=rh2
-            label=RIGHT_ACTION_LABELS[raction%len(RIGHT_ACTION_LABELS)]
+            info=RIGHT_ACTION_TABLE[raction%len(RIGHT_ACTION_TABLE)]
+            label=info[0]
+            bins=info[1]
+            local=info[2]
+            if label not in RIGHT_ACTION_LABELS:
+                label="普攻"
             cx,cy,r=self.app_state.get_marker_geometry(label)
             start_x=cx
             start_y=cy
             end_x=cx
             end_y=cy
             action_type="click"
+            hand_interval=self.app_state.hardware.suggest_hand_interval()
+            drag_duration=max(0.02,hand_interval*1.5)
             try:
-                if label=="闪现":
-                    angle=(raction%len(RIGHT_ACTION_LABELS))/float(len(RIGHT_ACTION_LABELS))
-                    end_x=cx+math.cos(angle*2*math.pi)*r
-                    end_y=cy+math.sin(angle*2*math.pi)*r
+                if bins>1:
+                    angle=2*math.pi*((local+0.5)/float(bins))
+                    if label=="取消施法":
+                        start_x=cx+math.cos(angle)*r*2.0
+                        start_y=cy+math.sin(angle)*r*2.0
+                        end_x=cx
+                        end_y=cy
+                        pyautogui.moveTo(start_x,start_y)
+                        pyautogui.mouseDown()
+                        pyautogui.dragTo(end_x,end_y,duration=drag_duration,button='left')
+                        pyautogui.mouseUp()
+                    else:
+                        end_x=cx+math.cos(angle)*r
+                        end_y=cy+math.sin(angle)*r
+                        pyautogui.moveTo(cx,cy)
+                        pyautogui.mouseDown()
+                        pyautogui.dragTo(end_x,end_y,duration=drag_duration,button='left')
+                        pyautogui.mouseUp()
+                    action_type="drag"
+                elif label in ["回城","恢复","普攻","主动装备","数据A","数据B","数据C"]:
                     pyautogui.moveTo(cx,cy)
-                    pyautogui.mouseDown()
-                    pyautogui.dragTo(end_x,end_y,duration=0.05,button='left')
-                    pyautogui.mouseUp()
-                    action_type="drag"
-                elif label in ["一技能","二技能","三技能","四技能"]:
-                    end_y=cy-r
-                    pyautogui.moveTo(cx,cy)
-                    pyautogui.mouseDown()
-                    pyautogui.dragTo(cx,end_y,duration=0.05,button='left')
-                    pyautogui.mouseUp()
-                    action_type="drag"
-                elif label=="取消施法":
-                    start_x=cx+r*2
-                    start_y=cy+r*2
-                    pyautogui.moveTo(start_x,start_y)
-                    pyautogui.mouseDown()
-                    pyautogui.dragTo(cx,cy,duration=0.05,button='left')
-                    pyautogui.mouseUp()
-                    action_type="drag"
+                    pyautogui.click()
                 else:
                     pyautogui.moveTo(cx,cy)
                     pyautogui.click()
             except:
                 pass
             self.app_state.record_ai_action({"hand":"right","action_id":raction,"label":label,"type":action_type,"start":(start_x,start_y),"end":(end_x,end_y),"timestamp":time.time()})
-            time.sleep(0.05)
+            time.sleep(max(0.01,hand_interval))
 class OptimizationThread(threading.Thread):
     def __init__(self,app_state):
         super(OptimizationThread,self).__init__()
@@ -1195,7 +1318,11 @@ class OptimizationThread(threading.Thread):
                         m.y_pct=clamp(st["y_pct"],0.0,1.0)
                         m.r_pct=clamp(st["r_pct"],0.01,0.5)
                         m.update_geometry_from_parent()
-        completed=self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,1000)
+        def persist_markers():
+            ov=self.app_state.overlay
+            if ov:
+                self.app_state.file_manager.save_markers(ov.get_marker_data(),self.app_state.window_rect)
+        completed=self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,persist_markers,1000)
         self.app_state.clear_cancel_request()
         if completed:
             self.app_state.set_progress(100)
@@ -1439,11 +1566,11 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 def main():
     app=QtWidgets.QApplication(sys.argv)
-    file_manager=AAAFileManager()
-    agent=RLAgent(file_manager)
-    buffer=ExperienceBuffer(file_manager)
-    app_state=AppState(file_manager,agent,buffer)
     rate_controller=HardwareAdaptiveRate()
+    file_manager=AAAFileManager()
+    agent=RLAgent(file_manager,rate_controller)
+    buffer=ExperienceBuffer(file_manager)
+    app_state=AppState(file_manager,agent,buffer,rate_controller)
     input_tracker=InputTracker(app_state)
     recorder=ScreenshotRecorder(app_state,buffer,rate_controller,input_tracker)
     recorder.start()
