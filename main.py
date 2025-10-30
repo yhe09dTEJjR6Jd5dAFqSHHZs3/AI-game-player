@@ -8,6 +8,7 @@ import math
 import random
 import ctypes
 import psutil
+import logging
 from datetime import datetime
 from enum import Enum
 from ctypes import wintypes
@@ -22,6 +23,8 @@ from pynput import mouse,keyboard
 import win32gui,win32con,win32api
 from collections import deque
 from PyQt5 import QtCore,QtGui,QtWidgets
+logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+logger=logging.getLogger("aaa_runtime")
 class Mode(Enum):
     INIT=0
     LEARNING=1
@@ -134,17 +137,25 @@ class AAAFileManager:
                 common=None
             if target_base==old_base or common==old_base:
                 return old_base,old_base
-            os.makedirs(target_parent,exist_ok=True)
+            try:
+                os.makedirs(target_parent,exist_ok=True)
+            except OSError as e:
+                logger.error("创建目录失败:%s",e)
+                return old_base,old_base
             if os.path.exists(target_base):
                 try:
                     shutil.rmtree(target_base)
-                except:
+                except FileNotFoundError:
                     pass
+                except OSError as e:
+                    logger.error("清理旧AAA目录失败:%s",e)
+                    return old_base,old_base
             moved=False
             try:
                 shutil.move(old_base,target_base)
                 moved=True
-            except:
+            except (shutil.Error,OSError) as e:
+                logger.warning("直接移动AAA目录失败:%s",e)
                 try:
                     os.makedirs(target_base,exist_ok=True)
                     for name in os.listdir(old_base):
@@ -152,9 +163,12 @@ class AAAFileManager:
                     moved=True
                     try:
                         shutil.rmtree(old_base)
-                    except:
+                    except FileNotFoundError:
                         pass
-                except:
+                    except OSError as cleanup_error:
+                        logger.warning("清理旧AAA残留失败:%s",cleanup_error)
+                except (OSError,shutil.Error) as nested_error:
+                    logger.error("迁移AAA目录失败:%s",nested_error)
                     moved=False
             if not moved:
                 return old_base,old_base
@@ -205,29 +219,30 @@ class AAAFileManager:
             if os.path.exists(self.vision_model_path):
                 try:
                     vision.load_state_dict(torch.load(self.vision_model_path,map_location="cpu"))
-                except:
-                    pass
+                except (OSError,RuntimeError,ValueError) as e:
+                    logger.warning("加载视觉模型失败:%s",e)
             if os.path.exists(self.left_model_path):
                 try:
                     left.load_state_dict(torch.load(self.left_model_path,map_location="cpu"))
-                except:
-                    pass
+                except (OSError,RuntimeError,ValueError) as e:
+                    logger.warning("加载左手模型失败:%s",e)
             if os.path.exists(self.right_model_path):
                 try:
                     right.load_state_dict(torch.load(self.right_model_path,map_location="cpu"))
-                except:
-                    pass
+                except (OSError,RuntimeError,ValueError) as e:
+                    logger.warning("加载右手模型失败:%s",e)
             if os.path.exists(self.neuro_model_path):
                 try:
                     neuro.load_state_dict(torch.load(self.neuro_model_path,map_location="cpu"))
-                except:
-                    pass
+                except (OSError,RuntimeError,ValueError) as e:
+                    logger.warning("加载神经模块失败:%s",e)
     def to_relative(self,abs_path):
         with self.lock:
             base=self.base_path
         try:
             rel=os.path.relpath(abs_path,base)
-        except:
+        except ValueError as e:
+            logger.warning("转换相对路径失败:%s",e)
             rel=abs_path
         if rel.startswith("..") and not abs_path.startswith(base):
             rel=abs_path
@@ -256,11 +271,13 @@ class ExperienceBuffer:
     def add(self,frame_img,action,source,metrics,hero_dead,cooldowns,window_rect):
         ts=time.time()
         fname=os.path.join(self.manager.experience_dir,str(int(ts*1000))+".png")
+        rel_frame=None
         try:
             frame_img.save(fname)
-        except:
-            pass
-        rec={"t":ts,"frame":self.manager.to_relative(fname),"action":action,"source":source,"metrics":metrics,"hero_dead":hero_dead,"cooldowns":cooldowns,"rect":window_rect}
+            rel_frame=self.manager.to_relative(fname)
+        except (OSError,ValueError) as e:
+            logger.error("保存帧失败:%s",e)
+        rec={"t":ts,"frame":rel_frame,"action":action,"source":source,"metrics":metrics,"hero_dead":hero_dead,"cooldowns":cooldowns,"rect":window_rect}
         with self.lock:
             self.data.append(rec)
             if len(self.data)>self.capacity:
@@ -268,15 +285,15 @@ class ExperienceBuffer:
         try:
             with open(self.meta_log,"a",encoding="utf-8") as f:
                 f.write(json.dumps(rec)+"\n")
-        except:
-            pass
+        except OSError as e:
+            logger.error("追加经验失败:%s",e)
     def _rewrite_locked(self):
         try:
             with open(self.meta_log,"w",encoding="utf-8") as f:
                 for rec in self.data:
                     f.write(json.dumps(rec)+"\n")
-        except:
-            pass
+        except OSError as e:
+            logger.error("重写经验失败:%s",e)
     def on_aaa_moved(self,old_base,new_base):
         with self.lock:
             self._refresh_paths_locked()
@@ -291,9 +308,10 @@ class ExperienceBuffer:
                             try:
                                 rec=json.loads(line)
                                 records.append(rec)
-                            except:
-                                continue
-            except:
+                            except json.JSONDecodeError as e:
+                                logger.warning("忽略损坏经验记录:%s",e)
+            except OSError as e:
+                logger.error("读取经验失败:%s",e)
                 records=[]
             if not records:
                 records=list(self.data)
@@ -304,7 +322,8 @@ class ExperienceBuffer:
                     abs_old=frame if os.path.isabs(frame) else os.path.join(old_base,frame)
                     try:
                         rel_tail=os.path.relpath(abs_old,old_base)
-                    except:
+                    except ValueError as e:
+                        logger.warning("经验路径转换失败:%s",e)
                         if abs_old.startswith(old_base):
                             rel_tail=abs_old[len(old_base):].lstrip(os.sep)
                         else:
@@ -406,6 +425,7 @@ class HandPolicy(nn.Module):
 class RLAgent:
     def __init__(self,file_manager,hardware_manager):
         self.hardware=hardware_manager
+        self.hardware.refresh(True)
         self.device=self.hardware.suggest_device()
         self.vision=VisionModel().to(self.device)
         self.left=HandPolicy(32,16).to(self.device)
@@ -422,6 +442,7 @@ class RLAgent:
         self.global_step=0
         self.neuro_state=torch.zeros(32,device=self.device)
     def ensure_device(self):
+        self.hardware.refresh()
         target=self.hardware.suggest_device()
         if target.type!=self.device.type:
             self.vision.to(target)
@@ -481,6 +502,7 @@ class RLAgent:
         cancelled=False
         effective_steps=0
         for it in range(max_iters):
+            self.hardware.refresh()
             if progress_get_cancel():
                 cancelled=True
                 break
@@ -501,8 +523,10 @@ class RLAgent:
                 rl_mask_right=[]
                 for rec in batch:
                     try:
-                        img=Image.open(self.file_manager.to_absolute(rec["frame"])).convert("RGB")
-                    except:
+                        abs_path=self.file_manager.to_absolute(rec["frame"])
+                        img=Image.open(abs_path).convert("RGB")
+                    except (OSError,ValueError,TypeError) as e:
+                        logger.warning("加载经验帧失败:%s",e)
                         continue
                     frames.append(img)
                     A=float(rec["metrics"]["A"])
@@ -761,77 +785,88 @@ class HardwareAdaptiveRate:
         self.gpu_free=0.5
         self.last_refresh=0.0
         self.visual_level=1
-    def refresh(self):
+        self.lock=threading.Lock()
+    def refresh(self,force=False):
         now=time.time()
-        if now-self.last_refresh<0.5:
-            return
-        self.cpu_load=psutil.cpu_percent()
-        vm=psutil.virtual_memory()
-        self.mem_free=vm.available/float(vm.total if vm.total>0 else 1)
-        if torch.cuda.is_available():
+        with self.lock:
+            if not force and now-self.last_refresh<0.5:
+                return
             try:
-                props=torch.cuda.get_device_properties(0)
-                total=float(props.total_memory)
-                allocated=float(torch.cuda.memory_allocated(0))
-                reserved=float(torch.cuda.memory_reserved(0))
-                used=max(allocated,reserved)
-                self.gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
-            except:
-                self.gpu_free=0.5
-        else:
-            self.gpu_free=0.5
-        if self.cpu_load>85 or self.mem_free<0.1:
-            self.batch_size=max(16,self.batch_size-8)
-            self.parallel=max(1,self.parallel-1)
-            self.hand_interval=min(0.12,self.hand_interval+0.01)
-        else:
-            if self.cpu_load<60 and self.mem_free>0.2:
-                self.batch_size=min(64,self.batch_size+4)
-            if self.cpu_load<70:
-                self.parallel=min(4,self.parallel+1)
-            if self.hand_interval>0.025 and self.cpu_load<70:
-                self.hand_interval=max(0.02,self.hand_interval-0.005)
-        if torch.cuda.is_available():
-            if self.gpu_free>0.25 and self.cpu_load>70:
-                target=torch.device("cuda")
-            elif self.gpu_free<0.1:
-                target=torch.device("cpu")
+                self.cpu_load=psutil.cpu_percent()
+            except Exception as e:
+                logger.error("获取CPU负载失败:%s",e)
+                self.cpu_load=100.0
+            try:
+                vm=psutil.virtual_memory()
+                self.mem_free=vm.available/float(vm.total if vm.total>0 else 1)
+            except Exception as e:
+                logger.error("获取内存信息失败:%s",e)
+                self.mem_free=0.0
+            if torch.cuda.is_available():
+                try:
+                    props=torch.cuda.get_device_properties(0)
+                    total=float(props.total_memory)
+                    allocated=float(torch.cuda.memory_allocated(0))
+                    reserved=float(torch.cuda.memory_reserved(0))
+                    used=max(allocated,reserved)
+                    self.gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
+                except Exception as e:
+                    logger.warning("获取GPU信息失败:%s",e)
+                    self.gpu_free=0.5
             else:
-                target=self.device
-        else:
-            target=torch.device("cpu")
-        self.device=target
-        capacity=(1.0-self.cpu_load/100.0)*0.5+self.mem_free*0.25+self.gpu_free*0.25
-        if capacity>=0.8:
-            self.visual_level=3
-        elif capacity>=0.55:
-            self.visual_level=2
-        elif capacity>=0.3:
-            self.visual_level=1
-        else:
-            self.visual_level=0
-        self.last_refresh=now
+                self.gpu_free=0.5
+            if self.cpu_load>85 or self.mem_free<0.1:
+                self.batch_size=max(16,self.batch_size-8)
+                self.parallel=max(1,self.parallel-1)
+                self.hand_interval=min(0.12,self.hand_interval+0.01)
+            else:
+                if self.cpu_load<60 and self.mem_free>0.2:
+                    self.batch_size=min(64,self.batch_size+4)
+                if self.cpu_load<70:
+                    self.parallel=min(4,self.parallel+1)
+                if self.hand_interval>0.025 and self.cpu_load<70:
+                    self.hand_interval=max(0.02,self.hand_interval-0.005)
+            if torch.cuda.is_available():
+                if self.gpu_free>0.25 and self.cpu_load>70:
+                    target=torch.device("cuda")
+                elif self.gpu_free<0.1:
+                    target=torch.device("cpu")
+                else:
+                    target=self.device
+            else:
+                target=torch.device("cpu")
+            self.device=target
+            capacity=(1.0-self.cpu_load/100.0)*0.5+self.mem_free*0.25+self.gpu_free*0.25
+            if capacity>=0.8:
+                self.visual_level=3
+            elif capacity>=0.55:
+                self.visual_level=2
+            elif capacity>=0.3:
+                self.visual_level=1
+            else:
+                self.visual_level=0
+            self.last_refresh=now
     def get_hz(self):
-        self.refresh()
-        score=(1.0-self.cpu_load/100.0)*0.4+self.mem_free*0.2+self.gpu_free*0.4
-        score=clamp(score,0.0,1.0)
-        hz=int(max(1,min(120,int(1.0+score*(120.0-1.0)))))
-        return hz
+        with self.lock:
+            score=(1.0-self.cpu_load/100.0)*0.4+self.mem_free*0.2+self.gpu_free*0.4
+            score=clamp(score,0.0,1.0)
+            hz=int(max(1,min(120,int(1.0+score*(120.0-1.0)))))
+            return hz
     def suggest_batch_size(self):
-        self.refresh()
-        return self.batch_size
+        with self.lock:
+            return self.batch_size
     def suggest_parallel(self):
-        self.refresh()
-        return self.parallel
+        with self.lock:
+            return self.parallel
     def suggest_hand_interval(self):
-        self.refresh()
-        return self.hand_interval
+        with self.lock:
+            return self.hand_interval
     def suggest_device(self):
-        self.refresh()
-        return self.device
+        with self.lock:
+            return self.device
     def suggest_visual_level(self):
-        self.refresh()
-        return self.visual_level
+        with self.lock:
+            return self.visual_level
     def suggest_visual_size(self):
         level=self.suggest_visual_level()
         if level>=3:
@@ -863,7 +898,8 @@ def window_visible(hwnd):
     try:
         if not win32gui.IsWindow(hwnd):
             return False
-    except:
+    except Exception as e:
+        logger.warning("窗口有效性检查失败:%s",e)
         return False
     if not win32gui.IsWindowVisible(hwnd):
         return False
@@ -871,7 +907,8 @@ def window_visible(hwnd):
         return False
     try:
         rect=win32gui.GetWindowRect(hwnd)
-    except:
+    except Exception as e:
+        logger.warning("窗口矩形获取失败:%s",e)
         return False
     if rect[2]<=rect[0] or rect[3]<=rect[1]:
         return False
@@ -885,12 +922,14 @@ def window_visible(hwnd):
         try:
             top=win32gui.WindowFromPoint((px,py))
             top_root=win32gui.GetAncestor(top,win32con.GA_ROOT) if top else None
-        except:
+        except Exception as e:
+            logger.warning("窗口点检测失败:%s",e)
             top_root=None
         if top_root not in [target_root,hwnd]:
             try:
                 ex=win32gui.GetWindowLong(top_root,win32con.GWL_EXSTYLE)
-            except:
+            except Exception as e:
+                logger.warning("窗口样式获取失败:%s",e)
                 ex=0
             if (ex&win32con.WS_EX_TRANSPARENT)==0 or (ex&win32con.WS_EX_LAYERED)==0:
                 return False
@@ -898,15 +937,15 @@ def window_visible(hwnd):
         cloaked=ctypes.c_int()
         if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd,14,ctypes.byref(cloaked),ctypes.sizeof(cloaked))==0 and cloaked.value!=0:
             return False
-    except:
-        pass
+    except Exception as e:
+        logger.info("窗口遮挡状态获取失败:%s",e)
     try:
         visible_rect=wintypes.RECT()
         if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd,9,ctypes.byref(visible_rect),ctypes.sizeof(visible_rect))==0:
             if max(0,visible_rect.right-visible_rect.left)==0 or max(0,visible_rect.bottom-visible_rect.top)==0:
                 return False
-    except:
-        pass
+    except Exception as e:
+        logger.info("窗口可见区域获取失败:%s",e)
     return True
 class AppState:
     def __init__(self,file_manager,agent,buffer,hardware_manager):
@@ -1144,8 +1183,8 @@ class InputTracker:
                 os._exit(0)
             else:
                 self.app_state.mark_user_input()
-        except:
-            pass
+        except Exception as e:
+            logger.error("键盘事件处理失败:%s",e)
     def pop_action(self):
         with self.lock:
             if self.action_queue:
@@ -1162,6 +1201,7 @@ class ScreenshotRecorder(threading.Thread):
         self.stop_flag=False
     def run(self):
         while not self.stop_flag:
+            self.rate_controller.refresh()
             hz=self.rate_controller.get_hz()
             dt=1.0/float(max(1,hz))
             with self.app_state.lock:
@@ -1173,7 +1213,8 @@ class ScreenshotRecorder(threading.Thread):
                 rect=get_window_rect(hwnd)
                 try:
                     img=ImageGrab.grab(bbox=rect)
-                except:
+                except Exception as e:
+                    logger.warning("截图失败:%s",e)
                     img=None
                 if img is not None:
                     self.app_state.update_state_from_frame(img)
@@ -1239,6 +1280,7 @@ class LeftHandThread(threading.Thread):
             direction=1 if float(h_state.mean().item())>=0 else -1
             arc_span=(0.35+0.05*((laction%8)+1))*math.pi
             arc_steps=12
+            self.app_state.hardware.refresh()
             hand_interval=self.app_state.hardware.suggest_hand_interval()
             drag_duration=max(0.02,hand_interval*1.5)
             arc_duration=max(0.01,hand_interval)
@@ -1254,8 +1296,8 @@ class LeftHandThread(threading.Thread):
                     pyautogui.dragTo(px,py,duration=arc_duration,button='left',mouseDownUp=False)
                     path.append((px,py))
                 pyautogui.mouseUp()
-            except:
-                pass
+            except Exception as e:
+                logger.warning("左手操作失败:%s",e)
             self.app_state.record_ai_action({"hand":"left","action_id":laction,"label":"移动轮盘","type":"drag","start":(center_x,center_y),"end":path[-1] if path else (center_x,center_y),"path":path,"timestamp":time.time(),"rotation_dir":"cw" if direction>0 else "ccw"})
             time.sleep(max(0.01,hand_interval))
 class RightHandThread(threading.Thread):
@@ -1299,6 +1341,7 @@ class RightHandThread(threading.Thread):
             end_x=cx
             end_y=cy
             action_type="click"
+            self.app_state.hardware.refresh()
             hand_interval=self.app_state.hardware.suggest_hand_interval()
             drag_duration=max(0.02,hand_interval*1.5)
             try:
@@ -1327,8 +1370,8 @@ class RightHandThread(threading.Thread):
                 else:
                     pyautogui.moveTo(cx,cy)
                     pyautogui.click()
-            except:
-                pass
+            except Exception as e:
+                logger.warning("右手操作失败:%s",e)
             self.app_state.record_ai_action({"hand":"right","action_id":raction,"label":label,"type":action_type,"start":(start_x,start_y),"end":(end_x,end_y),"timestamp":time.time()})
             time.sleep(max(0.01,hand_interval))
 class OptimizationThread(threading.Thread):
@@ -1571,10 +1614,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for name,thr in threads:
             try:
                 thr.join(timeout=1.0)
-            except:
-                pass
+            except Exception as e:
+                logger.warning("线程关闭失败:%s",e)
             setattr(self.app_state,name,None)
     def on_timer(self):
+        self.rate_controller.refresh()
         self.maybe_init()
         self.app_state.update_window_rect()
         snap=self.app_state.get_state_snapshot()
@@ -1614,6 +1658,7 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app=QtWidgets.QApplication(sys.argv)
     rate_controller=HardwareAdaptiveRate()
+    rate_controller.refresh(True)
     file_manager=AAAFileManager()
     agent=RLAgent(file_manager,rate_controller)
     buffer=ExperienceBuffer(file_manager)
