@@ -703,6 +703,45 @@ class OptionPlanner(nn.Module):
         termination=torch.sigmoid(self.termination_head(z))
         value=self.value_head(z)
         return logits,termination,self.option_embeddings,value
+class AdaptiveRewardModel:
+    def __init__(self,hardware):
+        self.hardware=hardware
+        self.alpha=0.06
+        self.running=torch.zeros(3)
+        self.variation=torch.ones(3)
+        self.preference=torch.tensor([1.0,-1.0,0.5])
+        self.temperature=1.0
+        self.user_bias=0.5
+        self.recent=deque(maxlen=128)
+    def _resource_vector(self):
+        return torch.tensor([max(0.0,1.0-self.hardware.cpu_load/100.0),max(0.0,self.hardware.mem_free),max(0.0,self.hardware.gpu_free)],dtype=torch.float32)
+    def _observe(self,vec,source,hero_dead,is_ai):
+        device=self.running.device
+        vec=vec.to(device)
+        self.running=self.running*(1.0-self.alpha)+vec*self.alpha
+        diff=(vec-self.running).abs()+1e-4
+        self.variation=self.variation*(1.0-self.alpha)+diff*self.alpha
+        self.recent.append(vec.detach().cpu())
+        resource=self._resource_vector().to(device)
+        resource_score=clamp(resource.mean().item(),0.0,1.0)
+        self.user_bias=(1.0-self.alpha)*self.user_bias+self.alpha*(0.7 if source=="user" else 0.4)
+        hero_factor=0.6+0.4*float(hero_dead)
+        density=len(self.recent)/float(self.recent.maxlen if self.recent.maxlen else 1)
+        skill_focus=0.5+density*0.5
+        emphasis=torch.stack([self.running[0]+resource_score,self.running[2]+skill_focus,self.running[1]+hero_factor])
+        weights=F.softmax(emphasis,dim=0)
+        adjust=torch.tensor([1.0+resource_score,hero_factor,skill_focus if is_ai else self.user_bias],dtype=torch.float32,device=device)
+        pref=torch.stack([weights[0]*adjust[0],-(weights[2]*adjust[1]),weights[1]*adjust[2]],dim=0)
+        self.preference=pref
+        self.temperature=float(clamp(resource_score*1.8+0.4,0.5,2.5))
+    def compute(self,metrics,source,hero_dead,is_ai):
+        device=self.running.device
+        vec=torch.tensor([metrics[0],metrics[1],metrics[2]],dtype=torch.float32,device=device)
+        self._observe(vec,source,hero_dead,is_ai)
+        normalized=(vec-self.running)/(self.variation+1e-3)
+        reward=(normalized*self.preference).sum()
+        scale=self.temperature*(1.1 if is_ai else self.user_bias+0.6)
+        return float(reward.item()*scale)
 class MetaLearner:
     def __init__(self,modules,step_size=0.05):
         self.modules=list(modules)
@@ -729,6 +768,7 @@ class RLAgent:
         self.right=TransformerHandPolicy(32,32).to(self.device)
         self.neuro_module=BrainInspiredNeuroModule(32).to(self.device)
         self.option_planner=OptionPlanner(32,6).to(self.device)
+        self.reward_model=AdaptiveRewardModel(self.hardware)
         self.file_manager=file_manager
         self.file_manager.load_models(self.vision,self.left,self.right,self.neuro_module,self.option_planner)
         self.left_opt=optim.Adam(self.left.parameters(),lr=1e-4,weight_decay=1e-5)
@@ -748,6 +788,8 @@ class RLAgent:
         self.cpu_batch=None
         self.batch_capacity=0
         self.batch_shape=None
+    def compute_reward(self,A,B,C,source,hero_dead):
+        return self.reward_model.compute((A,B,C),source,hero_dead,source!="user")
     def ensure_device(self):
         self.hardware.refresh()
         target=self.hardware.suggest_device()
@@ -899,6 +941,7 @@ class RLAgent:
         effective_steps=0
         for it in range(max_iters):
             self.hardware.refresh()
+            self.entropy_coef=float(clamp(0.002+0.02*self.hardware.mem_free+0.01*self.reward_model.temperature,0.002,0.05))
             if progress_get_cancel():
                 cancelled=True
                 break
@@ -929,7 +972,7 @@ class RLAgent:
                     A=float(rec["metrics"]["A"])
                     B=float(rec["metrics"]["B"])
                     C=float(rec["metrics"]["C"])
-                    rew=1.0*A-0.5*B+0.2*C
+                    rew=self.compute_reward(A,B,C,rec.get("source","user"),rec.get("hero_dead",False))
                     rewards.append(rew)
                     act=rec["action"]
                     left_target=0
