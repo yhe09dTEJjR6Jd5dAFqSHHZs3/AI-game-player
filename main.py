@@ -2824,7 +2824,7 @@ class AppState:
         with self.lock:
             overlay=self.overlay
         if overlay is None:
-            overlay=_OverlayWindow(self)
+            overlay=OverlayWindow(self)
             with self.lock:
                 self.overlay=overlay
         markers=self.file_manager.load_markers()
