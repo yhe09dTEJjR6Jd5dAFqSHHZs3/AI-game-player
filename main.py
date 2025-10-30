@@ -76,6 +76,11 @@ class DependencyManager:
         self.retry_worker=threading.Thread(target=self._retry_loop,daemon=True)
         self.retry_worker.start()
         self.wizard_started=False
+    def set_offline_cache(self,base):
+        path=os.path.join(base,"wheel_cache")
+        with self.lock:
+            self.offline_cache=path
+        self._ensure_cache_dir()
     def register(self,name):
         with self.lock:
             if name not in self.names:
@@ -540,6 +545,7 @@ class AAAFileManager:
                 os.makedirs(self.base_path,exist_ok=True)
             self.experience_dir=os.path.join(self.base_path,"experience")
             os.makedirs(self.experience_dir,exist_ok=True)
+            dependency_manager.set_offline_cache(self.base_path)
             self.config_path=os.path.join(self.base_path,"config.json")
             self.vision_model_path=os.path.join(self.base_path,"vision_model.pt")
             self.left_model_path=os.path.join(self.base_path,"left_hand_model.pt")
