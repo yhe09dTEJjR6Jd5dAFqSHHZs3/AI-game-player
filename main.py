@@ -1490,10 +1490,34 @@ class RLAgent:
                     rl_mask_right.append(right_rl)
                 if not arr_list:
                     continue
+                try:
+                    t_batch=self._batch_from_arrays(arr_list)
+                    metrics,flags,h=self.vision(t_batch)
+                except torch.cuda.OutOfMemoryError:
+                    self.hardware.handle_oom(len(arr_list))
+                    self.batch_buffer=None
+                    self.cpu_batch=None
+                    self.batch_capacity=0
+                    self.batch_shape=None
+                    continue
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        self.hardware.handle_oom(len(arr_list))
+                        self.batch_buffer=None
+                        self.cpu_batch=None
+                        self.batch_capacity=0
+                        self.batch_shape=None
+                        continue
+                    raise
+                except MemoryError:
+                    self.hardware.handle_oom(len(arr_list))
+                    self.batch_buffer=None
+                    self.cpu_batch=None
+                    self.batch_capacity=0
+                    self.batch_shape=None
+                    continue
                 any_step=True
                 effective_steps+=1
-                t_batch=self._batch_from_arrays(arr_list)
-                metrics,flags,h=self.vision(t_batch)
                 h_brain=self.neuro_project(h)
                 sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
                 planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
@@ -1959,12 +1983,15 @@ def ensure_qt_classes():
             self.setCentralWidget(self.rootWidget)
             self.layout=QtWidgets.QGridLayout(self.rootWidget)
             self.modeLabel=QtWidgets.QLabel("模式:初始化")
+            self.windowStatusLabel=QtWidgets.QLabel("窗口:未选择")
+            self.windowStatusLabel.setStyleSheet("color:#888888")
             self.metricsLabelA=QtWidgets.QLabel("A:0")
             self.metricsLabelB=QtWidgets.QLabel("B:0")
             self.metricsLabelC=QtWidgets.QLabel("C:0")
             self.heroDeadLabel=QtWidgets.QLabel("英雄存活:是")
             self.cooldownLabel=QtWidgets.QLabel("冷却信息")
             self.layout.addWidget(self.modeLabel,0,0,1,2)
+            self.layout.addWidget(self.windowStatusLabel,0,2)
             self.layout.addWidget(self.metricsLabelA,1,0)
             self.layout.addWidget(self.metricsLabelB,1,1)
             self.layout.addWidget(self.metricsLabelC,1,2)
@@ -2051,6 +2078,19 @@ def ensure_qt_classes():
             running_opt=self.app_state.optimization_running()
             rect=snap["window_rect"]
             has_window=(rect[2]-rect[0])>0 and (rect[3]-rect[1])>0
+            if not has_window:
+                self.windowStatusLabel.setText("窗口:未选择")
+                self.windowStatusLabel.setStyleSheet("color:#888888")
+            else:
+                if snap.get("window_visible") and not snap["paused"]:
+                    self.windowStatusLabel.setText("窗口:可用")
+                    self.windowStatusLabel.setStyleSheet("color:#009944")
+                elif not snap.get("window_visible"):
+                    self.windowStatusLabel.setText("窗口:不可见")
+                    self.windowStatusLabel.setStyleSheet("color:#aa0000")
+                else:
+                    self.windowStatusLabel.setText("窗口:暂停")
+                    self.windowStatusLabel.setStyleSheet("color:#cc6600")
             self.chooseWindowBtn.setEnabled(snap["ready"])
             self.optimizeBtn.setEnabled(snap["mode"]==Mode.LEARNING and snap["ready"] and has_window and not running_opt)
             self.cancelOptimizeBtn.setEnabled(running_opt)
@@ -2451,6 +2491,23 @@ class HardwareAdaptiveRate:
             self.parallel_plan={"time":now,"batch":self.batch_size,"parallel":self.parallel,"device":str(self.device),"monitor":self.monitor_interval,"hand_interval":self.hand_interval}
             self.performance_log.append({"time":now,"cpu":cpu_ratio,"mem":mem_ratio,"gpu":gpu_ratio,"batch":self.batch_size,"parallel":self.parallel})
             self.last_refresh=now
+    def handle_oom(self,batch_attempt=0):
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        with self.lock:
+            target=self.batch_size//2
+            if batch_attempt:
+                target=min(target,max(self.min_batch,batch_attempt//2))
+            if target<self.min_batch:
+                target=self.min_batch
+            self.batch_size=target
+            self.parallel=max(1,self.parallel//2)
+            self.visual_level=max(0,self.visual_level-1)
+            self.last_refresh=0.0
+            self.parallel_plan={"time":time.time(),"batch":self.batch_size,"parallel":self.parallel,"device":str(self.device),"monitor":self.monitor_interval,"hand_interval":self.hand_interval}
     def get_hz(self):
         with self.lock:
             score=(1.0-self.cpu_load/100.0)*0.4+self.mem_free*0.2+self.gpu_free*0.4
@@ -2792,7 +2849,11 @@ class AppState:
             self.current_hidden=hid.clone().detach()
     def get_state_snapshot(self):
         with self.lock:
-            return {"mode":self.mode,"metrics":self.metrics,"hero_dead":self.hero_dead,"in_recall":self.in_recall,"cooldowns":self.cooldowns,"progress":self.progress,"window_rect":self.window_rect,"ready":self.ready,"paused":self.paused_by_visibility}
+            try:
+                visible=window_visible(self.hwnd) if self.hwnd is not None else False
+            except Exception:
+                visible=False
+            return {"mode":self.mode,"metrics":self.metrics,"hero_dead":self.hero_dead,"in_recall":self.in_recall,"cooldowns":self.cooldowns,"progress":self.progress,"window_rect":self.window_rect,"ready":self.ready,"paused":self.paused_by_visibility,"window_visible":visible}
     def set_progress(self,v):
         with self.lock:
             self.progress=v
