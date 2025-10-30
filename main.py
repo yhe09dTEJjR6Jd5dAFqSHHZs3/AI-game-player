@@ -21,7 +21,7 @@ import numpy as np
 import pyautogui
 from pynput import mouse,keyboard
 import win32gui,win32con,win32api
-from collections import deque
+from collections import deque,OrderedDict
 from PyQt5 import QtCore,QtGui,QtWidgets
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logger=logging.getLogger("aaa_runtime")
@@ -262,6 +262,9 @@ class ExperienceBuffer:
         self.lock=threading.Lock()
         self.data=[]
         self.meta_log=""
+        self.cache_lock=threading.Lock()
+        self.frame_cache=OrderedDict()
+        self.cache_capacity=256
         self.refresh_paths()
     def refresh_paths(self):
         with self.lock:
@@ -335,6 +338,46 @@ class ExperienceBuffer:
             if len(self.data)>self.capacity:
                 self.data=self.data[-self.capacity:]
             self._rewrite_locked()
+            with self.cache_lock:
+                self.frame_cache=OrderedDict()
+    def get_frame_arrays(self,records,size):
+        w=int(size[0])
+        h=int(size[1])
+        results=[None]*len(records)
+        missing=[]
+        with self.cache_lock:
+            for idx,rec in enumerate(records):
+                frame=rec.get("frame")
+                if not frame:
+                    continue
+                key=(frame,w,h)
+                cached=self.frame_cache.get(key)
+                if cached is not None:
+                    results[idx]=cached
+                    self.frame_cache.move_to_end(key)
+                else:
+                    missing.append((idx,key,frame))
+            if missing:
+                load_map={}
+                for idx,key,frame in missing:
+                    if key not in load_map:
+                        abs_path=self.manager.to_absolute(frame)
+                        try:
+                            img=Image.open(abs_path).convert("RGB")
+                            img=img.resize((w,h))
+                            arr=np.array(img,dtype=np.float32)/255.0
+                            arr=np.transpose(arr,(2,0,1))
+                            load_map[key]=arr
+                        except (OSError,ValueError,TypeError) as e:
+                            logger.warning("加载经验帧失败:%s",e)
+                            load_map[key]=None
+                    arr=load_map[key]
+                    if arr is not None:
+                        results[idx]=arr
+                        self.frame_cache[key]=arr
+                while len(self.frame_cache)>self.cache_capacity:
+                    self.frame_cache.popitem(last=False)
+        return results
     def sample(self,batch_size=32):
         with self.lock:
             if len(self.data)==0:
@@ -444,18 +487,19 @@ class RLAgent:
     def ensure_device(self):
         self.hardware.refresh()
         target=self.hardware.suggest_device()
-        if target.type!=self.device.type:
-            self.vision.to(target)
-            self.left.to(target)
-            self.right.to(target)
-            self.neuro_module.to(target)
-            for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
-                for st in opt.state.values():
-                    for k,v in list(st.items()):
-                        if torch.is_tensor(v):
-                            st[k]=v.to(target)
-            self.neuro_state=self.neuro_state.to(target)
-            self.device=target
+        if target==self.device:
+            return
+        self.vision.to(target)
+        self.left.to(target)
+        self.right.to(target)
+        self.neuro_module.to(target)
+        for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
+            for st in opt.state.values():
+                for k,v in list(st.items()):
+                    if torch.is_tensor(v):
+                        st[k]=v.to(target)
+        self.neuro_state=self.neuro_state.to(target)
+        self.device=target
     def preprocess_frame(self,img):
         self.ensure_device()
         w,h=self.hardware.suggest_visual_size()
@@ -513,7 +557,8 @@ class RLAgent:
                 batch=buffer.sample(self.hardware.suggest_batch_size())
                 if not batch:
                     continue
-                frames=[]
+                size=self.hardware.suggest_visual_size()
+                arrays=buffer.get_frame_arrays(batch,size)
                 targets_left=[]
                 targets_right=[]
                 rewards=[]
@@ -521,14 +566,11 @@ class RLAgent:
                 mask_right=[]
                 rl_mask_left=[]
                 rl_mask_right=[]
-                for rec in batch:
-                    try:
-                        abs_path=self.file_manager.to_absolute(rec["frame"])
-                        img=Image.open(abs_path).convert("RGB")
-                    except (OSError,ValueError,TypeError) as e:
-                        logger.warning("加载经验帧失败:%s",e)
+                arr_list=[]
+                for rec,arr in zip(batch,arrays):
+                    if arr is None:
                         continue
-                    frames.append(img)
+                    arr_list.append(arr)
                     A=float(rec["metrics"]["A"])
                     B=float(rec["metrics"]["B"])
                     C=float(rec["metrics"]["C"])
@@ -560,11 +602,12 @@ class RLAgent:
                     mask_right.append(right_super)
                     rl_mask_left.append(left_rl)
                     rl_mask_right.append(right_rl)
-                if not frames:
+                if not arr_list:
                     continue
                 any_step=True
                 effective_steps+=1
-                t_batch=torch.cat([self.preprocess_frame(f) for f in frames],dim=0)
+                arr_stack=np.stack(arr_list,axis=0)
+                t_batch=torch.from_numpy(arr_stack).to(self.device)
                 metrics,flags,h=self.vision(t_batch)
                 h_brain=self.neuro_project(h)
                 with torch.no_grad():
@@ -712,6 +755,8 @@ class OverlayWindow(QtWidgets.QWidget):
         self.markers=[]
         self.selected_marker=None
         self.config_mode=False
+        self._marker_visible_cache={}
+        self._overlay_visible=False
     def find_marker(self,label):
         for m in self.markers:
             if m.label==label:
@@ -720,9 +765,13 @@ class OverlayWindow(QtWidgets.QWidget):
     def sync_with_window(self):
         hwnd=self.app_state.hwnd
         if hwnd is None:
-            self.hide()
+            if self._overlay_visible:
+                self.hide()
+                self._overlay_visible=False
             for m in self.markers:
-                m.hide()
+                if self._marker_visible_cache.get(m,False):
+                    m.hide()
+                    self._marker_visible_cache[m]=False
             return
         rect=get_window_rect(hwnd)
         x,y,w,h=rect[0],rect[1],rect[2]-rect[0],rect[3]-rect[1]
@@ -731,19 +780,30 @@ class OverlayWindow(QtWidgets.QWidget):
             m.update_geometry_from_parent()
         visible=window_visible(hwnd)
         if not visible:
-            for m in self.markers:
-                m.hide()
-            if self.isVisible():
+            if self._overlay_visible:
                 self.hide()
+                self._overlay_visible=False
+            for m in self.markers:
+                if self._marker_visible_cache.get(m,False):
+                    m.hide()
+                    self._marker_visible_cache[m]=False
             return
-        if not self.isVisible():
+        if not self._overlay_visible or not self.isVisible():
             self.show()
+            self._overlay_visible=True
+        self._update_marker_visibility(False)
+    def _update_marker_visibility(self,force):
+        desired=self.config_mode and self._overlay_visible
         for m in self.markers:
-            if self.config_mode:
-                if not m.isVisible():
-                    m.show()
-            else:
-                m.hide()
+            prev=self._marker_visible_cache.get(m,False)
+            if force or prev!=desired:
+                if desired:
+                    if not m.isVisible():
+                        m.show()
+                else:
+                    if m.isVisible():
+                        m.hide()
+                self._marker_visible_cache[m]=desired
     def set_config_mode(self,enabled):
         self.config_mode=enabled
         if enabled:
@@ -756,18 +816,27 @@ class OverlayWindow(QtWidgets.QWidget):
             self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
             for m in self.markers:
                 m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
-                m.hide()
+        self._update_marker_visibility(True)
         self.sync_with_window()
     def add_marker(self,label,color):
         m=MarkerWidget(self,label,color,0.5,0.5,0.5,0.05)
         self.markers.append(m)
         m.update_geometry_from_parent()
-        m.show()
+        desired=self.config_mode and self._overlay_visible
+        if desired:
+            m.show()
+        else:
+            m.hide()
+        m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,not self.config_mode)
+        self._marker_visible_cache[m]=desired
         self.selected_marker=m
     def remove_selected_marker(self):
         if self.selected_marker in self.markers:
-            self.markers.remove(self.selected_marker)
-            self.selected_marker.setParent(None)
+            target=self.selected_marker
+            self.markers.remove(target)
+            if target in self._marker_visible_cache:
+                self._marker_visible_cache.pop(target,None)
+            target.setParent(None)
             self.selected_marker=None
     def get_marker_data(self):
         out=[]
@@ -786,35 +855,64 @@ class HardwareAdaptiveRate:
         self.last_refresh=0.0
         self.visual_level=1
         self.lock=threading.Lock()
+        self.snapshot_lock=threading.Lock()
+        self.snapshot={"cpu":0.0,"mem":0.5,"gpu":0.5,"time":0.0}
+        self.monitor_stop=False
+        self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
+        self.monitor_thread.start()
+    def _collect_snapshot(self):
+        try:
+            cpu=psutil.cpu_percent(interval=None)
+        except Exception as e:
+            logger.error("获取CPU负载失败:%s",e)
+            cpu=100.0
+        try:
+            vm=psutil.virtual_memory()
+            mem_free=vm.available/float(vm.total if vm.total>0 else 1)
+        except Exception as e:
+            logger.error("获取内存信息失败:%s",e)
+            mem_free=0.0
+        gpu_free=0.5
+        if torch.cuda.is_available():
+            try:
+                props=torch.cuda.get_device_properties(0)
+                total=float(props.total_memory)
+                allocated=float(torch.cuda.memory_allocated(0))
+                reserved=float(torch.cuda.memory_reserved(0))
+                used=max(allocated,reserved)
+                gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
+            except Exception as e:
+                logger.warning("获取GPU信息失败:%s",e)
+                gpu_free=0.5
+        return {"cpu":cpu,"mem":mem_free,"gpu":gpu_free,"time":time.time()}
+    def _monitor_loop(self):
+        while not self.monitor_stop:
+            snap=self._collect_snapshot()
+            with self.snapshot_lock:
+                self.snapshot["cpu"]=snap["cpu"]
+                self.snapshot["mem"]=snap["mem"]
+                self.snapshot["gpu"]=snap["gpu"]
+                self.snapshot["time"]=snap["time"]
+            time.sleep(0.25)
     def refresh(self,force=False):
         now=time.time()
         with self.lock:
-            if not force and now-self.last_refresh<0.5:
+            if force:
+                snap=self._collect_snapshot()
+                with self.snapshot_lock:
+                    self.snapshot["cpu"]=snap["cpu"]
+                    self.snapshot["mem"]=snap["mem"]
+                    self.snapshot["gpu"]=snap["gpu"]
+                    self.snapshot["time"]=snap["time"]
+            elif now-self.last_refresh<0.1:
                 return
-            try:
-                self.cpu_load=psutil.cpu_percent()
-            except Exception as e:
-                logger.error("获取CPU负载失败:%s",e)
-                self.cpu_load=100.0
-            try:
-                vm=psutil.virtual_memory()
-                self.mem_free=vm.available/float(vm.total if vm.total>0 else 1)
-            except Exception as e:
-                logger.error("获取内存信息失败:%s",e)
-                self.mem_free=0.0
-            if torch.cuda.is_available():
-                try:
-                    props=torch.cuda.get_device_properties(0)
-                    total=float(props.total_memory)
-                    allocated=float(torch.cuda.memory_allocated(0))
-                    reserved=float(torch.cuda.memory_reserved(0))
-                    used=max(allocated,reserved)
-                    self.gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
-                except Exception as e:
-                    logger.warning("获取GPU信息失败:%s",e)
-                    self.gpu_free=0.5
-            else:
-                self.gpu_free=0.5
+            with self.snapshot_lock:
+                cpu=self.snapshot["cpu"]
+                mem=self.snapshot["mem"]
+                gpu=self.snapshot["gpu"]
+            self.cpu_load=cpu
+            self.mem_free=mem
+            self.gpu_free=gpu
             if self.cpu_load>85 or self.mem_free<0.1:
                 self.batch_size=max(16,self.batch_size-8)
                 self.parallel=max(1,self.parallel-1)
