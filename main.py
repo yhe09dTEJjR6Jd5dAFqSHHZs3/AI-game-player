@@ -105,6 +105,16 @@ def build_right_decode_table(mapping):
     return table
 RIGHT_ACTION_MAPPING=build_right_mapping()
 RIGHT_ACTION_TABLE=build_right_decode_table(RIGHT_ACTION_MAPPING)
+MARKER_SPEC={"移动轮盘":{"color":(255,0,0),"radius":0.14,"alpha":0.5,"required":True,"pos":(0.2,0.78)},"回城":{"color":(255,165,0),"radius":0.08,"alpha":0.5,"required":True,"pos":(0.88,0.82)},"恢复":{"color":(0,255,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.74,0.82)},"闪现":{"color":(255,255,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.62,0.82)},"普攻":{"color":(0,0,255),"radius":0.07,"alpha":0.5,"required":True,"pos":(0.86,0.68)},"一技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.74,0.64)},"二技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.88,0.56)},"三技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.66,0.52)},"四技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.94,0.48)},"取消施法":{"color":(0,0,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.5,0.5)},"主动装备":{"color":(128,0,128),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.7,0.75)},"数据A":{"color":(200,200,0),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.1,0.1)},"数据B":{"color":(0,200,200),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.2,0.1)},"数据C":{"color":(200,0,200),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.3,0.1)}}
+REQUIRED_MODULES=["psutil","pyautogui","pynput","PIL","numpy","torch","PyQt5"]
+def verify_dependencies():
+    missing=[]
+    for name in REQUIRED_MODULES:
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            missing.append(name)
+    return missing
 def get_desktop_path():
     return os.path.join(os.path.expanduser("~"),"Desktop")
 class AAAFileManager:
@@ -116,6 +126,7 @@ class AAAFileManager:
         self.vision_model_path=None
         self.left_model_path=None
         self.right_model_path=None
+        self.init_status_path=None
         self.ensure_structure()
     def ensure_structure(self):
         with self.lock:
@@ -128,6 +139,7 @@ class AAAFileManager:
             self.left_model_path=os.path.join(self.base_path,"left_hand_model.pt")
             self.right_model_path=os.path.join(self.base_path,"right_hand_model.pt")
             self.neuro_model_path=os.path.join(self.base_path,"neuro_module.pt")
+            self.init_status_path=os.path.join(self.base_path,"init_status.json")
             if not os.path.exists(self.config_path):
                 default_cfg={"markers":[],"aaa_path":self.base_path}
                 with open(self.config_path,"w",encoding="utf-8") as f:
@@ -197,6 +209,15 @@ class AAAFileManager:
             self.ensure_structure()
             self.update_config_path()
             return old_base,target_base
+    def write_init_status(self,status):
+        with self.lock:
+            if self.init_status_path is None:
+                self.init_status_path=os.path.join(self.base_path,"init_status.json")
+            try:
+                with open(self.init_status_path,"w",encoding="utf-8") as f:
+                    json.dump(status,f)
+            except OSError as e:
+                logger.error("写入初始化状态失败:%s",e)
     def update_config_path(self):
         with self.lock:
             if os.path.exists(self.config_path):
@@ -840,6 +861,9 @@ def ensure_qt_classes():
             self.config_mode=False
             self._marker_visible_cache={}
             self._overlay_visible=False
+            self.sync_timer=QtCore.QTimer(self)
+            self.sync_timer.timeout.connect(self.sync_with_window)
+            self.sync_timer.start(200)
         def find_marker(self,label):
             for m in self.markers:
                 if m.label==label:
@@ -849,6 +873,7 @@ def ensure_qt_classes():
             return QtCore.QSize(400,400)
         def set_overlay_visible(self,visible):
             self._overlay_visible=visible
+            self.sync_with_window()
             self._update_marker_visibility(True)
             if visible:
                 if not self.isVisible():
@@ -867,6 +892,7 @@ def ensure_qt_classes():
                         if m.isVisible():
                             m.hide()
                     self._marker_visible_cache[m]=desired
+                m.update_geometry_from_parent()
         def set_config_mode(self,enabled):
             self.config_mode=enabled
             if enabled:
@@ -881,8 +907,85 @@ def ensure_qt_classes():
                     m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
             self._update_marker_visibility(True)
             self.sync_with_window()
-        def add_marker(self,label,color):
-            m=_MarkerWidget(self,label,color,0.5,0.5,0.5,0.05)
+        def sync_with_window(self):
+            with self.app_state.lock:
+                hwnd=self.app_state.hwnd
+                rect=self.app_state.window_rect
+            if hwnd is None:
+                if self.isVisible():
+                    self.hide()
+                return
+            try:
+                rect=get_window_rect(hwnd)
+                with self.app_state.lock:
+                    self.app_state.window_rect=rect
+            except Exception as e:
+                logger.debug("同步窗口失败:%s",e)
+            x1,y1,x2,y2=self.app_state.window_rect
+            if x2<=x1 or y2<=y1:
+                if self.isVisible():
+                    self.hide()
+                return
+            self.setGeometry(x1,y1,x2-x1,y2-y1)
+            for m in self.markers:
+                m.update_geometry_from_parent()
+        def load_from_config(self,records,spec):
+            for m in list(self.markers):
+                m.setParent(None)
+            self.markers=[]
+            self.selected_marker=None
+            self._marker_visible_cache={}
+            seen=set()
+            for rec in records:
+                label=rec.get("label")
+                if not label:
+                    continue
+                cfg=spec.get(label,spec.get("普攻"))
+                base_color=cfg.get("color",(255,0,0))
+                rec_color=rec.get("color")
+                if rec_color:
+                    color=QtGui.QColor(rec_color)
+                else:
+                    color=QtGui.QColor(base_color[0],base_color[1],base_color[2])
+                alpha_val=rec.get("alpha")
+                alpha=float(alpha_val) if alpha_val is not None else float(cfg.get("alpha",0.5))
+                pos=cfg.get("pos",(0.5,0.5))
+                rx=rec.get("x_pct")
+                ry=rec.get("y_pct")
+                rr=rec.get("r_pct")
+                x_pct=clamp(float(rx) if rx is not None else float(pos[0]),0.0,1.0)
+                y_pct=clamp(float(ry) if ry is not None else float(pos[1]),0.0,1.0)
+                r_pct=clamp(float(rr) if rr is not None else float(cfg.get("radius",0.05)),0.01,0.5)
+                marker=_MarkerWidget(self,label,color,alpha,x_pct,y_pct,r_pct)
+                marker.update_geometry_from_parent()
+                self.markers.append(marker)
+                seen.add(label)
+            self.ensure_required_markers(spec,seen)
+            self._update_marker_visibility(True)
+        def ensure_required_markers(self,spec,seen=None):
+            existing=seen if seen is not None else set(m.label for m in self.markers)
+            for label,cfg in spec.items():
+                if not cfg.get("required"):
+                    continue
+                if label in existing:
+                    continue
+                color_tuple=cfg.get("color",(255,0,0))
+                marker=self.add_marker(label,QtGui.QColor(color_tuple[0],color_tuple[1],color_tuple[2]),cfg.get("alpha",0.5),cfg.get("pos",(0.5,0.5))[0],cfg.get("pos",(0.5,0.5))[1],cfg.get("radius",0.05))
+                if marker:
+                    existing.add(label)
+            self._update_marker_visibility(True)
+        def add_marker(self,label,color=None,alpha=None,x_pct=None,y_pct=None,r_pct=None):
+            if not label:
+                return None
+            cfg=MARKER_SPEC.get(label,MARKER_SPEC.get("普攻"))
+            base_color=cfg.get("color",(255,0,0))
+            target_color=color if color is not None else QtGui.QColor(base_color[0],base_color[1],base_color[2])
+            target_alpha=alpha if alpha is not None else float(cfg.get("alpha",0.5))
+            pos=cfg.get("pos",(0.5,0.5))
+            xp=x_pct if x_pct is not None else 0.5
+            yp=y_pct if y_pct is not None else 0.5
+            rp=r_pct if r_pct is not None else float(cfg.get("radius",0.05))
+            m=_MarkerWidget(self,label,target_color,target_alpha,clamp(float(xp),0.0,1.0),clamp(float(yp),0.0,1.0),clamp(float(rp),0.01,0.5))
             self.markers.append(m)
             m.update_geometry_from_parent()
             desired=self.config_mode and self._overlay_visible
@@ -890,9 +993,7 @@ def ensure_qt_classes():
                 m.show()
             else:
                 m.hide()
-            m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,not self.config_mode)
-            self._marker_visible_cache[m]=desired
-            self.selected_marker=m
+            return m
         def remove_selected_marker(self):
             if self.selected_marker in self.markers:
                 target=self.selected_marker
@@ -986,6 +1087,20 @@ def ensure_qt_classes():
             self.timer.timeout.connect(self.on_tick)
             self.timer.start(200)
         def on_tick(self):
+            if self.app_state.consume_window_prompt():
+                QtWidgets.QMessageBox.information(self,"初始化完成","依赖与资源已就绪，请选择窗口")
+            err=self.app_state.consume_init_error()
+            if err:
+                QtWidgets.QMessageBox.critical(self,"初始化失败",err)
+            opt_status=self.app_state.consume_optimization_prompt()
+            if opt_status:
+                if opt_status=="completed":
+                    QtWidgets.QMessageBox.information(self,"优化完成","经验优化已完成，已保存最新模型")
+                else:
+                    QtWidgets.QMessageBox.warning(self,"优化已取消","优化过程已取消，进度已重置")
+                self.app_state.enter_learning()
+                if opt_status!="completed":
+                    self.app_state.set_progress(0)
             snap=self.app_state.get_state_snapshot()
             mode_map={Mode.INIT:"初始化",Mode.LEARNING:"学习",Mode.OPTIMIZING:"优化",Mode.CONFIGURING:"配置",Mode.TRAINING:"训练"}
             self.modeLabel.setText("模式:"+mode_map.get(snap["mode"],"未知"))
@@ -997,7 +1112,13 @@ def ensure_qt_classes():
             cd_text="冷却:"+",".join(["%s:%s"%(k,"是" if v else "否") for k,v in cd.items()])
             self.cooldownLabel.setText(cd_text)
             self.progressBar.setValue(int(snap["progress"]))
-            self.cancelOptimizeBtn.setEnabled(self.app_state.mode==Mode.OPTIMIZING)
+            running_opt=self.app_state.optimization_running()
+            rect=snap["window_rect"]
+            has_window=(rect[2]-rect[0])>0 and (rect[3]-rect[1])>0
+            self.chooseWindowBtn.setEnabled(snap["ready"])
+            self.optimizeBtn.setEnabled(snap["mode"]==Mode.LEARNING and snap["ready"] and has_window and not running_opt)
+            self.cancelOptimizeBtn.setEnabled(running_opt)
+            self.configBtn.setEnabled(snap["mode"]==Mode.LEARNING and has_window and not running_opt)
             if self.app_state.mode==Mode.CONFIGURING:
                 self.saveConfigBtn.setEnabled(True)
                 self.addMarkerBtn.setEnabled(True)
@@ -1006,6 +1127,8 @@ def ensure_qt_classes():
                 self.saveConfigBtn.setEnabled(False)
                 self.addMarkerBtn.setEnabled(False)
                 self.delMarkerBtn.setEnabled(False)
+            if self.app_state.overlay:
+                self.app_state.overlay.sync_with_window()
         def on_choose_window(self):
             ensure_qt_classes()
             dlg=_WindowSelectorDialog(self)
@@ -1017,29 +1140,39 @@ def ensure_qt_classes():
                 selected=dlg.selected()
                 if selected:
                     hwnd,rect=selected
-                    app.set_hwnd(hwnd)
-                    app.window_rect=rect
-                    if not app.overlay:
-                        app.overlay=_OverlayWindow(app)
-                    app.overlay.sync_with_window()
-                    app.overlay.set_overlay_visible(True)
-                    QtWidgets.QMessageBox.information(self,"准备就绪","请选择一个窗口")
+                    app.on_window_selected(hwnd,rect)
+                    app.mark_user_input()
+                    QtWidgets.QMessageBox.information(self,"学习模式","窗口已选择，已进入学习模式")
         def on_optimize(self):
-            if self.app_state.mode!=Mode.LEARNING:
+            with self.app_state.lock:
+                ready=self.app_state.ready
+                mode=self.app_state.mode
+                hwnd=self.app_state.hwnd
+            if not ready or hwnd is None:
+                QtWidgets.QMessageBox.warning(self,"无法优化","请先完成初始化并选择窗口")
+                return
+            if mode!=Mode.LEARNING:
                 QtWidgets.QMessageBox.information(self,"切换模式","请先返回学习模式后再开始优化")
                 return
+            if self.app_state.optimization_running():
+                QtWidgets.QMessageBox.information(self,"优化进行中","优化线程正在运行")
+                return
             self.app_state.set_mode(Mode.OPTIMIZING)
+            thread=OptimizationThread(self.app_state)
+            self.app_state.register_optimization_thread(thread)
+            thread.start()
+            QtWidgets.QMessageBox.information(self,"开始优化","已开始基于经验池的优化，可随时取消")
         def on_cancel_optimize(self):
-            self.app_state.request_cancel_optimization()
+            if self.app_state.optimization_running():
+                self.app_state.request_cancel_optimization()
         def on_configure(self):
             if self.app_state.mode!=Mode.LEARNING:
                 QtWidgets.QMessageBox.information(self,"切换模式","请在学习模式下进行配置")
                 return
             self.app_state.set_mode(Mode.CONFIGURING)
-            if not self.app_state.overlay:
-                self.app_state.overlay=_OverlayWindow(self.app_state)
-            self.app_state.overlay.set_overlay_visible(True)
-            self.app_state.overlay.set_config_mode(True)
+            overlay=self.app_state.ensure_overlay_initialized()
+            overlay.set_overlay_visible(True)
+            overlay.set_config_mode(True)
         def on_save_config(self):
             if self.app_state.mode!=Mode.CONFIGURING:
                 return
@@ -1062,18 +1195,34 @@ def ensure_qt_classes():
                 markers.append(m)
             self.app_state.file_manager.save_markers(markers,rect)
         def on_add_marker(self):
-            overlay=self.app_state.overlay
-            if overlay:
-                overlay.add_marker(random.choice(RIGHT_ACTION_LABELS),QtGui.QColor(255,0,0))
+            overlay=self.app_state.ensure_overlay_initialized()
+            available=[label for label in MARKER_SPEC.keys() if overlay.find_marker(label) is None]
+            if not available:
+                QtWidgets.QMessageBox.information(self,"无需添加","所有标志均已存在")
+                return
+            label,ok=QtWidgets.QInputDialog.getItem(self,"选择标志","标志",available,0,False)
+            if ok and label:
+                marker=overlay.add_marker(label)
+                overlay.selected_marker=marker
+                if marker:
+                    marker.selected=True
+                    marker.update()
         def on_delete_marker(self):
             overlay=self.app_state.overlay
             if overlay:
+                target=overlay.selected_marker
+                if not target:
+                    return
+                if MARKER_SPEC.get(target.label,{}).get("required"):
+                    QtWidgets.QMessageBox.warning(self,"不可删除","该标志为必需项，无法删除")
+                    return
                 overlay.remove_selected_marker()
         def on_move_aaa(self):
             d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
             if d:
                 old_base,new_base=self.app_state.file_manager.move_dir(d)
                 self.app_state.buffer.on_aaa_moved(old_base,new_base)
+                self.app_state.ensure_overlay_initialized()
                 QtWidgets.QMessageBox.information(self,"完成","AAA目录已迁移")
     MarkerWidget=_MarkerWidget
     OverlayWindow=_OverlayWindow
@@ -1320,6 +1469,15 @@ class AppState:
         self.paused_by_visibility=False
         self.current_hidden=torch.zeros(1,32)
         self.ai_action_queue=deque()
+        self.marker_spec=MARKER_SPEC
+        self.pending_window_prompt=False
+        self.pending_init_error=None
+        self.init_status={}
+        self.optimization_thread=None
+        self.pending_opt_prompt=False
+        self.optimization_status=None
+        self.init_thread=None
+        self.mode_manager_thread=None
     def set_hwnd(self,hwnd):
         with self.lock:
             self.hwnd=hwnd
@@ -1343,6 +1501,47 @@ class AppState:
             if self.paused_by_visibility!=paused:
                 self.paused_by_visibility=paused
                 self.last_user_input=time.time()
+    def complete_initialization(self,success,status,message=None):
+        with self.lock:
+            self.ready=success
+            self.init_status=status
+            if success:
+                self.pending_window_prompt=True
+            elif message:
+                self.pending_init_error=message
+    def consume_window_prompt(self):
+        with self.lock:
+            if self.pending_window_prompt:
+                self.pending_window_prompt=False
+                return True
+            return False
+    def consume_init_error(self):
+        with self.lock:
+            msg=self.pending_init_error
+            self.pending_init_error=None
+            return msg
+    def register_optimization_thread(self,thread):
+        with self.lock:
+            self.optimization_thread=thread
+            self.cancel_optimization=False
+            self.progress=0
+    def optimization_running(self):
+        with self.lock:
+            thread=self.optimization_thread
+        return thread is not None and thread.is_alive()
+    def finish_optimization(self,status):
+        with self.lock:
+            self.optimization_status=status
+            self.pending_opt_prompt=True
+            self.optimization_thread=None
+    def consume_optimization_prompt(self):
+        with self.lock:
+            if self.pending_opt_prompt:
+                self.pending_opt_prompt=False
+                status=self.optimization_status
+                self.optimization_status=None
+                return status
+            return None
     def should_switch_to_training(self):
         with self.lock:
             return self.mode==Mode.LEARNING and (time.time()-self.last_user_input)>=self.idle_threshold and self.can_record()
@@ -1350,6 +1549,44 @@ class AppState:
         with self.lock:
             user_intervened=(time.time()-self.last_user_input)<0.2
             return self.mode==Mode.TRAINING and ((not self.can_record()) or user_intervened)
+    def stop_training_threads(self):
+        with self.lock:
+            left=self.left_thread
+            right=self.right_thread
+            self.left_thread=None
+            self.right_thread=None
+        for t in [left,right]:
+            if t:
+                t.stop_flag=True
+        for t in [left,right]:
+            if t:
+                t.join(timeout=1.0)
+        with self.lock:
+            self.training_hidden_states={"left":None,"right":None}
+    def enter_learning(self):
+        self.stop_training_threads()
+        with self.lock:
+            self.mode=Mode.LEARNING
+            self.last_user_input=time.time()
+    def enter_training(self):
+        with self.lock:
+            if self.mode==Mode.TRAINING:
+                return
+            self.mode=Mode.TRAINING
+            self.last_user_input=time.time()
+            self.training_hidden_states={"left":None,"right":None}
+            need_left=self.left_thread is None or not self.left_thread.is_alive()
+            need_right=self.right_thread is None or not self.right_thread.is_alive()
+        if need_left:
+            left=LeftHandThread(self)
+            left.start()
+            with self.lock:
+                self.left_thread=left
+        if need_right:
+            right=RightHandThread(self)
+            right.start()
+            with self.lock:
+                self.right_thread=right
     def update_state_from_frame(self,img):
         metrics,hero_dead,in_recall,cooldowns,hid=self.agent.infer_state(img)
         with self.lock:
@@ -1360,7 +1597,7 @@ class AppState:
             self.current_hidden=hid.clone().detach()
     def get_state_snapshot(self):
         with self.lock:
-            return {"mode":self.mode,"metrics":self.metrics,"hero_dead":self.hero_dead,"in_recall":self.in_recall,"cooldowns":self.cooldowns,"progress":self.progress,"window_rect":self.window_rect}
+            return {"mode":self.mode,"metrics":self.metrics,"hero_dead":self.hero_dead,"in_recall":self.in_recall,"cooldowns":self.cooldowns,"progress":self.progress,"window_rect":self.window_rect,"ready":self.ready,"paused":self.paused_by_visibility}
     def set_progress(self,v):
         with self.lock:
             self.progress=v
@@ -1394,7 +1631,37 @@ class AppState:
                 cy=rect[1]+marker.y_pct*(rect[3]-rect[1])
                 r=marker.r_pct*min(rect[2]-rect[0],rect[3]-rect[1])
                 return cx,cy,r
-        return rect[0]+(rect[2]-rect[0])*0.5,rect[1]+(rect[3]-rect[1])*0.5,min(rect[2]-rect[0],rect[3]-rect[1])*0.1
+        cfg=self.marker_spec.get(label,self.marker_spec.get("普攻"))
+        pos=cfg.get("pos",(0.5,0.5))
+        radius=cfg.get("radius",0.05)
+        cx=rect[0]+(rect[2]-rect[0])*pos[0]
+        cy=rect[1]+(rect[3]-rect[1])*pos[1]
+        r=min(rect[2]-rect[0],rect[3]-rect[1])*radius
+        return cx,cy,r
+    def ensure_overlay_initialized(self):
+        ensure_qt_classes()
+        with self.lock:
+            overlay=self.overlay
+        if overlay is None:
+            overlay=_OverlayWindow(self)
+            with self.lock:
+                self.overlay=overlay
+        markers=self.file_manager.load_markers()
+        self.overlay.load_from_config(markers,self.marker_spec)
+        self.overlay.ensure_required_markers(self.marker_spec)
+        self.overlay.sync_with_window()
+        return self.overlay
+    def on_window_selected(self,hwnd,rect):
+        with self.lock:
+            self.hwnd=hwnd
+            self.window_rect=rect
+            self.agent.reset_neuro_state()
+            self.last_user_input=time.time()
+            self.mode=Mode.LEARNING
+        self.set_visibility_paused(not window_visible(hwnd))
+        overlay=self.ensure_overlay_initialized()
+        overlay.set_overlay_visible(False)
+        self.buffer.refresh_paths()
 class InputTracker:
     def __init__(self,app_state):
         self.app_state=app_state
@@ -1556,39 +1823,50 @@ class ScreenshotRecorder(threading.Thread):
             hz=self.rate_controller.get_hz()
             dt=1.0/float(max(1,hz))
             with self.app_state.lock:
-                active=self.app_state.can_record()
                 hwnd=self.app_state.hwnd
-                rect=self.app_state.window_rect
                 mode=self.app_state.mode
-            if active and hwnd is not None:
-                rect=get_window_rect(hwnd)
-                try:
-                    img=ImageGrabModule.grab(bbox=rect)
-                except Exception as e:
-                    logger.warning("截图失败:%s",e)
-                    img=None
-                if img is not None:
-                    self.app_state.update_state_from_frame(img)
-                    if mode==Mode.LEARNING:
-                        actions=[]
-                        while True:
-                            act=self.input_tracker.pop_action()
-                            if act is None:
-                                break
-                            actions.append(act)
-                        src="user"
-                    else:
-                        actions=[]
-                        while True:
-                            act=self.app_state.consume_ai_action()
-                            if act is None:
-                                break
-                            actions.append(act)
-                        src="ai"
-                    if not actions:
-                        actions=[None]
-                    for act in actions:
-                        self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
+            if hwnd is None:
+                time.sleep(dt)
+                continue
+            visible=window_visible(hwnd)
+            self.app_state.set_visibility_paused(not visible)
+            if not visible:
+                time.sleep(dt)
+                continue
+            if not self.app_state.can_record():
+                time.sleep(dt)
+                continue
+            rect=get_window_rect(hwnd)
+            with self.app_state.lock:
+                self.app_state.window_rect=rect
+                mode=self.app_state.mode
+            try:
+                img=ImageGrabModule.grab(bbox=rect)
+            except Exception as e:
+                logger.warning("截图失败:%s",e)
+                img=None
+            if img is not None:
+                self.app_state.update_state_from_frame(img)
+                if mode==Mode.LEARNING:
+                    actions=[]
+                    while True:
+                        act=self.input_tracker.pop_action()
+                        if act is None:
+                            break
+                        actions.append(act)
+                    src="user"
+                else:
+                    actions=[]
+                    while True:
+                        act=self.app_state.consume_ai_action()
+                        if act is None:
+                            break
+                        actions.append(act)
+                    src="ai"
+                if not actions:
+                    actions=[None]
+                for act in actions:
+                    self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
             time.sleep(dt)
 class LeftHandThread(threading.Thread):
     def __init__(self,app_state):
@@ -1757,6 +2035,60 @@ class OptimizationThread(threading.Thread):
             self.app_state.set_progress(100)
         else:
             self.app_state.set_progress(0)
+        status="completed" if completed else "cancelled"
+        self.app_state.finish_optimization(status)
+class InitializationThread(threading.Thread):
+    def __init__(self,app_state):
+        super(InitializationThread,self).__init__()
+        self.daemon=True
+        self.app_state=app_state
+    def run(self):
+        status={"timestamp":datetime.now().isoformat(),"dependencies":{},"aaa":{},"hardware":{}}
+        missing=verify_dependencies()
+        status["dependencies"]={"missing":missing,"ok":len(missing)==0}
+        try:
+            self.app_state.file_manager.ensure_structure()
+            status["aaa"]={"ok":True,"path":self.app_state.file_manager.base_path}
+        except Exception as e:
+            status["aaa"]={"ok":False,"error":str(e)}
+        self.app_state.hardware.refresh(True)
+        status["hardware"]={"cpu":self.app_state.hardware.cpu_load,"mem":self.app_state.hardware.mem_free,"gpu":self.app_state.hardware.gpu_free}
+        self.app_state.file_manager.write_init_status(status)
+        error_msg=None
+        if missing:
+            error_msg="缺少依赖:"+",".join(missing)
+        if not status["aaa"].get("ok",False):
+            detail=status["aaa"].get("error","AAA目录初始化失败")
+            error_msg=(error_msg+";"+detail) if error_msg else detail
+        if error_msg:
+            logger.error("初始化失败:%s",error_msg)
+            self.app_state.complete_initialization(False,status,error_msg)
+        else:
+            logger.info("初始化完成,依赖就绪")
+            self.app_state.complete_initialization(True,status,None)
+class ModeManagerThread(threading.Thread):
+    def __init__(self,app_state):
+        super(ModeManagerThread,self).__init__()
+        self.daemon=True
+        self.app_state=app_state
+        self.stop_flag=False
+    def run(self):
+        while not self.stop_flag:
+            with self.app_state.lock:
+                hwnd=self.app_state.hwnd
+                mode=self.app_state.mode
+            if hwnd:
+                visible=window_visible(hwnd)
+                self.app_state.set_visibility_paused(not visible)
+                if not visible:
+                    if mode==Mode.TRAINING:
+                        self.app_state.enter_learning()
+                else:
+                    if self.app_state.should_switch_to_training():
+                        self.app_state.enter_training()
+                if self.app_state.must_back_to_learning():
+                    self.app_state.enter_learning()
+            time.sleep(0.1)
 def main():
     app=QtWidgets.QApplication(sys.argv)
     ensure_qt_classes()
@@ -1769,6 +2101,12 @@ def main():
     input_tracker=InputTracker(app_state)
     recorder=ScreenshotRecorder(app_state,buffer,rate_controller,input_tracker)
     recorder.start()
+    init_thread=InitializationThread(app_state)
+    app_state.init_thread=init_thread
+    init_thread.start()
+    mode_manager=ModeManagerThread(app_state)
+    app_state.mode_manager_thread=mode_manager
+    mode_manager.start()
     w=MainWindow(app_state,rate_controller)
     w.show()
     sys.exit(app.exec_())
