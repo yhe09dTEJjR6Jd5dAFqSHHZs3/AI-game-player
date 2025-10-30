@@ -357,6 +357,7 @@ class VisionModel(nn.Module):
         self.conv1=nn.Conv2d(3,16,3,2,1)
         self.conv2=nn.Conv2d(16,32,3,2,1)
         self.conv3=nn.Conv2d(32,64,3,2,1)
+        self.pool=nn.AdaptiveAvgPool2d((30,30))
         self.fc_state=nn.Linear(64*30*30,32)
         self.fc_metrics=nn.Linear(32,3)
         self.fc_flags=nn.Linear(32,10)
@@ -364,6 +365,7 @@ class VisionModel(nn.Module):
         x=F.relu(self.conv1(x))
         x=F.relu(self.conv2(x))
         x=F.relu(self.conv3(x))
+        x=self.pool(x)
         x=x.view(x.size(0),-1)
         h=F.relu(self.fc_state(x))
         metrics=F.relu(self.fc_metrics(h))
@@ -425,7 +427,8 @@ class RLAgent:
             self.device=target
     def preprocess_frame(self,img):
         self.ensure_device()
-        img=img.resize((240,240))
+        w,h=self.hardware.suggest_visual_size()
+        img=img.resize((w,h))
         arr=np.array(img).astype(np.float32)/255.0
         arr=np.transpose(arr,(2,0,1))
         t=torch.tensor(arr,dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -747,6 +750,7 @@ class HardwareAdaptiveRate:
         self.mem_free=0.5
         self.gpu_free=0.5
         self.last_refresh=0.0
+        self.visual_level=1
     def refresh(self):
         now=time.time()
         if now-self.last_refresh<0.5:
@@ -787,6 +791,15 @@ class HardwareAdaptiveRate:
         else:
             target=torch.device("cpu")
         self.device=target
+        capacity=(1.0-self.cpu_load/100.0)*0.5+self.mem_free*0.25+self.gpu_free*0.25
+        if capacity>=0.8:
+            self.visual_level=3
+        elif capacity>=0.55:
+            self.visual_level=2
+        elif capacity>=0.3:
+            self.visual_level=1
+        else:
+            self.visual_level=0
         self.last_refresh=now
     def get_hz(self):
         self.refresh()
@@ -806,6 +819,18 @@ class HardwareAdaptiveRate:
     def suggest_device(self):
         self.refresh()
         return self.device
+    def suggest_visual_level(self):
+        self.refresh()
+        return self.visual_level
+    def suggest_visual_size(self):
+        level=self.suggest_visual_level()
+        if level>=3:
+            return 336,336
+        if level==2:
+            return 304,304
+        if level==1:
+            return 272,272
+        return 240,240
 def enum_windows():
     result=[]
     def callback(hwnd,extra):
