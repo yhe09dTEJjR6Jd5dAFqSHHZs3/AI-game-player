@@ -22,14 +22,76 @@ import numpy as np
 from collections import deque,OrderedDict
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logger=logging.getLogger("aaa_runtime")
+REQUIRED_MODULES=["psutil","pyautogui","pynput","PIL","numpy","torch","PyQt5"]
+class ModuleMissingError(ImportError):
+    def __init__(self,name,detail):
+        super().__init__(detail)
+        self.name=name
+class DependencyManager:
+    def __init__(self,names):
+        self.names=list(names)
+        self.lock=threading.Lock()
+        self.modules={}
+        self.failures={}
+        self.preload_thread=None
+        self.preload_started=False
+    def register(self,name):
+        with self.lock:
+            if name not in self.names:
+                self.names.append(name)
+    def ensure_module(self,name):
+        module=self.modules.get(name)
+        if module is not None:
+            return module
+        failure=self.failures.get(name)
+        if failure is not None:
+            raise failure
+        with self.lock:
+            module=self.modules.get(name)
+            if module is not None:
+                return module
+            failure=self.failures.get(name)
+            if failure is not None:
+                raise failure
+            try:
+                module=importlib.import_module(name)
+                self.modules[name]=module
+                return module
+            except ImportError as e:
+                err=ModuleMissingError(name,str(e))
+                self.failures[name]=err
+                raise err
+    def verify(self):
+        missing=[]
+        for name in list(self.names):
+            try:
+                self.ensure_module(name)
+            except ModuleMissingError as e:
+                missing.append(e.name)
+        return missing
+    def start_preloading(self):
+        with self.lock:
+            if self.preload_started:
+                return
+            self.preload_started=True
+        def worker():
+            for name in list(self.names):
+                try:
+                    self.ensure_module(name)
+                except ModuleMissingError:
+                    pass
+        thread=threading.Thread(target=worker)
+        thread.daemon=True
+        thread.start()
+        with self.lock:
+            self.preload_thread=thread
+dependency_manager=DependencyManager(REQUIRED_MODULES)
 class LazyModule:
     def __init__(self,name):
         self.name=name
-        self.module=None
+        dependency_manager.register(name)
     def _load(self):
-        if self.module is None:
-            self.module=importlib.import_module(self.name)
-        return self.module
+        return dependency_manager.ensure_module(self.name)
     def __getattr__(self,item):
         return getattr(self._load(),item)
     def __call__(self,*args,**kwargs):
@@ -106,18 +168,21 @@ def build_right_decode_table(mapping):
 RIGHT_ACTION_MAPPING=build_right_mapping()
 RIGHT_ACTION_TABLE=build_right_decode_table(RIGHT_ACTION_MAPPING)
 MARKER_SPEC={"移动轮盘":{"color":(255,0,0),"radius":0.14,"alpha":0.5,"required":True,"pos":(0.2,0.78)},"回城":{"color":(255,165,0),"radius":0.08,"alpha":0.5,"required":True,"pos":(0.88,0.82)},"恢复":{"color":(0,255,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.74,0.82)},"闪现":{"color":(255,255,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.62,0.82)},"普攻":{"color":(0,0,255),"radius":0.07,"alpha":0.5,"required":True,"pos":(0.86,0.68)},"一技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.74,0.64)},"二技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.88,0.56)},"三技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.66,0.52)},"四技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.94,0.48)},"取消施法":{"color":(0,0,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.5,0.5)},"主动装备":{"color":(128,0,128),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.7,0.75)},"数据A":{"color":(200,200,0),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.1,0.1)},"数据B":{"color":(0,200,200),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.2,0.1)},"数据C":{"color":(200,0,200),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.3,0.1)}}
-REQUIRED_MODULES=["psutil","pyautogui","pynput","PIL","numpy","torch","PyQt5"]
 def verify_dependencies():
-    missing=[]
-    for name in REQUIRED_MODULES:
-        try:
-            importlib.import_module(name)
-        except ImportError:
-            missing.append(name)
-    return missing
+    return dependency_manager.verify()
 def get_desktop_path():
     return os.path.join(os.path.expanduser("~"),"Desktop")
 class AAAFileManager:
+    class MoveError(Exception):
+        pass
+    class PrecheckError(MoveError):
+        def __init__(self,msg,level=logging.ERROR):
+            super().__init__(msg)
+            self.level=level
+    class OperationError(MoveError):
+        pass
+    class RecoveryError(MoveError):
+        pass
     def __init__(self):
         self.lock=threading.Lock()
         self.base_path=os.path.join(get_desktop_path(),"AAA")
@@ -152,59 +217,103 @@ class AAAFileManager:
                 torch.save({},self.right_model_path)
             if not os.path.exists(self.neuro_model_path):
                 torch.save({},self.neuro_model_path)
+    def _precheck_move(self,old_base,new_parent):
+        if not new_parent:
+            raise self.PrecheckError("目标路径为空",logging.INFO)
+        requested=os.path.abspath(new_parent)
+        if not requested:
+            raise self.PrecheckError("目标路径无效")
+        if os.path.basename(requested).lower()=="aaa":
+            target_parent=os.path.dirname(requested)
+            target_base=requested
+        else:
+            target_parent=requested
+            target_base=os.path.join(target_parent,"AAA")
+        if not target_parent:
+            raise self.PrecheckError("缺少目标上级目录")
+        try:
+            common=os.path.commonpath([old_base,target_base])
+        except ValueError:
+            common=None
+        if os.path.normcase(target_base)==os.path.normcase(old_base):
+            raise self.PrecheckError("目标目录与当前目录相同",logging.INFO)
+        if common==old_base:
+            raise self.PrecheckError("目标目录位于当前目录内部")
+        try:
+            os.makedirs(target_parent,exist_ok=True)
+        except OSError as e:
+            raise self.PrecheckError("创建目标父目录失败:"+str(e))
+        if os.path.exists(target_base):
+            try:
+                shutil.rmtree(target_base)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                raise self.PrecheckError("清理旧目标目录失败:"+str(e))
+        logger.info("AAA目录预检查通过:%s -> %s",old_base,target_base)
+        return target_parent,target_base
+    def _perform_move(self,old_base,target_base):
+        logger.info("AAA目录开始移动:%s -> %s",old_base,target_base)
+        try:
+            shutil.move(old_base,target_base)
+        except (shutil.Error,OSError) as e:
+            raise self.OperationError("直接移动失败:"+str(e))
+    def _recover_move(self,old_base,target_base,original_error):
+        logger.info("AAA目录进入恢复流程:%s -> %s",old_base,target_base)
+        logger.warning("AAA目录恢复触发原因:%s",original_error)
+        if os.path.normcase(old_base)==os.path.normcase(target_base):
+            return
+        source_base=old_base if os.path.exists(old_base) else target_base
+        if not os.path.exists(source_base):
+            raise self.RecoveryError("源目录缺失")
+        if os.path.normcase(source_base)==os.path.normcase(target_base):
+            logger.info("AAA目录恢复检测:数据已在目标位置")
+            return
+        moved=[]
+        try:
+            os.makedirs(target_base,exist_ok=True)
+            for name in os.listdir(source_base):
+                src=os.path.join(source_base,name)
+                dst=os.path.join(target_base,name)
+                if os.path.normcase(src)==os.path.normcase(dst):
+                    continue
+                shutil.move(src,dst)
+                moved.append((dst,src))
+            if os.path.exists(old_base) and os.path.normcase(old_base)!=os.path.normcase(target_base):
+                try:
+                    shutil.rmtree(old_base)
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    logger.warning("清理旧AAA残留失败:%s",cleanup_error)
+            return
+        except (OSError,shutil.Error) as e:
+            for dst,src in reversed(moved):
+                if os.path.exists(dst):
+                    try:
+                        shutil.move(dst,src)
+                    except (OSError,shutil.Error) as rollback_error:
+                        logger.error("AAA目录回滚失败:%s",rollback_error)
+            raise self.RecoveryError("恢复流程失败:"+str(e))
     def move_dir(self,new_parent):
         with self.lock:
             old_base=os.path.abspath(self.base_path)
-            requested=os.path.abspath(new_parent)
-            if os.path.basename(requested).lower()=="aaa":
-                target_parent=os.path.dirname(requested)
-                target_base=requested
-            else:
-                target_parent=requested
-                target_base=os.path.join(target_parent,"AAA")
-            if not target_parent:
+            try:
+                target_parent,target_base=self._precheck_move(old_base,new_parent)
+            except self.PrecheckError as e:
+                level=getattr(e,"level",logging.ERROR)
+                logger.log(level,"AAA目录预检查终止:%s",e)
                 return old_base,old_base
             try:
-                common=os.path.commonpath([old_base,target_base])
-            except ValueError:
-                common=None
-            if target_base==old_base or common==old_base:
-                return old_base,old_base
-            try:
-                os.makedirs(target_parent,exist_ok=True)
-            except OSError as e:
-                logger.error("创建目录失败:%s",e)
-                return old_base,old_base
-            if os.path.exists(target_base):
+                self._perform_move(old_base,target_base)
+            except self.OperationError as move_error:
+                logger.warning("AAA目录直接移动失败:%s",move_error)
                 try:
-                    shutil.rmtree(target_base)
-                except FileNotFoundError:
-                    pass
-                except OSError as e:
-                    logger.error("清理旧AAA目录失败:%s",e)
+                    self._recover_move(old_base,target_base,move_error)
+                except self.RecoveryError as recovery_error:
+                    logger.error("AAA目录迁移恢复失败:%s",recovery_error)
                     return old_base,old_base
-            moved=False
-            try:
-                shutil.move(old_base,target_base)
-                moved=True
-            except (shutil.Error,OSError) as e:
-                logger.warning("直接移动AAA目录失败:%s",e)
-                try:
-                    os.makedirs(target_base,exist_ok=True)
-                    for name in os.listdir(old_base):
-                        shutil.move(os.path.join(old_base,name),target_base)
-                    moved=True
-                    try:
-                        shutil.rmtree(old_base)
-                    except FileNotFoundError:
-                        pass
-                    except OSError as cleanup_error:
-                        logger.warning("清理旧AAA残留失败:%s",cleanup_error)
-                except (OSError,shutil.Error) as nested_error:
-                    logger.error("迁移AAA目录失败:%s",nested_error)
-                    moved=False
-            if not moved:
-                return old_base,old_base
+            logger.info("AAA目录迁移完成:%s -> %s",old_base,target_base)
             self.base_path=target_base
             self.ensure_structure()
             self.update_config_path()
@@ -2090,6 +2199,7 @@ class ModeManagerThread(threading.Thread):
                     self.app_state.enter_learning()
             time.sleep(0.1)
 def main():
+    dependency_manager.start_preloading()
     app=QtWidgets.QApplication(sys.argv)
     ensure_qt_classes()
     rate_controller=HardwareAdaptiveRate()
