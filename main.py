@@ -1122,7 +1122,7 @@ class AdaptiveRewardModel:
         self.preference=torch.stack([pref_A,-pref_B,pref_C],dim=0)
         adaptation=0.5+impact_ratio*0.8+support_ratio*0.3-survival_penalty*0.4
         self.temperature=float(clamp(adaptation,0.5,2.5))
-    def compute(self,metrics,source,hero_dead,is_ai):
+    def compute(self,metrics):
         device=self.running.device
         vec=torch.tensor([metrics[0],metrics[1],metrics[2]],dtype=torch.float32,device=device)
         self._observe(vec)
@@ -1179,8 +1179,8 @@ class RLAgent:
         self.min_temperature=0.25
         self.temperature_decay=0.9995
         self.hierarchical_prior={"left":{"default":["移动轮盘"]},"right":{"burst":["普攻","一技能","二技能","三技能","四技能"],"mobility":["闪现"],"sustain":["恢复","回城"],"utility":["主动装备","数据A","数据B","数据C"],"cancel":["取消施法"]}}
-    def compute_reward(self,A,B,C,source,hero_dead):
-        return self.reward_model.compute((A,B,C),source,hero_dead,source!="user")
+    def compute_reward(self,A,B,C):
+        return self.reward_model.compute((A,B,C))
     def ensure_device(self):
         self.hardware.refresh()
         target=self.hardware.suggest_device()
@@ -1437,8 +1437,9 @@ class RLAgent:
                     A=float(rec["metrics"]["A"])
                     B=float(rec["metrics"]["B"])
                     C=float(rec["metrics"]["C"])
-                    rew=self.compute_reward(A,B,C,rec.get("source","user"),rec.get("hero_dead",False))
+                    rew=self.compute_reward(A,B,C)
                     rewards.append(rew)
+                    quality=0.5*(math.tanh(clamp(rew/10.0,-6.0,6.0))+1.0)
                     act=rec["action"]
                     left_target=0
                     right_target=0
@@ -1452,15 +1453,13 @@ class RLAgent:
                         if hand=="left":
                             left_target=aid
                             left_rl=1
-                            if rec["source"]=="user":
-                                left_super=1
+                            left_super=quality
                         elif hand=="right":
                             right_target=aid
                             right_rl=1
-                            if rec["source"]=="user":
-                                right_super=1
+                            right_super=quality
                         option_targets.append(self._map_action_to_option(act,A,B,C,rec.get("hero_dead",False)))
-                        option_supervision.append(1 if rec["source"]=="user" else 0)
+                        option_supervision.append(quality)
                         option_rl_flags.append(1)
                     else:
                         option_targets.append(self._map_action_to_option(None,A,B,C,rec.get("hero_dead",False)))
@@ -1920,7 +1919,11 @@ def ensure_qt_classes():
         def refresh_windows(self):
             self.listWidget.clear()
             self.windows=[]
-            for hwnd,title,rect in enumerate_windows():
+            for hwnd,title in enum_windows():
+                try:
+                    rect=get_window_rect(hwnd)
+                except Exception:
+                    continue
                 item=QtWidgets.QListWidgetItem(title)
                 item.setData(QtCore.Qt.UserRole,(hwnd,rect))
                 self.listWidget.addItem(item)
