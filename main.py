@@ -10,17 +10,20 @@ import ctypes
 import logging
 import importlib
 import queue
+import subprocess
+import statistics
+import itertools
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 from ctypes import wintypes
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
-from collections import deque,OrderedDict
+from collections import deque,OrderedDict,defaultdict
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logger=logging.getLogger("aaa_runtime")
 REQUIRED_MODULES=["psutil","pyautogui","pynput","PIL","numpy","torch","PyQt5"]
@@ -36,10 +39,11 @@ class DependencyIssue:
     attempts:int=0
     last_failure:float=0.0
     resolved:bool=False
+    history:list=field(default_factory=list)
     def should_retry(self,interval):
         return self.resolved or (time.time()-self.last_failure)>=interval
     def to_dict(self):
-        return {"name":self.name,"message":self.message,"guidance":self.guidance,"attempts":self.attempts,"resolved":self.resolved}
+        return {"name":self.name,"message":self.message,"guidance":self.guidance,"attempts":self.attempts,"resolved":self.resolved,"history":list(self.history)}
 class DependencyManager:
     def __init__(self,names):
         self.names=list(names)
@@ -49,6 +53,13 @@ class DependencyManager:
         self.preload_thread=None
         self.preload_started=False
         self.retry_interval=5.0
+        self.offline_cache=os.path.join(os.path.expanduser("~"),"Desktop","AAA","wheel_cache")
+        self.install_feedback=deque(maxlen=64)
+        self.retry_queue=queue.Queue()
+        self.retry_set=set()
+        self.retry_worker=threading.Thread(target=self._retry_loop,daemon=True)
+        self.retry_worker.start()
+        self.wizard_started=False
     def register(self,name):
         with self.lock:
             if name not in self.names:
@@ -59,7 +70,90 @@ class DependencyManager:
             tip="pip install pillow"
         if name.lower()=="pyqt5":
             tip="pip install PyQt5"
-        return "建议执行:"+tip+";错误:"+message
+        cache_hint="离线缓存:"+self.offline_cache
+        return "建议执行:"+tip+";"+cache_hint+";错误:"+message
+    def _ensure_cache_dir(self):
+        try:
+            os.makedirs(self.offline_cache,exist_ok=True)
+        except OSError as e:
+            logger.warning("离线缓存目录创建失败:%s",e)
+    def _attempt_install(self,name):
+        self._ensure_cache_dir()
+        try:
+            files=[f for f in os.listdir(self.offline_cache) if f.lower().startswith(name.lower().replace("-","_"))]
+        except OSError:
+            files=[]
+        use_cache=len(files)>0
+        cmd=[sys.executable,"-m","pip","install"]
+        if use_cache:
+            cmd.extend(["--no-index","--find-links",self.offline_cache])
+        cmd.append(name)
+        start=time.time()
+        try:
+            result=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=420)
+            output=(result.stdout.decode(errors="ignore")+result.stderr.decode(errors="ignore")).strip()
+            success=result.returncode==0
+        except Exception as e:
+            output=str(e)
+            success=False
+        feedback={"name":name,"success":success,"duration":time.time()-start,"timestamp":time.time(),"message":output[:2000],"cache":use_cache}
+        with self.lock:
+            self.install_feedback.append(feedback)
+        if not success:
+            raise ModuleMissingError(name,output)
+    def _attempt_install_and_import(self,name):
+        self._attempt_install(name)
+        module=importlib.import_module(name)
+        with self.lock:
+            self.modules[name]=module
+        return module
+    def _retry_loop(self):
+        while True:
+            name=self.retry_queue.get()
+            if name is None:
+                break
+            time.sleep(self.retry_interval)
+            try:
+                module=self._attempt_install_and_import(name)
+                with self.lock:
+                    self.modules[name]=module
+                    issue=self.issues.get(name)
+                    if issue:
+                        issue.resolved=True
+                        issue.history.append({"timestamp":time.time(),"success":True})
+                with self.lock:
+                    self.retry_set.discard(name)
+            except ModuleMissingError as e:
+                with self.lock:
+                    issue=self.issues.get(name)
+                    if issue:
+                        issue.message=str(e)
+                        issue.attempts+=1
+                        issue.last_failure=time.time()
+                        issue.resolved=False
+                        issue.history.append({"timestamp":time.time(),"success":False,"detail":str(e)[:200]})
+                    self.retry_set.discard(name)
+            except Exception as e:
+                logger.error("依赖自动重试异常:%s",e)
+                with self.lock:
+                    self.retry_set.discard(name)
+    def schedule_retry(self,name,force=False):
+        with self.lock:
+            if not force and name in self.retry_set:
+                return
+            self.retry_set.add(name)
+        self.retry_queue.put(name)
+    def start_install_wizard(self):
+        with self.lock:
+            if self.wizard_started:
+                return
+            self.wizard_started=True
+            pending=[n for n in self.names if n not in self.modules]
+        for item in pending:
+            self.schedule_retry(item,True)
+    def get_install_feedback(self):
+        with self.lock:
+            return list(self.install_feedback)
     def ensure_module(self,name):
         module=self.modules.get(name)
         if module is not None:
@@ -82,6 +176,16 @@ class DependencyManager:
                 return module
             except ImportError as e:
                 message=str(e)
+                try:
+                    module=self._attempt_install_and_import(name)
+                    if issue:
+                        issue.resolved=True
+                        issue.message=""
+                        issue.guidance="自动安装成功"
+                        issue.history.append({"timestamp":time.time(),"success":True})
+                    return module
+                except ModuleMissingError as install_error:
+                    message=str(install_error)
                 guidance=self._build_guidance(name,message)
                 now=time.time()
                 if issue:
@@ -90,8 +194,10 @@ class DependencyManager:
                     issue.attempts+=1
                     issue.last_failure=now
                     issue.resolved=False
+                    issue.history.append({"timestamp":now,"success":False,"detail":message[:200]})
                 else:
-                    self.issues[name]=DependencyIssue(name,message,guidance,1,now,False)
+                    self.issues[name]=DependencyIssue(name,message,guidance,1,now,False,[{"timestamp":now,"success":False,"detail":message[:200]}])
+                self.schedule_retry(name)
                 raise ModuleMissingError(name,message)
     def verify(self):
         missing=[]
@@ -212,6 +318,7 @@ def verify_dependencies():
 def get_desktop_path():
     return os.path.join(os.path.expanduser("~"),"Desktop")
 MODEL_SCHEMA_VERSION=1
+CONFIG_VERSION=2
 def _color_to_hex(color):
     if hasattr(color,"name"):
         return color.name()
@@ -410,7 +517,7 @@ class AAAFileManager:
             self.option_model_path=os.path.join(self.base_path,"option_planner.pt")
             self.init_status_path=os.path.join(self.base_path,"init_status.json")
             if not os.path.exists(self.config_path):
-                default_cfg={"markers":[],"aaa_path":self.base_path}
+                default_cfg={"markers":[],"aaa_path":self.base_path,"version":CONFIG_VERSION}
                 with open(self.config_path,"w",encoding="utf-8") as f:
                     json.dump(default_cfg,f)
             if not os.path.exists(self.vision_model_path):
@@ -557,7 +664,9 @@ class AAAFileManager:
                 with open(self.config_path,"r",encoding="utf-8") as f:
                     cfg=json.load(f)
             else:
-                cfg={"markers":[]}
+                cfg={"markers":[],"version":CONFIG_VERSION}
+            if cfg.get("version")!=CONFIG_VERSION:
+                cfg["version"]=CONFIG_VERSION
             cfg["aaa_path"]=self.base_path
             with open(self.config_path,"w",encoding="utf-8") as f:
                 json.dump(cfg,f)
@@ -567,10 +676,11 @@ class AAAFileManager:
                 with open(self.config_path,"r",encoding="utf-8") as f:
                     cfg=json.load(f)
             else:
-                cfg={"aaa_path":self.base_path}
+                cfg={"aaa_path":self.base_path,"version":CONFIG_VERSION}
             rect=window_rect if window_rect else (0,0,1,1)
             normalized=self.validate_markers(markers,rect)
             cfg["markers"]=[m.to_dict() for m in normalized]
+            cfg["version"]=CONFIG_VERSION
             with open(self.config_path,"w",encoding="utf-8") as f:
                 json.dump(cfg,f)
     def load_markers(self):
@@ -579,7 +689,15 @@ class AAAFileManager:
             if os.path.exists(self.config_path):
                 with open(self.config_path,"r",encoding="utf-8") as f:
                     cfg=json.load(f)
-                    for m in cfg.get("markers",[]):
+                    markers=cfg.get("markers",[])
+                    if cfg.get("version")!=CONFIG_VERSION:
+                        normalized=self.validate_markers(markers,(0,0,1,1))
+                        cfg["markers"]=[m.to_dict() for m in normalized]
+                        cfg["version"]=CONFIG_VERSION
+                        with open(self.config_path,"w",encoding="utf-8") as wf:
+                            json.dump(cfg,wf)
+                        markers=[m.to_dict() for m in normalized]
+                    for m in markers:
                         out.append(m)
             return out
     def save_models(self,vision,left,right,neuro,planner):
@@ -630,6 +748,8 @@ class ExperienceBuffer:
         self.cache_lock=threading.Lock()
         self.frame_cache=OrderedDict()
         self.cache_capacity=256
+        self.read_history=deque(maxlen=240)
+        self.write_history=deque(maxlen=240)
         self.refresh_paths()
     def refresh_paths(self):
         with self.lock:
@@ -650,6 +770,7 @@ class ExperienceBuffer:
             self.data.append(rec)
             if len(self.data)>self.capacity:
                 self.data.pop(0)
+            self.write_history.append({"timestamp":ts,"source":source,"frame":bool(rel_frame)})
         try:
             with open(self.meta_log,"a",encoding="utf-8") as f:
                 f.write(json.dumps(rec)+"\n")
@@ -708,6 +829,7 @@ class ExperienceBuffer:
     def get_frame_arrays(self,records,size):
         w=int(size[0])
         h=int(size[1])
+        t0=time.time()
         results=[None]*len(records)
         missing=[]
         with self.cache_lock:
@@ -753,6 +875,9 @@ class ExperienceBuffer:
                     self.frame_cache[key]=arr
             while len(self.frame_cache)>self.cache_capacity:
                 self.frame_cache.popitem(last=False)
+        duration=time.time()-t0
+        with self.lock:
+            self.read_history.append({"timestamp":time.time(),"duration":duration,"count":len(records)})
         return results
     def sample(self,batch_size=32):
         with self.lock:
@@ -789,6 +914,46 @@ class ExperienceBuffer:
                     r=(sx+sy)/2.0
                     out[k]={"x_pct":mx,"y_pct":my,"r_pct":r}
             return out
+    def get_performance_metrics(self):
+        with self.lock:
+            reads=list(self.read_history)
+            writes=list(self.write_history)
+            total=len(self.data)
+        avg_read=statistics.fmean([item["duration"] for item in reads]) if reads else 0.0
+        avg_batch=statistics.fmean([item["count"] for item in reads]) if reads else 0.0
+        if len(writes)>1:
+            intervals=[max(0.0,writes[i+1]["timestamp"]-writes[i]["timestamp"]) for i in range(len(writes)-1)]
+            avg_interval=statistics.fmean(intervals) if intervals else 0.0
+        else:
+            avg_interval=0.0
+        return {"avg_read_time":avg_read,"avg_read_batch":avg_batch,"avg_write_interval":avg_interval,"size":total}
+    def get_heatmap(self,grid=32):
+        g=int(clamp(grid,4,64))
+        counts=[[0.0 for _ in range(g)] for _ in range(g)]
+        with self.lock:
+            records=list(self.data)
+        for rec in records:
+            rect=rec.get("rect")
+            act=rec.get("action")
+            if not rect or not act:
+                continue
+            pos=act.get("pos")
+            if not pos:
+                continue
+            w=max(1,rect[2]-rect[0])
+            h=max(1,rect[3]-rect[1])
+            x=(pos[0]-rect[0])/float(w)
+            y=(pos[1]-rect[1])/float(h)
+            if x<0 or x>1 or y<0 or y>1:
+                continue
+            ix=min(g-1,max(0,int(x*g)))
+            iy=min(g-1,max(0,int(y*g)))
+            counts[iy][ix]+=1.0
+        total=sum(sum(row) for row in counts)
+        if total>0:
+            scale=1.0/total
+            counts=[[v*scale for v in row] for row in counts]
+        return {"grid":g,"counts":counts}
 class VisionModel(nn.Module):
     def __init__(self):
         super(VisionModel,self).__init__()
@@ -990,14 +1155,18 @@ class RLAgent:
         self.value_coef=0.5
         self.global_step=0
         self.neuro_state=torch.zeros(32,device=self.device)
-        self.state_history=deque(maxlen=64)
-        self.option_history=deque(maxlen=64)
+        self.state_history=deque(maxlen=128)
+        self.option_history=deque(maxlen=128)
         self.current_option=0
         self.meta_controller=MetaLearner([self.vision,self.left,self.right,self.neuro_module,self.option_planner],0.05)
         self.batch_buffer=None
         self.cpu_batch=None
         self.batch_capacity=0
         self.batch_shape=None
+        self.policy_temperature=1.2
+        self.min_temperature=0.25
+        self.temperature_decay=0.9995
+        self.hierarchical_prior={"left":{"default":["移动轮盘"]},"right":{"burst":["普攻","一技能","二技能","三技能","四技能"],"mobility":["闪现"],"sustain":["恢复","回城"],"utility":["主动装备","数据A","数据B","数据C"],"cancel":["取消施法"]}}
     def compute_reward(self,A,B,C,source,hero_dead):
         return self.reward_model.compute((A,B,C),source,hero_dead,source!="user")
     def ensure_device(self):
@@ -1082,25 +1251,99 @@ class RLAgent:
             if hero_dead or B>A:
                 return 3
         return 5
-    def select_actions(self,h_state,left_hidden,right_hidden):
+    def _update_temperature(self):
+        self.policy_temperature=max(self.min_temperature,self.policy_temperature*self.temperature_decay)
+        latency=self.hardware.get_latency("right_hand")
+        scale=clamp(1.0+latency*0.4,0.5,2.0)
+        return float(self.policy_temperature*scale)
+    def _build_context_features(self,h_state,cooldowns,mode,hero_dead,in_recall):
+        base=[1.0 if hero_dead else -1.0,1.0 if in_recall else -1.0,float(mode==Mode.TRAINING),float(mode==Mode.LEARNING),float(mode==Mode.OPTIMIZING)]
+        cd_keys=["flash","skill1","skill2","skill3","skill4","active_item","heal"]
+        for key in cd_keys:
+            base.append(1.0 if cooldowns.get(key,False) else -1.0)
+        lat=[self.hardware.get_latency("left_hand"),self.hardware.get_latency("right_hand"),self.hardware.get_latency("screenshot"),self.hardware.get_latency("optimize")]
+        base.extend(lat)
+        base.append(float(self.policy_temperature))
+        hist_ratio=len(self.option_history)/float(self.option_history.maxlen if self.option_history.maxlen else 1)
+        base.append(hist_ratio)
+        if len(base)<h_state.numel():
+            base.extend([0.0]*(h_state.numel()-len(base)))
+        tensor=torch.tensor(base[:h_state.numel()],dtype=torch.float32,device=self.device)
+        return tensor
+    def _apply_option_diversity(self,logits):
+        if len(self.option_history)==0:
+            return logits
+        hist=torch.tensor(list(self.option_history),dtype=torch.long,device=logits.device)
+        counts=torch.bincount(hist,minlength=logits.size(-1)).float()
+        if counts.sum()>0:
+            penalty=counts/counts.sum()
+            logits=logits-penalty.unsqueeze(0)*0.6
+        return logits
+    def _mask_right_logits(self,logits,option,cooldowns,hero_dead,in_recall):
+        masked=logits.clone()
+        option_map={0:"left",1:"burst",2:"mobility",3:"sustain",4:"utility",5:"cancel"}
+        focus=option_map.get(option,"burst")
+        skill_map={"一技能":"skill1","二技能":"skill2","三技能":"skill3","四技能":"skill4"}
+        allowed=set(self.hierarchical_prior["right"].get(focus,self.hierarchical_prior["right"].get("burst",[])))
+        for idx,entry in enumerate(RIGHT_ACTION_TABLE):
+            label=entry[0]
+            invalid=False
+            if hero_dead and label not in ["恢复","回城"]:
+                invalid=True
+            if in_recall and label not in ["取消施法","回城","恢复"]:
+                invalid=True
+            if label=="闪现" and cooldowns.get("flash",False):
+                invalid=True
+            if label=="恢复" and cooldowns.get("heal",False):
+                invalid=True
+            if label in skill_map and cooldowns.get(skill_map[label],False):
+                invalid=True
+            if label=="主动装备" and cooldowns.get("active_item",False):
+                invalid=True
+            if label not in allowed and label in RIGHT_ACTION_LABELS and label not in ["取消施法","数据A","数据B","数据C"]:
+                invalid=True
+            if invalid:
+                masked[0,idx]=-1e9
+        return masked
+    def _mask_left_logits(self,logits,hero_dead,in_recall,mode):
+        if hero_dead or in_recall or mode!=Mode.TRAINING:
+            base=torch.full_like(logits,-1e9)
+            base[0,0]=10.0
+            return base
+        return logits
+    def select_actions(self,h_state,left_hidden,right_hidden,cooldowns,mode,hero_dead,in_recall):
         self.ensure_device()
         seq=self._build_sequence_tensor()
-        planner_logits,planner_term,option_embeddings,_=self.option_planner(h_state.unsqueeze(0))
-        option_probs=F.softmax(planner_logits,dim=-1)
+        context=self._build_context_features(h_state,cooldowns,mode,hero_dead,in_recall)
+        planner_input=(h_state+context).unsqueeze(0)
+        planner_logits,planner_term,option_embeddings,_=self.option_planner(planner_input)
+        planner_logits=self._apply_option_diversity(planner_logits)
+        temperature=self._update_temperature()
+        option_probs=F.softmax(planner_logits/temperature,dim=-1)
         terminate=planner_term[0,self.current_option].item()
-        if random.random()<terminate:
-            new_option=torch.multinomial(option_probs[0],1).item()
+        adaptive_term=terminate+float(hero_dead or in_recall)*0.5
+        if adaptive_term>0.6 or random.random()<adaptive_term:
+            topk=torch.topk(option_probs[0],k=min(3,option_probs.size(-1)))
+            choice_weights=topk.values/torch.clamp(topk.values.sum(),min=1e-6)
+            pick=torch.multinomial(choice_weights,1).item()
+            new_option=int(topk.indices[pick].item())
         else:
             new_option=self.current_option
         self.current_option=new_option
         option_vec=option_embeddings[new_option].unsqueeze(0).to(self.device)
-        self.option_history.append(torch.tensor(float(new_option)))
+        self.option_history.append(new_option)
         llogits,lval=self.left(seq,option_vec)
         rlogits,rval=self.right(seq,option_vec)
-        lprob=F.softmax(llogits,dim=-1)
-        rprob=F.softmax(rlogits,dim=-1)
-        laction=torch.multinomial(lprob,1).item()
-        raction=torch.multinomial(rprob,1).item()
+        llogits=self._mask_left_logits(llogits,hero_dead,in_recall,mode)
+        rlogits=self._mask_right_logits(rlogits,new_option,cooldowns,hero_dead,in_recall)
+        lprob=F.softmax(llogits/temperature,dim=-1)
+        rprob=F.softmax(rlogits/temperature,dim=-1)
+        top_left=torch.topk(lprob,2)
+        left_choice_weights=top_left.values/torch.clamp(top_left.values.sum(),min=1e-6)
+        laction=int(top_left.indices[torch.multinomial(left_choice_weights,1).item()])
+        top_right=torch.topk(rprob,3)
+        right_choice_weights=top_right.values/torch.clamp(top_right.values.sum(),min=1e-6)
+        raction=int(top_right.indices[torch.multinomial(right_choice_weights,1).item()])
         return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,None,None
     def neuro_project(self,h_batch):
         self.ensure_device()
@@ -1406,9 +1649,99 @@ def ensure_qt_classes():
             self.config_mode=False
             self._marker_visible_cache={}
             self._overlay_visible=False
+            self.undo_stack=deque(maxlen=32)
+            self.redo_stack=deque(maxlen=32)
+            self.heatmap=None
+            self.last_save_prompt=time.time()
+            self._history_enabled=True
             self.sync_timer=QtCore.QTimer(self)
             self.sync_timer.timeout.connect(self.sync_with_window)
             self.sync_timer.start(200)
+        def _serialize_markers(self):
+            data=[]
+            for m in self.markers:
+                data.append({"label":m.label,"x_pct":m.x_pct,"y_pct":m.y_pct,"r_pct":m.r_pct,"color":m.color.name(),"alpha":m.alpha})
+            return data
+        def _restore_markers(self,records):
+            flag=self._history_enabled
+            self._history_enabled=False
+            for m in list(self.markers):
+                m.setParent(None)
+            self.markers=[]
+            self.selected_marker=None
+            self._marker_visible_cache={}
+            for rec in records:
+                marker=self.add_marker(rec.get("label"),QtGui.QColor(rec.get("color","#ff0000")),rec.get("alpha"),rec.get("x_pct"),rec.get("y_pct"),rec.get("r_pct"))
+                if marker:
+                    marker.update_geometry_from_parent()
+            self._update_marker_visibility(True)
+            self._history_enabled=flag
+        def _push_history(self):
+            if not self._history_enabled:
+                return
+            self.undo_stack.append(self._serialize_markers())
+            while len(self.undo_stack)>self.undo_stack.maxlen:
+                self.undo_stack.popleft()
+            self.redo_stack.clear()
+        def undo(self):
+            if not self.undo_stack:
+                return
+            state=self.undo_stack.pop()
+            self.redo_stack.append(self._serialize_markers())
+            self._restore_markers(state)
+        def redo(self):
+            if not self.redo_stack:
+                return
+            state=self.redo_stack.pop()
+            self.undo_stack.append(self._serialize_markers())
+            self._restore_markers(state)
+        def apply_calibration(self,stats):
+            if not stats:
+                return
+            self._push_history()
+            for m in self.markers:
+                if m.label in stats:
+                    st=stats[m.label]
+                    m.x_pct=clamp(float(st.get("x_pct",m.x_pct)),0.0,1.0)
+                    m.y_pct=clamp(float(st.get("y_pct",m.y_pct)),0.0,1.0)
+                    m.r_pct=clamp(float(st.get("r_pct",m.r_pct)),0.01,0.5)
+                    m.update_geometry_from_parent()
+            self._update_marker_visibility(True)
+        def update_heatmap(self,heatmap):
+            self.heatmap=heatmap
+            self.update()
+        def should_prompt_save(self):
+            if not self.config_mode:
+                return False
+            now=time.time()
+            if now-self.last_save_prompt>30.0:
+                self.last_save_prompt=now
+                return True
+            return False
+        def paintEvent(self,event):
+            qp=QtGui.QPainter(self)
+            qp.setRenderHint(QtGui.QPainter.Antialiasing)
+            if self.heatmap:
+                grid=int(self.heatmap.get("grid",0))
+                counts=self.heatmap.get("counts")
+                if grid>0 and counts:
+                    width=float(max(1,self.width()))
+                    height=float(max(1,self.height()))
+                    cell_w=width/grid
+                    cell_h=height/grid
+                    for iy in range(min(grid,len(counts))):
+                        row=counts[iy]
+                        for ix in range(min(grid,len(row))):
+                            value=row[ix]
+                            if value<=0:
+                                continue
+                            alpha=int(clamp(value*600.0,0.0,180.0))
+                            if alpha<=0:
+                                continue
+                            color=QtGui.QColor(255,100,0,alpha)
+                            qp.fillRect(QtCore.QRectF(ix*cell_w,iy*cell_h,cell_w,cell_h),color)
+            qp.end()
+            QtWidgets.QWidget.paintEvent(self,event)
         def find_marker(self,label):
             for m in self.markers:
                 if m.label==label:
@@ -1445,6 +1778,7 @@ def ensure_qt_classes():
                 self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
                 for m in self.markers:
                     m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
+                self.last_save_prompt=time.time()
             else:
                 self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
                 self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
@@ -1480,6 +1814,9 @@ def ensure_qt_classes():
             self.markers=[]
             self.selected_marker=None
             self._marker_visible_cache={}
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self._history_enabled=False
             seen=set()
             for rec in records:
                 label=rec.get("label")
@@ -1507,6 +1844,8 @@ def ensure_qt_classes():
                 seen.add(label)
             self.ensure_required_markers(spec,seen)
             self._update_marker_visibility(True)
+            self._history_enabled=True
+            self.undo_stack.append(self._serialize_markers())
         def ensure_required_markers(self,spec,seen=None):
             existing=seen if seen is not None else set(m.label for m in self.markers)
             for label,cfg in spec.items():
@@ -1522,6 +1861,7 @@ def ensure_qt_classes():
         def add_marker(self,label,color=None,alpha=None,x_pct=None,y_pct=None,r_pct=None):
             if not label:
                 return None
+            self._push_history()
             cfg=MARKER_SPEC.get(label,MARKER_SPEC.get("普攻"))
             base_color=cfg.get("color",(255,0,0))
             target_color=color if color is not None else QtGui.QColor(base_color[0],base_color[1],base_color[2])
@@ -1541,6 +1881,7 @@ def ensure_qt_classes():
             return m
         def remove_selected_marker(self):
             if self.selected_marker in self.markers:
+                self._push_history()
                 target=self.selected_marker
                 self.markers.remove(target)
                 if target in self._marker_visible_cache:
@@ -1550,7 +1891,7 @@ def ensure_qt_classes():
         def get_marker_data(self):
             out=[]
             for m in self.markers:
-                out.append(m)
+                out.append(MarkerData(m.label,m.x_pct,m.y_pct,m.r_pct,m.color.name(),m.alpha))
             return out
     class _WindowSelectorDialog(QtWidgets.QDialog):
         def __init__(self,parent=None):
@@ -1607,6 +1948,13 @@ def ensure_qt_classes():
             self.addMarkerBtn=QtWidgets.QPushButton("添加标志")
             self.delMarkerBtn=QtWidgets.QPushButton("删除标志")
             self.moveAAABtn=QtWidgets.QPushButton("修改AAA位置")
+            self.undoBtn=QtWidgets.QPushButton("撤销")
+            self.redoBtn=QtWidgets.QPushButton("重做")
+            self.calibrateBtn=QtWidgets.QPushButton("标志校准")
+            self.perfView=QtWidgets.QTreeWidget()
+            self.perfView.setColumnCount(2)
+            self.perfView.setHeaderLabels(["项目","数值"])
+            self.perfView.setRootIsDecorated(False)
             self.layout.addWidget(self.chooseWindowBtn,4,0)
             self.layout.addWidget(self.optimizeBtn,4,1)
             self.layout.addWidget(self.cancelOptimizeBtn,4,2)
@@ -1615,10 +1963,17 @@ def ensure_qt_classes():
             self.layout.addWidget(self.addMarkerBtn,6,0)
             self.layout.addWidget(self.delMarkerBtn,6,1)
             self.layout.addWidget(self.moveAAABtn,6,2)
+            self.layout.addWidget(self.undoBtn,7,0)
+            self.layout.addWidget(self.redoBtn,7,1)
+            self.layout.addWidget(self.calibrateBtn,7,2)
+            self.layout.addWidget(self.perfView,8,0,1,3)
             self.cancelOptimizeBtn.setEnabled(False)
             self.saveConfigBtn.setEnabled(False)
             self.addMarkerBtn.setEnabled(False)
             self.delMarkerBtn.setEnabled(False)
+            self.undoBtn.setEnabled(False)
+            self.redoBtn.setEnabled(False)
+            self.calibrateBtn.setEnabled(False)
             self.overlay=None
             self.chooseWindowBtn.clicked.connect(self.on_choose_window)
             self.optimizeBtn.clicked.connect(self.on_optimize)
@@ -1628,9 +1983,13 @@ def ensure_qt_classes():
             self.addMarkerBtn.clicked.connect(self.on_add_marker)
             self.delMarkerBtn.clicked.connect(self.on_delete_marker)
             self.moveAAABtn.clicked.connect(self.on_move_aaa)
+            self.undoBtn.clicked.connect(self.on_undo_marker)
+            self.redoBtn.clicked.connect(self.on_redo_marker)
+            self.calibrateBtn.clicked.connect(self.on_calibrate)
             self.timer=QtCore.QTimer(self)
             self.timer.timeout.connect(self.on_tick)
             self.timer.start(200)
+            self.last_config_reminder=0.0
         def on_tick(self):
             if self.app_state.consume_window_prompt():
                 QtWidgets.QMessageBox.information(self,"初始化完成","依赖与资源已就绪，请选择窗口")
@@ -1668,12 +2027,62 @@ def ensure_qt_classes():
                 self.saveConfigBtn.setEnabled(True)
                 self.addMarkerBtn.setEnabled(True)
                 self.delMarkerBtn.setEnabled(True)
+                self.undoBtn.setEnabled(True)
+                self.redoBtn.setEnabled(True)
+                self.calibrateBtn.setEnabled(True)
             else:
                 self.saveConfigBtn.setEnabled(False)
                 self.addMarkerBtn.setEnabled(False)
                 self.delMarkerBtn.setEnabled(False)
+                self.undoBtn.setEnabled(False)
+                self.redoBtn.setEnabled(False)
+                self.calibrateBtn.setEnabled(False)
             if self.app_state.overlay:
                 self.app_state.overlay.sync_with_window()
+                heatmap=self.app_state.buffer.get_heatmap()
+                self.app_state.overlay.update_heatmap(heatmap)
+                if self.app_state.overlay.should_prompt_save():
+                    QtWidgets.QMessageBox.information(self,"提示","请记得保存配置以保留标志调整")
+            perf=self.hardware.get_performance_snapshot()
+            buffer_metrics=self.app_state.buffer.get_performance_metrics()
+            self.perfView.clear()
+            res_item=QtWidgets.QTreeWidgetItem(["CPU","%.1f%%"%perf["resources"].get("cpu",0.0)])
+            mem_item=QtWidgets.QTreeWidgetItem(["内存","%.1f%%"%(perf["resources"].get("mem",0.0)*100.0)])
+            gpu_item=QtWidgets.QTreeWidgetItem(["GPU","%.1f%%"%(perf["resources"].get("gpu",0.0)*100.0)])
+            plan_item=QtWidgets.QTreeWidgetItem(["并行","批次:%d 流:%d"%(perf["plan"].get("batch_size",0),perf["plan"].get("parallel",0))])
+            plan_item.addChild(QtWidgets.QTreeWidgetItem(["间隔","截图%.3fs 手%.3fs"%(perf["plan"].get("monitor_interval",0.0),perf["plan"].get("hand_interval",0.0))]))
+            self.perfView.addTopLevelItem(res_item)
+            self.perfView.addTopLevelItem(mem_item)
+            self.perfView.addTopLevelItem(gpu_item)
+            self.perfView.addTopLevelItem(plan_item)
+            latency_item=QtWidgets.QTreeWidgetItem(["时延","-"])
+            for key,value in perf["latency"].items():
+                latency_item.addChild(QtWidgets.QTreeWidgetItem([key,"%.3fs"%value]))
+            self.perfView.addTopLevelItem(latency_item)
+            buffer_item=QtWidgets.QTreeWidgetItem(["经验池","记录:%d"%buffer_metrics.get("size",0)])
+            buffer_item.addChild(QtWidgets.QTreeWidgetItem(["平均读取","%.3fs"%buffer_metrics.get("avg_read_time",0.0)]))
+            buffer_item.addChild(QtWidgets.QTreeWidgetItem(["平均批次","%.1f"%buffer_metrics.get("avg_read_batch",0.0)]))
+            buffer_item.addChild(QtWidgets.QTreeWidgetItem(["写入间隔","%.3fs"%buffer_metrics.get("avg_write_interval",0.0)]))
+            self.perfView.addTopLevelItem(buffer_item)
+            history=perf.get("history",[])
+            if history:
+                avg_cpu=sum(item.get("cpu",0.0) for item in history)/len(history)
+                history_item=QtWidgets.QTreeWidgetItem(["资源趋势","样本:%d"%len(history)])
+                history_item.addChild(QtWidgets.QTreeWidgetItem(["CPU均值","%.1f%%"%(avg_cpu*100.0)]))
+                self.perfView.addTopLevelItem(history_item)
+            install_item=QtWidgets.QTreeWidgetItem(["依赖反馈",str(len(perf.get("install",[])))])
+            for feed in perf.get("install",[])[-5:]:
+                status="成功" if feed.get("success") else "失败"
+                detail=status+" %.2fs"%feed.get("duration",0.0)
+                install_item.addChild(QtWidgets.QTreeWidgetItem([feed.get("name","?"),detail]))
+            self.perfView.addTopLevelItem(install_item)
+            failures=self.app_state.training_controller.get_failed_actions()
+            failure_item=QtWidgets.QTreeWidgetItem(["失败动作",str(len(failures))])
+            if failures:
+                last=failures[-1]
+                failure_item.addChild(QtWidgets.QTreeWidgetItem([last.get("hand","?"),last.get("reason","")]))
+            self.perfView.addTopLevelItem(failure_item)
+            self.perfView.expandAll()
         def on_choose_window(self):
             ensure_qt_classes()
             dlg=_WindowSelectorDialog(self)
@@ -1730,6 +2139,20 @@ def ensure_qt_classes():
             if self.app_state.overlay:
                 self.app_state.overlay.set_config_mode(False)
                 self.app_state.overlay.set_overlay_visible(False)
+        def on_undo_marker(self):
+            overlay=self.app_state.overlay
+            if overlay:
+                overlay.undo()
+        def on_redo_marker(self):
+            overlay=self.app_state.overlay
+            if overlay:
+                overlay.redo()
+        def on_calibrate(self):
+            overlay=self.app_state.ensure_overlay_initialized()
+            stats=self.app_state.buffer.get_user_click_stats()
+            overlay.apply_calibration(stats)
+            heatmap=self.app_state.buffer.get_heatmap()
+            overlay.update_heatmap(heatmap)
         def save_markers_to_manager(self):
             overlay=self.app_state.overlay
             if not overlay:
@@ -1814,6 +2237,12 @@ class HardwareAdaptiveRate:
         self.max_parallel=8
         self.min_interval=0.02
         self.max_interval=0.15
+        self.latency_lock=threading.Lock()
+        self.latency_stats=defaultdict(lambda:deque(maxlen=240))
+        self.latency_targets={"left_hand":0.06,"right_hand":0.06,"screenshot":0.25,"optimize":1.2}
+        self.performance_log=deque(maxlen=240)
+        self.device_pool=self._discover_devices()
+        self.parallel_plan={}
         self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
         self.monitor_thread.start()
     def _collect_snapshot(self):
@@ -1856,6 +2285,40 @@ class HardwareAdaptiveRate:
             self.snapshot["mem"]=self._ema_mem
             self.snapshot["gpu"]=self._ema_gpu
             self.snapshot["time"]=snap["time"]
+    def _discover_devices(self):
+        pool=[{"device":torch.device("cpu"),"index":None}]
+        if torch.cuda.is_available():
+            for idx in range(torch.cuda.device_count()):
+                pool.append({"device":torch.device("cuda",idx),"index":idx})
+        return pool
+    def record_latency(self,tag,duration):
+        with self.latency_lock:
+            stats=self.latency_stats[tag]
+            stats.append(max(0.0,float(duration)))
+    def _aggregate_latencies(self):
+        with self.latency_lock:
+            return {k:(statistics.fmean(v) if len(v)>0 else 0.0) for k,v in self.latency_stats.items()}
+    def get_latency(self,tag):
+        with self.latency_lock:
+            values=self.latency_stats.get(tag)
+            if not values:
+                return 0.0
+            return statistics.fmean(values)
+    def get_performance_snapshot(self):
+        with self.snapshot_lock:
+            snap=dict(self.snapshot)
+        lat=self._aggregate_latencies()
+        with self.lock:
+            info={"batch_size":self.batch_size,"parallel":self.parallel,"hand_interval":self.hand_interval,"device":str(self.device),"monitor_interval":self.monitor_interval}
+        hist=list(self.performance_log)
+        return {"resources":snap,"latency":lat,"plan":info,"history":hist,"install":dependency_manager.get_install_feedback()}
+    def suggest_parallel_plan(self,workload=None):
+        self.refresh()
+        with self.lock:
+            plan={"streams":self.parallel,"batch":self.batch_size,"device":str(self.device),"visual":self.visual_level}
+        if workload is not None:
+            plan["workload"]=workload
+        return plan
     def _monitor_loop(self):
         while not self.monitor_stop:
             snap=self._collect_snapshot()
@@ -1879,6 +2342,7 @@ class HardwareAdaptiveRate:
             cpu_ratio=clamp(cpu/100.0,0.0,1.0)
             mem_ratio=clamp(mem,0.0,1.0)
             gpu_ratio=clamp(gpu,0.0,1.0)
+            latencies=self._aggregate_latencies()
             cpu_error=self.cpu_target-cpu_ratio
             mem_error=mem_ratio-self.mem_target
             gpu_error=gpu_ratio-self.gpu_target
@@ -1895,19 +2359,47 @@ class HardwareAdaptiveRate:
             if cpu_ratio>0.9 or gpu_ratio<0.05:
                 interval+=0.01
             self.hand_interval=float(clamp(interval,self.min_interval,self.max_interval))
+            for tag,target in self.latency_targets.items():
+                obs=latencies.get(tag)
+                if obs and obs>target*1.2:
+                    self.hand_interval=float(clamp(self.hand_interval*1.05,self.min_interval,self.max_interval))
+                elif obs and obs<target*0.6:
+                    self.hand_interval=float(clamp(self.hand_interval*0.95,self.min_interval,self.max_interval))
+            shot_latency=latencies.get("screenshot")
+            if shot_latency and shot_latency>0.0:
+                hz=clamp(1.0/max(shot_latency,0.008),1.0,120.0)
+                self.monitor_interval=float(clamp(1.0/hz,0.2,1.5))
             if torch.cuda.is_available():
-                if self.gpu_free>0.3 and cpu_ratio>0.7:
-                    target=torch.device("cuda")
-                elif self.gpu_free<0.08:
-                    target=torch.device("cpu")
-                else:
-                    target=self.device
+                self.device_pool=self._discover_devices()
+                best_device=self.device
+                best_score=-1.0
+                for item in self.device_pool:
+                    dev=item["device"]
+                    if dev.type=="cuda":
+                        idx=item["index"]
+                        try:
+                            props=torch.cuda.get_device_properties(idx)
+                            total=float(props.total_memory)
+                            used=float(torch.cuda.memory_allocated(idx))
+                            free_ratio=max(0.0,min(1.0,(total-used)/total if total>0 else 0.0))
+                            score=0.6*free_ratio+0.4*(1.0-cpu_ratio)
+                        except Exception as e:
+                            logger.warning("GPU得分失败:%s",e)
+                            score=0.0
+                    else:
+                        score=0.5*(1.0-cpu_ratio)+0.5*mem_ratio
+                    if score>best_score:
+                        best_score=score
+                        best_device=dev
+                target=best_device
             else:
                 target=torch.device("cpu")
             self.device=target
             resource_score=0.45*(1.0-cpu_ratio)+0.25*mem_ratio+0.3*gpu_ratio
             dynamic_level=int(clamp(math.floor(resource_score*4.0),0,3))
             self.visual_level=dynamic_level
+            self.parallel_plan={"time":now,"batch":self.batch_size,"parallel":self.parallel,"device":str(self.device),"monitor":self.monitor_interval,"hand_interval":self.hand_interval}
+            self.performance_log.append({"time":now,"cpu":cpu_ratio,"mem":mem_ratio,"gpu":gpu_ratio,"batch":self.batch_size,"parallel":self.parallel})
             self.last_refresh=now
     def get_hz(self):
         with self.lock:
@@ -1945,6 +2437,9 @@ class TrainingController:
         self.lock=threading.Lock()
         self.hidden={"left":None,"right":None}
         self.action_queue=deque()
+        self.left_queue=deque()
+        self.right_queue=deque()
+        self.failed_actions=deque(maxlen=128)
         self.left_thread=None
         self.right_thread=None
     def reset_hidden(self):
@@ -1965,6 +2460,38 @@ class TrainingController:
         with self.lock:
             self.hidden["left"]=left_state
             self.hidden["right"]=right_state
+    def plan_actions(self,h_state,left_hidden,right_hidden,cooldowns,mode,hero_dead,in_recall):
+        result=self.app_state.agent.select_actions(h_state,left_hidden,right_hidden,cooldowns,mode,hero_dead,in_recall)
+        laction,raction,lprob,rprob,lval,rval,lh2,rh2=result
+        lprob_val=float(lprob.item() if hasattr(lprob,"item") else float(lprob))
+        rprob_val=float(rprob.item() if hasattr(rprob,"item") else float(rprob))
+        lvalue=float(lval.mean().item()) if lval is not None else 0.0
+        rvalue=float(rval.mean().item()) if rval is not None else 0.0
+        command_left={"action":laction,"prob":lprob_val,"value":lvalue,"option":self.app_state.agent.current_option,"timestamp":time.time()}
+        command_right={"action":raction,"prob":rprob_val,"value":rvalue,"option":self.app_state.agent.current_option,"timestamp":time.time()}
+        with self.lock:
+            last_left=self.left_queue[-1] if self.left_queue else None
+            last_right=self.right_queue[-1] if self.right_queue else None
+            if last_left and last_left["action"]==command_left["action"] and abs(last_left["timestamp"]-command_left["timestamp"])<0.02:
+                command_left=last_left
+            else:
+                self.left_queue.append(command_left)
+                if len(self.left_queue)>32:
+                    self.left_queue.popleft()
+            if last_right and last_right["action"]==command_right["action"] and abs(last_right["timestamp"]-command_right["timestamp"])<0.02:
+                command_right=last_right
+            else:
+                self.right_queue.append(command_right)
+                if len(self.right_queue)>32:
+                    self.right_queue.popleft()
+        self.set_hidden_pair(lh2,rh2)
+        return command_left,command_right
+    def next_action(self,hand):
+        with self.lock:
+            queue=self.left_queue if hand=="left" else self.right_queue
+            if queue:
+                return queue.popleft()
+            return None
     def record_action(self,action):
         with self.lock:
             if len(self.action_queue)>64:
@@ -1975,6 +2502,14 @@ class TrainingController:
             if self.action_queue:
                 return self.action_queue.popleft()
             return None
+    def record_failure(self,hand,command,reason):
+        with self.lock:
+            if len(self.failed_actions)>=self.failed_actions.maxlen:
+                self.failed_actions.popleft()
+            self.failed_actions.append({"hand":hand,"command":command,"reason":reason,"time":time.time()})
+    def get_failed_actions(self):
+        with self.lock:
+            return list(self.failed_actions)
     def stop_threads(self):
         with self.lock:
             threads=[self.left_thread,self.right_thread]
@@ -2442,11 +2977,13 @@ class ScreenshotRecorder(threading.Thread):
                 self.app_state.window_rect=rect
                 mode=self.app_state.mode
             try:
+                capture_start=time.time()
                 img=ImageGrabModule.grab(bbox=rect)
             except Exception as e:
                 logger.warning("截图失败:%s",e)
                 img=None
             if img is not None:
+                self.rate_controller.record_latency("screenshot",time.time()-capture_start)
                 self.app_state.update_state_from_frame(img)
                 if mode==Mode.LEARNING:
                     actions=[]
@@ -2481,6 +3018,10 @@ class LeftHandThread(threading.Thread):
                 cond=(self.app_state.mode==Mode.TRAINING and (not self.app_state.hero_dead) and (not self.app_state.in_recall) and window_visible(self.app_state.hwnd))
                 rect=self.app_state.window_rect
                 hidden_vec=self.app_state.current_hidden.clone().detach()
+                cooldowns=dict(self.app_state.cooldowns)
+                mode=self.app_state.mode
+                hero_dead=self.app_state.hero_dead
+                in_recall=self.app_state.in_recall
             lh=self.app_state.training_controller.get_hidden("left")
             rh=self.app_state.training_controller.get_hidden("right")
             if not cond:
@@ -2492,10 +3033,14 @@ class LeftHandThread(threading.Thread):
                 lh=lh.to(device)
             if rh is not None:
                 rh=rh.to(device)
-            laction,raction,lprob,rprob,lval,rval,lh2,rh2=self.app_state.agent.select_actions(h_state,lh,rh)
-            lh2=lh2.detach() if lh2 is not None else None
-            rh2=rh2.detach() if rh2 is not None else None
-            self.app_state.training_controller.set_hidden_pair(lh2,rh2)
+            command=self.app_state.training_controller.next_action("left")
+            if command is None:
+                self.app_state.training_controller.plan_actions(h_state,lh,rh,cooldowns,mode,hero_dead,in_recall)
+                command=self.app_state.training_controller.next_action("left")
+            if command is None:
+                time.sleep(0.01)
+                continue
+            laction=int(command.get("action",0))
             center_x,center_y,r=self.app_state.get_marker_geometry("移动轮盘")
             angle=(laction/16.0)*2*math.pi
             dx=math.cos(angle)*r
@@ -2512,6 +3057,7 @@ class LeftHandThread(threading.Thread):
             hand_interval=self.app_state.hardware.suggest_hand_interval()
             drag_duration=max(0.02,hand_interval*1.5)
             arc_duration=max(0.01,hand_interval)
+            start_time=time.time()
             try:
                 pyautogui.moveTo(center_x,center_y)
                 pyautogui.mouseDown()
@@ -2526,7 +3072,10 @@ class LeftHandThread(threading.Thread):
                 pyautogui.mouseUp()
             except Exception as e:
                 logger.warning("左手操作失败:%s",e)
-            self.app_state.record_ai_action({"hand":"left","action_id":laction,"label":"移动轮盘","type":"drag","start":(center_x,center_y),"end":path[-1] if path else (center_x,center_y),"path":path,"timestamp":time.time(),"rotation_dir":"cw" if direction>0 else "ccw"})
+                self.app_state.training_controller.record_failure("left",command,str(e))
+            duration=time.time()-start_time
+            self.app_state.hardware.record_latency("left_hand",duration)
+            self.app_state.record_ai_action({"hand":"left","action_id":laction,"label":"移动轮盘","type":"drag","start":(center_x,center_y),"end":path[-1] if path else (center_x,center_y),"path":path,"timestamp":time.time(),"rotation_dir":"cw" if direction>0 else "ccw","prob":command.get("prob",0.0),"value":command.get("value",0.0),"option":command.get("option")})
             time.sleep(max(0.01,hand_interval))
 class RightHandThread(threading.Thread):
     def __init__(self,app_state):
@@ -2540,6 +3089,10 @@ class RightHandThread(threading.Thread):
                 cond=(self.app_state.mode==Mode.TRAINING and (not self.app_state.hero_dead) and (not self.app_state.in_recall) and window_visible(self.app_state.hwnd))
                 rect=self.app_state.window_rect
                 hidden_vec=self.app_state.current_hidden.clone().detach()
+                cooldowns=dict(self.app_state.cooldowns)
+                mode=self.app_state.mode
+                hero_dead=self.app_state.hero_dead
+                in_recall=self.app_state.in_recall
             lh=self.app_state.training_controller.get_hidden("left")
             rh=self.app_state.training_controller.get_hidden("right")
             if not cond:
@@ -2551,10 +3104,14 @@ class RightHandThread(threading.Thread):
                 lh=lh.to(device)
             if rh is not None:
                 rh=rh.to(device)
-            laction,raction,lprob,rprob,lval,rval,lh2,rh2=self.app_state.agent.select_actions(h_state,lh,rh)
-            lh2=lh2.detach() if lh2 is not None else None
-            rh2=rh2.detach() if rh2 is not None else None
-            self.app_state.training_controller.set_hidden_pair(lh2,rh2)
+            command=self.app_state.training_controller.next_action("right")
+            if command is None:
+                self.app_state.training_controller.plan_actions(h_state,lh,rh,cooldowns,mode,hero_dead,in_recall)
+                command=self.app_state.training_controller.next_action("right")
+            if command is None:
+                time.sleep(0.01)
+                continue
+            raction=int(command.get("action",0))
             info=RIGHT_ACTION_TABLE[raction%len(RIGHT_ACTION_TABLE)]
             label=info[0]
             bins=info[1]
@@ -2570,6 +3127,7 @@ class RightHandThread(threading.Thread):
             self.app_state.hardware.refresh()
             hand_interval=self.app_state.hardware.suggest_hand_interval()
             drag_duration=max(0.02,hand_interval*1.5)
+            start_time=time.time()
             try:
                 if bins>1:
                     angle=2*math.pi*((local+0.5)/float(bins))
@@ -2598,7 +3156,10 @@ class RightHandThread(threading.Thread):
                     pyautogui.click()
             except Exception as e:
                 logger.warning("右手操作失败:%s",e)
-            self.app_state.record_ai_action({"hand":"right","action_id":raction,"label":label,"type":action_type,"start":(start_x,start_y),"end":(end_x,end_y),"timestamp":time.time()})
+                self.app_state.training_controller.record_failure("right",command,str(e))
+            duration=time.time()-start_time
+            self.app_state.hardware.record_latency("right_hand",duration)
+            self.app_state.record_ai_action({"hand":"right","action_id":raction,"label":label,"type":action_type,"start":(start_x,start_y),"end":(end_x,end_y),"timestamp":time.time(),"prob":command.get("prob",0.0),"value":command.get("value",0.0),"option":command.get("option")})
             time.sleep(max(0.01,hand_interval))
 class OptimizationThread(threading.Thread):
     def __init__(self,app_state):
@@ -2626,7 +3187,9 @@ class OptimizationThread(threading.Thread):
             ov=self.app_state.overlay
             if ov:
                 self.app_state.file_manager.save_markers(ov.get_marker_data(),self.app_state.window_rect)
+        opt_start=time.time()
         completed=self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,persist_markers,1000)
+        self.app_state.hardware.record_latency("optimize",time.time()-opt_start)
         self.app_state.clear_cancel_request()
         if completed:
             self.app_state.set_progress(100)
@@ -2642,6 +3205,7 @@ class InitializationThread(threading.Thread):
     def run(self):
         status={"timestamp":datetime.now().isoformat(),"dependencies":{},"aaa":{},"hardware":{}}
         missing=verify_dependencies()
+        dependency_manager.start_install_wizard()
         guidance=dependency_manager.get_missing_guidance()
         status["dependencies"]={"missing":missing,"ok":len(missing)==0,"guidance":guidance}
         try:
