@@ -13,6 +13,8 @@ import queue
 import subprocess
 import statistics
 import itertools
+import io
+import tokenize
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
@@ -31,6 +33,19 @@ class ModuleMissingError(ImportError):
     def __init__(self,name,detail):
         super().__init__(detail)
         self.name=name
+def enforce_agent_rules():
+    src_path=os.path.abspath(__file__)
+    with open(src_path,'r',encoding='utf-8') as fh:
+        data=fh.read()
+    normalized=data.replace('\r\n','\n').replace('\r','\n')
+    if '\n\n' in normalized:
+        raise RuntimeError('AGENTS_BLANK_LINE')
+    reader=io.StringIO(data)
+    for tok in tokenize.generate_tokens(reader.readline):
+        if tok.type==tokenize.COMMENT:
+            raise RuntimeError('AGENTS_COMMENT')
+    return normalized
+normalized_source=enforce_agent_rules()
 @dataclass
 class DependencyIssue:
     name:str
