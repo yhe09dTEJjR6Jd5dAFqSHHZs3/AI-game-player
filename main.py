@@ -1090,6 +1090,11 @@ class AppState:
     def mark_user_input(self):
         with self.lock:
             self.last_user_input=time.time()
+    def set_visibility_paused(self,paused):
+        with self.lock:
+            if self.paused_by_visibility!=paused:
+                self.paused_by_visibility=paused
+                self.last_user_input=time.time()
     def should_switch_to_training(self):
         with self.lock:
             return self.mode==Mode.LEARNING and (time.time()-self.last_user_input)>=self.idle_threshold and self.can_record()
@@ -1731,7 +1736,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.app_state.overlay:
             self.app_state.overlay.sync_with_window()
         visible_ok=window_visible(self.app_state.hwnd) if self.app_state.hwnd else False
-        self.app_state.paused_by_visibility=not visible_ok
+        self.app_state.set_visibility_paused(not visible_ok)
         if self.app_state.mode==Mode.LEARNING:
             if self.app_state.should_switch_to_training():
                 self.app_state.set_mode(Mode.TRAINING)
