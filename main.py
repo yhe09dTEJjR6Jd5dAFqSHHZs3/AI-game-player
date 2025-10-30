@@ -1080,43 +1080,40 @@ class AdaptiveRewardModel:
         self.variation=torch.ones(3)
         self.preference=torch.tensor([1.0,-1.0,0.5])
         self.temperature=1.0
-        self.user_bias=0.5
         self.recent=deque(maxlen=128)
-    def _resource_vector(self):
-        return torch.tensor([max(0.0,1.0-self.hardware.cpu_load/100.0),max(0.0,self.hardware.mem_free),max(0.0,self.hardware.gpu_free)],dtype=torch.float32)
-    def _observe(self,vec,source,hero_dead,is_ai):
+    def _observe(self,vec):
         device=self.running.device
         vec=vec.to(device)
         self.running=self.running*(1.0-self.alpha)+vec*self.alpha
         diff=(vec-self.running).abs()+1e-4
         self.variation=self.variation*(1.0-self.alpha)+diff*self.alpha
         self.recent.append(vec.detach().cpu())
-        resource=self._resource_vector().to(device)
-        resource_score=clamp(resource.mean().item(),0.0,1.0)
-        self.user_bias=(1.0-self.alpha)*self.user_bias+self.alpha*(0.7 if source=="user" else 0.4)
-        hero_factor=0.6+0.4*float(hero_dead)
-        density=len(self.recent)/float(self.recent.maxlen if self.recent.maxlen else 1)
-        skill_focus=0.5+density*0.5
-        emphasis=torch.stack([self.running[0]+resource_score,self.running[1]+hero_factor,self.running[2]+skill_focus])
-        context=torch.tanh(emphasis)
+        kills=max(vec[0].item(),0.0)
+        deaths=max(vec[1].item(),0.0)
+        assists=max(vec[2].item(),0.0)
+        total=max(kills+assists,1e-3)
+        impact_ratio=kills/total
+        support_ratio=assists/total
+        survival_penalty=deaths/max(kills+deaths+1e-3,1e-3)
+        momentum=torch.tanh(self.running)
         base=torch.tensor([1.0,0.6,0.3],dtype=torch.float32,device=device)
-        adjust=torch.tensor([1.0+resource_score*0.5,1.0+hero_factor*0.5,1.0+(skill_focus if is_ai else self.user_bias)*0.5],dtype=torch.float32,device=device)
-        scaled=base*(1.0+context*0.4)*adjust
+        adjust=torch.tensor([1.0+impact_ratio*0.6,1.0+survival_penalty*0.5,1.0+support_ratio*0.4],dtype=torch.float32,device=device)
+        scaled=base*(1.0+momentum*0.4)*adjust
         pref_A=torch.clamp(scaled[0],min=0.2)
         pref_B=torch.clamp(scaled[1],min=0.1)
         pref_C=torch.clamp(scaled[2],min=0.05)
         pref_B=torch.clamp(pref_B,max=pref_A*0.85)
         pref_C=torch.clamp(pref_C,max=pref_B*0.85)
         self.preference=torch.stack([pref_A,-pref_B,pref_C],dim=0)
-        self.temperature=float(clamp(resource_score*1.8+0.4,0.5,2.5))
+        adaptation=0.5+impact_ratio*0.8+support_ratio*0.3-survival_penalty*0.4
+        self.temperature=float(clamp(adaptation,0.5,2.5))
     def compute(self,metrics,source,hero_dead,is_ai):
         device=self.running.device
         vec=torch.tensor([metrics[0],metrics[1],metrics[2]],dtype=torch.float32,device=device)
-        self._observe(vec,source,hero_dead,is_ai)
+        self._observe(vec)
         normalized=(vec-self.running)/(self.variation+1e-3)
         reward=(normalized*self.preference).sum()
-        scale=self.temperature*(1.1 if is_ai else self.user_bias+0.6)
-        return float(reward.item()*scale)
+        return float(reward.item()*self.temperature)
 class MetaLearner:
     def __init__(self,modules,step_size=0.05):
         self.modules=list(modules)
@@ -2243,6 +2240,7 @@ class HardwareAdaptiveRate:
         self.performance_log=deque(maxlen=240)
         self.device_pool=self._discover_devices()
         self.parallel_plan={}
+        self.viewport_size=(336,336)
         self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
         self.monitor_thread.start()
     def _collect_snapshot(self):
@@ -2291,6 +2289,17 @@ class HardwareAdaptiveRate:
             for idx in range(torch.cuda.device_count()):
                 pool.append({"device":torch.device("cuda",idx),"index":idx})
         return pool
+    def update_viewport(self,size):
+        if size is None:
+            return
+        if len(size)==4:
+            w=max(1,int(size[2]-size[0]))
+            h=max(1,int(size[3]-size[1]))
+        else:
+            w=max(1,int(size[0]))
+            h=max(1,int(size[1]))
+        with self.lock:
+            self.viewport_size=(w,h)
     def record_latency(self,tag,duration):
         with self.latency_lock:
             stats=self.latency_stats[tag]
@@ -2423,14 +2432,16 @@ class HardwareAdaptiveRate:
         with self.lock:
             return self.visual_level
     def suggest_visual_size(self):
-        level=self.suggest_visual_level()
-        if level>=3:
-            return 336,336
-        if level==2:
-            return 304,304
-        if level==1:
-            return 272,272
-        return 240,240
+        with self.lock:
+            level=self.visual_level
+            vw,vh=self.viewport_size
+        vw=max(1,vw)
+        vh=max(1,vh)
+        scale_map={0:0.45,1:0.6,2:0.8,3:1.0}
+        scale=scale_map.get(level,0.6)
+        tw=int(max(1,round(vw*scale)))
+        th=int(max(1,round(vh*scale)))
+        return min(tw,vw),min(th,vh)
 class TrainingController:
     def __init__(self,app_state):
         self.app_state=app_state
@@ -2730,6 +2741,7 @@ class AppState:
         self.training_controller.reset_hidden()
         self.training_controller.ensure_threads()
     def update_state_from_frame(self,img):
+        self.hardware.update_viewport(img.size)
         metrics,hero_dead,in_recall,cooldowns,hid=self.agent.infer_state(img)
         with self.lock:
             self.metrics=metrics
@@ -2794,6 +2806,7 @@ class AppState:
             self.agent.reset_neuro_state()
             self.last_user_input=time.time()
             self.mode=Mode.LEARNING
+        self.hardware.update_viewport(rect)
         self.set_visibility_paused(not window_visible(hwnd))
         overlay=self.ensure_overlay_initialized()
         overlay.set_overlay_visible(False)
@@ -2973,6 +2986,7 @@ class ScreenshotRecorder(threading.Thread):
                 time.sleep(dt)
                 continue
             rect=get_window_rect(hwnd)
+            self.rate_controller.update_viewport(rect)
             with self.app_state.lock:
                 self.app_state.window_rect=rect
                 mode=self.app_state.mode
