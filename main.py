@@ -192,6 +192,7 @@ class AAAFileManager:
         self.left_model_path=None
         self.right_model_path=None
         self.init_status_path=None
+        self.option_model_path=None
         self.ensure_structure()
     def ensure_structure(self):
         with self.lock:
@@ -204,6 +205,7 @@ class AAAFileManager:
             self.left_model_path=os.path.join(self.base_path,"left_hand_model.pt")
             self.right_model_path=os.path.join(self.base_path,"right_hand_model.pt")
             self.neuro_model_path=os.path.join(self.base_path,"neuro_module.pt")
+            self.option_model_path=os.path.join(self.base_path,"option_planner.pt")
             self.init_status_path=os.path.join(self.base_path,"init_status.json")
             if not os.path.exists(self.config_path):
                 default_cfg={"markers":[],"aaa_path":self.base_path}
@@ -217,6 +219,8 @@ class AAAFileManager:
                 torch.save({},self.right_model_path)
             if not os.path.exists(self.neuro_model_path):
                 torch.save({},self.neuro_model_path)
+            if not os.path.exists(self.option_model_path):
+                torch.save({},self.option_model_path)
     def _precheck_move(self,old_base,new_parent):
         if not new_parent:
             raise self.PrecheckError("目标路径为空",logging.INFO)
@@ -359,13 +363,14 @@ class AAAFileManager:
                     for m in cfg.get("markers",[]):
                         out.append(m)
             return out
-    def save_models(self,vision,left,right,neuro):
+    def save_models(self,vision,left,right,neuro,planner):
         with self.lock:
             torch.save(vision.state_dict(),self.vision_model_path)
             torch.save(left.state_dict(),self.left_model_path)
             torch.save(right.state_dict(),self.right_model_path)
             torch.save(neuro.state_dict(),self.neuro_model_path)
-    def load_models(self,vision,left,right,neuro):
+            torch.save(planner.state_dict(),self.option_model_path)
+    def load_models(self,vision,left,right,neuro,planner):
         with self.lock:
             if os.path.exists(self.vision_model_path):
                 try:
@@ -387,6 +392,11 @@ class AAAFileManager:
                     neuro.load_state_dict(torch.load(self.neuro_model_path,map_location="cpu"))
                 except (OSError,RuntimeError,ValueError) as e:
                     logger.warning("加载神经模块失败:%s",e)
+            if os.path.exists(self.option_model_path):
+                try:
+                    planner.load_state_dict(torch.load(self.option_model_path,map_location="cpu"))
+                except (OSError,RuntimeError,ValueError) as e:
+                    logger.warning("加载意图规划器失败:%s",e)
     def to_relative(self,abs_path):
         with self.lock:
             base=self.base_path
@@ -616,36 +626,124 @@ class BrainInspiredNeuroModule(nn.Module):
         updated=state*0.9+gating*sensory
         output=torch.tanh(updated)
         return output,updated
-class HandPolicy(nn.Module):
-    def __init__(self,in_dim,action_dim):
-        super(HandPolicy,self).__init__()
-        self.gru=nn.GRU(in_dim,128,batch_first=True)
+class RelativePositionalBias(nn.Module):
+    def __init__(self,heads,max_len=256):
+        super(RelativePositionalBias,self).__init__()
+        self.heads=heads
+        self.max_len=max_len
+        self.bias=nn.Parameter(torch.zeros(2*max_len-1,heads))
+        nn.init.trunc_normal_(self.bias,std=0.02)
+    def forward(self,length):
+        idx=torch.arange(length,device=self.bias.device)
+        diff=idx[:,None]-idx[None,:]+self.max_len-1
+        diff=diff.clamp(0,2*self.max_len-2)
+        values=self.bias[diff]
+        return values.permute(2,0,1).unsqueeze(0)
+class LightweightTransformerLayer(nn.Module):
+    def __init__(self,dim,heads,dropout=0.1):
+        super(LightweightTransformerLayer,self).__init__()
+        self.dim=dim
+        self.heads=heads
+        self.head_dim=dim//heads
+        self.q_proj=nn.Linear(dim,dim)
+        self.k_proj=nn.Linear(dim,dim)
+        self.v_proj=nn.Linear(dim,dim)
+        self.out_proj=nn.Linear(dim,dim)
+        self.rel_bias=RelativePositionalBias(heads)
+        self.norm1=nn.LayerNorm(dim)
+        self.norm2=nn.LayerNorm(dim)
+        self.dropout1=nn.Dropout(dropout)
+        self.dropout2=nn.Dropout(dropout)
+        self.ff=nn.Sequential(nn.Linear(dim,dim*2),nn.GELU(),nn.Linear(dim*2,dim))
+    def forward(self,x):
+        B,L,_=x.shape
+        q=self.q_proj(x).view(B,L,self.heads,self.head_dim).transpose(1,2)
+        k=self.k_proj(x).view(B,L,self.heads,self.head_dim).transpose(1,2)
+        v=self.v_proj(x).view(B,L,self.heads,self.head_dim).transpose(1,2)
+        attn=torch.matmul(q,k.transpose(-2,-1))/math.sqrt(self.head_dim)
+        bias=self.rel_bias(L)
+        attn=attn+bias
+        weights=F.softmax(attn,dim=-1)
+        context=torch.matmul(weights,v).transpose(1,2).contiguous().view(B,L,self.dim)
+        x=self.norm1(x+self.dropout1(self.out_proj(context)))
+        x=self.norm2(x+self.dropout2(self.ff(x)))
+        return x
+class TransformerHandPolicy(nn.Module):
+    def __init__(self,in_dim,action_dim,depth=3,heads=4):
+        super(TransformerHandPolicy,self).__init__()
+        self.embed=nn.Linear(in_dim,128)
+        self.layers=nn.ModuleList(LightweightTransformerLayer(128,heads,0.1) for _ in range(depth))
+        self.norm=nn.LayerNorm(128)
         self.actor=nn.Linear(128,action_dim)
         self.critic=nn.Linear(128,1)
-    def forward(self,x,h=None):
-        y,hx=self.gru(x,h)
-        logits=self.actor(y[:,-1])
-        val=self.critic(y[:,-1])
-        return logits,val,hx
+    def forward(self,x,option_vec=None):
+        y=self.embed(x)
+        if option_vec is not None:
+            y=y+option_vec.unsqueeze(1)
+        for layer in self.layers:
+            y=layer(y)
+        y=self.norm(y)
+        pooled=y[:,-1]
+        logits=self.actor(pooled)
+        val=self.critic(pooled)
+        return logits,val
+class OptionPlanner(nn.Module):
+    def __init__(self,dim,num_options):
+        super(OptionPlanner,self).__init__()
+        self.num_options=num_options
+        self.state_proj=nn.Linear(dim,dim)
+        self.policy_head=nn.Linear(dim,num_options)
+        self.termination_head=nn.Linear(dim,num_options)
+        self.value_head=nn.Linear(dim,1)
+        self.option_embeddings=nn.Parameter(torch.randn(num_options,128))
+        nn.init.xavier_uniform_(self.option_embeddings)
+    def forward(self,state):
+        z=torch.tanh(self.state_proj(state))
+        logits=self.policy_head(z)
+        termination=torch.sigmoid(self.termination_head(z))
+        value=self.value_head(z)
+        return logits,termination,self.option_embeddings,value
+class MetaLearner:
+    def __init__(self,modules,step_size=0.05):
+        self.modules=list(modules)
+        self.step_size=step_size
+    def capture(self):
+        return [self._clone_state(m) for m in self.modules]
+    def _clone_state(self,module):
+        return {k:v.detach().clone() for k,v in module.state_dict().items()}
+    def reptile_update(self,snapshots):
+        for module,state in zip(self.modules,snapshots):
+            current=module.state_dict()
+            for name,param in current.items():
+                target=state.get(name)
+                if target is None:
+                    continue
+                param.data.add_((target-param.data)*self.step_size)
 class RLAgent:
     def __init__(self,file_manager,hardware_manager):
         self.hardware=hardware_manager
         self.hardware.refresh(True)
         self.device=self.hardware.suggest_device()
         self.vision=VisionModel().to(self.device)
-        self.left=HandPolicy(32,16).to(self.device)
-        self.right=HandPolicy(32,32).to(self.device)
+        self.left=TransformerHandPolicy(32,16).to(self.device)
+        self.right=TransformerHandPolicy(32,32).to(self.device)
         self.neuro_module=BrainInspiredNeuroModule(32).to(self.device)
+        self.option_planner=OptionPlanner(32,6).to(self.device)
         self.file_manager=file_manager
-        self.file_manager.load_models(self.vision,self.left,self.right,self.neuro_module)
+        self.file_manager.load_models(self.vision,self.left,self.right,self.neuro_module,self.option_planner)
         self.left_opt=optim.Adam(self.left.parameters(),lr=1e-4,weight_decay=1e-5)
         self.right_opt=optim.Adam(self.right.parameters(),lr=1e-4,weight_decay=1e-5)
         self.vision_opt=optim.Adam(self.vision.parameters(),lr=1e-4,weight_decay=1e-5)
         self.neuro_opt=optim.Adam(self.neuro_module.parameters(),lr=1e-4,weight_decay=1e-5)
+        self.option_opt=optim.Adam(self.option_planner.parameters(),lr=1e-4,weight_decay=1e-5)
         self.entropy_coef=0.01
         self.value_coef=0.5
         self.global_step=0
         self.neuro_state=torch.zeros(32,device=self.device)
+        self.state_history=deque(maxlen=64)
+        self.option_history=deque(maxlen=64)
+        self.current_option=0
+        self.meta_controller=MetaLearner([self.vision,self.left,self.right,self.neuro_module,self.option_planner],0.05)
         self.batch_buffer=None
         self.cpu_batch=None
         self.batch_capacity=0
@@ -659,7 +757,8 @@ class RLAgent:
         self.left.to(target)
         self.right.to(target)
         self.neuro_module.to(target)
-        for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
+        self.option_planner.to(target)
+        for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]:
             for st in opt.state.values():
                 for k,v in list(st.items()):
                     if torch.is_tensor(v):
@@ -684,23 +783,73 @@ class RLAgent:
             t=self.preprocess_frame(img)
             metrics,flags,h=self.vision(t)
             brain_output,self.neuro_state=self.neuro_module(h[0],self.neuro_state)
+            self.state_history.append(brain_output.detach().cpu())
             metrics=metrics[0].cpu().numpy()
             flags=flags[0].cpu().numpy()
             hero_dead=bool(flags[0]>0.5)
             in_recall=bool(flags[1]>0.5)
             cooldowns={"recall":False,"heal":bool(flags[2]>0.5),"flash":bool(flags[3]>0.5),"basic":False,"skill1":bool(flags[4]>0.5),"skill2":bool(flags[5]>0.5),"skill3":bool(flags[6]>0.5),"skill4":bool(flags[7]>0.5),"active_item":bool(flags[8]>0.5),"cancel":False}
             return {"A":int(max(metrics[0],0)),"B":int(max(metrics[1],0)),"C":int(max(metrics[2],0))},hero_dead,in_recall,cooldowns,brain_output.detach().cpu()
+    def _build_sequence_tensor(self):
+        if len(self.state_history)==0:
+            return torch.zeros(1,1,32,device=self.device)
+        window=min(len(self.state_history),16)
+        states=list(self.state_history)[-window:]
+        seq=torch.stack([s.to(self.device) for s in states],dim=0)
+        if seq.dim()==1:
+            seq=seq.unsqueeze(0)
+        seq=seq.unsqueeze(0)
+        return seq
+    def _contrastive_loss(self,features):
+        if features.size(0)<2:
+            return torch.tensor(0.0,device=self.device)
+        clean=F.normalize(features,dim=-1)
+        augmented=F.normalize(clean+torch.randn_like(clean)*0.01,dim=-1)
+        logits=clean@augmented.t()/0.1
+        labels=torch.arange(features.size(0),device=self.device)
+        return F.cross_entropy(logits,labels)
+    def _map_action_to_option(self,action,A,B,C,hero_dead):
+        if action and action.get("hand")=="left":
+            return 0
+        label=(action.get("label") if action else None) or ""
+        if label in ["普攻","一技能","二技能","三技能","四技能"]:
+            return 1
+        if label=="闪现":
+            return 2
+        if label in ["恢复","回城"] or hero_dead:
+            return 3
+        if label in ["主动装备","数据A","数据B","数据C"]:
+            return 4
+        if label=="取消施法":
+            return 5
+        if action is None:
+            if A>max(B,C):
+                return 1
+            if C>A:
+                return 4
+            if hero_dead or B>A:
+                return 3
+        return 5
     def select_actions(self,h_state,left_hidden,right_hidden):
         self.ensure_device()
-        lf_in=h_state.unsqueeze(0).unsqueeze(0)
-        rf_in=h_state.unsqueeze(0).unsqueeze(0)
-        llogits,lval,left_hidden=self.left(lf_in,left_hidden)
-        rlogits,rval,right_hidden=self.right(rf_in,right_hidden)
+        seq=self._build_sequence_tensor()
+        planner_logits,planner_term,option_embeddings,_=self.option_planner(h_state.unsqueeze(0))
+        option_probs=F.softmax(planner_logits,dim=-1)
+        terminate=planner_term[0,self.current_option].item()
+        if random.random()<terminate:
+            new_option=torch.multinomial(option_probs[0],1).item()
+        else:
+            new_option=self.current_option
+        self.current_option=new_option
+        option_vec=option_embeddings[new_option].unsqueeze(0).to(self.device)
+        self.option_history.append(torch.tensor(float(new_option)))
+        llogits,lval=self.left(seq,option_vec)
+        rlogits,rval=self.right(seq,option_vec)
         lprob=F.softmax(llogits,dim=-1)
         rprob=F.softmax(rlogits,dim=-1)
         laction=torch.multinomial(lprob,1).item()
         raction=torch.multinomial(rprob,1).item()
-        return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,left_hidden,right_hidden
+        return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,None,None
     def neuro_project(self,h_batch):
         self.ensure_device()
         outputs=[]
@@ -712,6 +861,9 @@ class RLAgent:
     def reset_neuro_state(self):
         self.ensure_device()
         self.neuro_state=torch.zeros(32,device=self.device)
+        self.state_history.clear()
+        self.option_history.clear()
+        self.current_option=0
     def _ensure_batch_buffers(self,count,shape):
         c=shape[0]
         h=shape[1]
@@ -766,6 +918,9 @@ class RLAgent:
                 mask_right=[]
                 rl_mask_left=[]
                 rl_mask_right=[]
+                option_targets=[]
+                option_supervision=[]
+                option_rl_flags=[]
                 arr_list=[]
                 for rec,arr in zip(batch,arrays):
                     if arr is None:
@@ -796,6 +951,13 @@ class RLAgent:
                             right_rl=1
                             if rec["source"]=="user":
                                 right_super=1
+                        option_targets.append(self._map_action_to_option(act,A,B,C,rec.get("hero_dead",False)))
+                        option_supervision.append(1 if rec["source"]=="user" else 0)
+                        option_rl_flags.append(1)
+                    else:
+                        option_targets.append(self._map_action_to_option(None,A,B,C,rec.get("hero_dead",False)))
+                        option_supervision.append(0)
+                        option_rl_flags.append(0)
                     targets_left.append(left_target)
                     targets_right.append(right_target)
                     mask_left.append(left_super)
@@ -809,10 +971,16 @@ class RLAgent:
                 t_batch=self._batch_from_arrays(arr_list)
                 metrics,flags,h=self.vision(t_batch)
                 h_brain=self.neuro_project(h)
+                sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
+                planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
                 with torch.no_grad():
                     R=torch.tensor(rewards,dtype=torch.float32,device=self.device).unsqueeze(1)
-                left_logits,left_val,_=self.left(h_brain.unsqueeze(1))
-                right_logits,right_val,_=self.right(h_brain.unsqueeze(1))
+                option_indices=torch.tensor(option_targets,dtype=torch.long,device=self.device)
+                option_super=torch.tensor(option_supervision,dtype=torch.float32,device=self.device).unsqueeze(1)
+                option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=self.device).unsqueeze(1)
+                chosen_embeddings=option_embeddings.index_select(0,option_indices)
+                left_logits,left_val=self.left(sequence,chosen_embeddings)
+                right_logits,right_val=self.right(sequence,chosen_embeddings)
                 left_logprob=F.log_softmax(left_logits,dim=-1)
                 right_logprob=F.log_softmax(right_logits,dim=-1)
                 left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
@@ -836,21 +1004,36 @@ class RLAgent:
                 else:
                     rl_pg_right=torch.tensor(0.0,device=self.device)
                 v_loss=((left_val-R)**2+(right_val-R)**2).mean()
+                planner_logprob=F.log_softmax(planner_logits,dim=-1)
+                planner_entropy=(-planner_logprob.exp()*planner_logprob).sum(dim=-1).mean()
+                if option_super.sum().item()>0:
+                    planner_sup=(F.nll_loss(planner_logprob,option_indices,reduction="none")*option_super.squeeze(1)).mean()
+                else:
+                    planner_sup=torch.tensor(0.0,device=self.device)
+                if option_rl.sum().item()>0:
+                    planner_pg=-((planner_logprob.gather(1,option_indices.unsqueeze(1))*(R-planner_value).detach())*option_rl).sum()/option_rl.sum()
+                else:
+                    planner_pg=torch.tensor(0.0,device=self.device)
+                termination_penalty=planner_term.gather(1,option_indices.unsqueeze(1)).mean()
+                contrastive=self._contrastive_loss(h_brain)
                 l2_reg=0.0
-                for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters()):
+                for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters())+list(self.option_planner.parameters()):
                     l2_reg=l2_reg+p.pow(2).sum()*1e-6
-                loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent)+l2_reg
+                loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent+planner_entropy)+planner_sup+planner_pg+termination_penalty*0.1+contrastive*0.5+l2_reg
+                meta_snapshot=self.meta_controller.capture()
                 self.vision_opt.zero_grad()
                 self.left_opt.zero_grad()
                 self.right_opt.zero_grad()
                 self.neuro_opt.zero_grad()
+                self.option_opt.zero_grad()
                 loss.backward()
-                for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt]:
+                for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]:
                     for g in opt.param_groups:
                         base_lr=g["lr"]
                         scale=1.0/(1.0+0.0001*self.global_step)
                         g["lr"]=base_lr*scale
                     opt.step()
+                self.meta_controller.reptile_update(meta_snapshot)
                 self.global_step+=1
                 if effective_steps%10==0:
                     markers_updater()
@@ -863,7 +1046,7 @@ class RLAgent:
             progress_set(0)
         else:
             progress_set(100)
-            self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module)
+            self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module,self.option_planner)
         if markers_persist:
             markers_persist()
         return not cancelled
@@ -1357,6 +1540,15 @@ class HardwareAdaptiveRate:
         self._ema_mem=None
         self._ema_gpu=None
         self._ema_alpha=0.2
+        self.cpu_target=0.85
+        self.mem_target=0.15
+        self.gpu_target=0.2
+        self.adaptive_gain=0.12
+        self.max_batch=160
+        self.min_batch=8
+        self.max_parallel=8
+        self.min_interval=0.02
+        self.max_interval=0.15
         self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
         self.monitor_thread.start()
     def _collect_snapshot(self):
@@ -1419,36 +1611,38 @@ class HardwareAdaptiveRate:
             self.cpu_load=cpu
             self.mem_free=mem
             self.gpu_free=gpu
-            if self.cpu_load>85 or self.mem_free<0.1:
-                self.batch_size=max(16,self.batch_size-8)
-                self.parallel=max(1,self.parallel-1)
-                self.hand_interval=min(0.12,self.hand_interval+0.01)
-            else:
-                if self.cpu_load<60 and self.mem_free>0.2:
-                    self.batch_size=min(64,self.batch_size+4)
-                if self.cpu_load<70:
-                    self.parallel=min(4,self.parallel+1)
-                if self.hand_interval>0.025 and self.cpu_load<70:
-                    self.hand_interval=max(0.02,self.hand_interval-0.005)
+            cpu_ratio=clamp(cpu/100.0,0.0,1.0)
+            mem_ratio=clamp(mem,0.0,1.0)
+            gpu_ratio=clamp(gpu,0.0,1.0)
+            cpu_error=self.cpu_target-cpu_ratio
+            mem_error=mem_ratio-self.mem_target
+            gpu_error=gpu_ratio-self.gpu_target
+            adaptive=cpu_error*0.6+mem_error*0.2+gpu_error*0.2
+            batch_float=self.batch_size*(1.0+adaptive*self.adaptive_gain*10.0)
+            if cpu_ratio>0.95 or mem_ratio<0.05:
+                batch_float=self.batch_size*0.7
+            self.batch_size=int(clamp(batch_float,self.min_batch,self.max_batch))
+            parallel_float=self.parallel+adaptive*2.0
+            if cpu_ratio>0.9:
+                parallel_float=min(parallel_float,self.parallel)
+            self.parallel=int(clamp(round(parallel_float),1,self.max_parallel))
+            interval=self.hand_interval-adaptive*0.01
+            if cpu_ratio>0.9 or gpu_ratio<0.05:
+                interval+=0.01
+            self.hand_interval=float(clamp(interval,self.min_interval,self.max_interval))
             if torch.cuda.is_available():
-                if self.gpu_free>0.25 and self.cpu_load>70:
+                if self.gpu_free>0.3 and cpu_ratio>0.7:
                     target=torch.device("cuda")
-                elif self.gpu_free<0.1:
+                elif self.gpu_free<0.08:
                     target=torch.device("cpu")
                 else:
                     target=self.device
             else:
                 target=torch.device("cpu")
             self.device=target
-            capacity=(1.0-self.cpu_load/100.0)*0.5+self.mem_free*0.25+self.gpu_free*0.25
-            if capacity>=0.8:
-                self.visual_level=3
-            elif capacity>=0.55:
-                self.visual_level=2
-            elif capacity>=0.3:
-                self.visual_level=1
-            else:
-                self.visual_level=0
+            resource_score=0.45*(1.0-cpu_ratio)+0.25*mem_ratio+0.3*gpu_ratio
+            dynamic_level=int(clamp(math.floor(resource_score*4.0),0,3))
+            self.visual_level=dynamic_level
             self.last_refresh=now
     def get_hz(self):
         with self.lock:
