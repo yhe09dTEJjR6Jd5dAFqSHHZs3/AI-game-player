@@ -13,6 +13,7 @@ import queue
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
+from dataclasses import dataclass
 from ctypes import wintypes
 import torch
 import torch.nn as nn
@@ -27,40 +28,71 @@ class ModuleMissingError(ImportError):
     def __init__(self,name,detail):
         super().__init__(detail)
         self.name=name
+@dataclass
+class DependencyIssue:
+    name:str
+    message:str
+    guidance:str
+    attempts:int=0
+    last_failure:float=0.0
+    resolved:bool=False
+    def should_retry(self,interval):
+        return self.resolved or (time.time()-self.last_failure)>=interval
+    def to_dict(self):
+        return {"name":self.name,"message":self.message,"guidance":self.guidance,"attempts":self.attempts,"resolved":self.resolved}
 class DependencyManager:
     def __init__(self,names):
         self.names=list(names)
         self.lock=threading.Lock()
         self.modules={}
-        self.failures={}
+        self.issues={}
         self.preload_thread=None
         self.preload_started=False
+        self.retry_interval=5.0
     def register(self,name):
         with self.lock:
             if name not in self.names:
                 self.names.append(name)
+    def _build_guidance(self,name,message):
+        tip="pip install "+name
+        if name.lower()=="pillow":
+            tip="pip install pillow"
+        if name.lower()=="pyqt5":
+            tip="pip install PyQt5"
+        return "建议执行:"+tip+";错误:"+message
     def ensure_module(self,name):
         module=self.modules.get(name)
         if module is not None:
             return module
-        failure=self.failures.get(name)
-        if failure is not None:
-            raise failure
+        issue=self.issues.get(name)
+        if issue and not issue.should_retry(self.retry_interval):
+            raise ModuleMissingError(name,issue.message)
         with self.lock:
             module=self.modules.get(name)
             if module is not None:
                 return module
-            failure=self.failures.get(name)
-            if failure is not None:
-                raise failure
+            issue=self.issues.get(name)
+            if issue and not issue.should_retry(self.retry_interval):
+                raise ModuleMissingError(name,issue.message)
             try:
                 module=importlib.import_module(name)
                 self.modules[name]=module
+                if issue:
+                    issue.resolved=True
                 return module
             except ImportError as e:
-                err=ModuleMissingError(name,str(e))
-                self.failures[name]=err
-                raise err
+                message=str(e)
+                guidance=self._build_guidance(name,message)
+                now=time.time()
+                if issue:
+                    issue.message=message
+                    issue.guidance=guidance
+                    issue.attempts+=1
+                    issue.last_failure=now
+                    issue.resolved=False
+                else:
+                    self.issues[name]=DependencyIssue(name,message,guidance,1,now,False)
+                raise ModuleMissingError(name,message)
     def verify(self):
         missing=[]
         for name in list(self.names):
@@ -74,17 +106,24 @@ class DependencyManager:
             if self.preload_started:
                 return
             self.preload_started=True
-        def worker():
-            for name in list(self.names):
-                try:
-                    self.ensure_module(name)
-                except ModuleMissingError:
-                    pass
-        thread=threading.Thread(target=worker)
+        def worker(n):
+            try:
+                self.ensure_module(n)
+            except ModuleMissingError:
+                pass
+        def runner():
+            workers=min(len(self.names),max(1,os.cpu_count() or 1))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for n in list(self.names):
+                    pool.submit(worker,n)
+        thread=threading.Thread(target=runner)
         thread.daemon=True
         thread.start()
         with self.lock:
             self.preload_thread=thread
+    def get_missing_guidance(self):
+        with self.lock:
+            return [issue.to_dict() for issue in self.issues.values() if not issue.resolved]
 dependency_manager=DependencyManager(REQUIRED_MODULES)
 class LazyModule:
     def __init__(self,name):
@@ -172,6 +211,34 @@ def verify_dependencies():
     return dependency_manager.verify()
 def get_desktop_path():
     return os.path.join(os.path.expanduser("~"),"Desktop")
+MODEL_SCHEMA_VERSION=1
+def _color_to_hex(color):
+    if hasattr(color,"name"):
+        return color.name()
+    if isinstance(color,(tuple,list)) and len(color)>=3:
+        r=int(clamp(float(color[0]),0,255))
+        g=int(clamp(float(color[1]),0,255))
+        b=int(clamp(float(color[2]),0,255))
+        return "#"+format(r,"02x")+format(g,"02x")+format(b,"02x")
+    if isinstance(color,str):
+        return color
+    return "#ff0000"
+@dataclass
+class MarkerData:
+    label:str
+    x_pct:float
+    y_pct:float
+    r_pct:float
+    color:str
+    alpha:float
+    def to_dict(self):
+        return {"label":self.label,"x_pct":self.x_pct,"y_pct":self.y_pct,"r_pct":self.r_pct,"color":self.color,"alpha":self.alpha}
+@dataclass
+class SubsystemContext:
+    file_manager:"AAAFileManager"
+    agent:"RLAgent"
+    buffer:"ExperienceBuffer"
+    hardware:"HardwareAdaptiveRate"
 class AAAFileManager:
     class MoveError(Exception):
         pass
@@ -193,7 +260,142 @@ class AAAFileManager:
         self.right_model_path=None
         self.init_status_path=None
         self.option_model_path=None
+        self.model_status={}
+        self.model_version=MODEL_SCHEMA_VERSION
         self.ensure_structure()
+    def _marker_template(self,label):
+        spec=MARKER_SPEC.get(label,MARKER_SPEC.get("普攻"))
+        color=_color_to_hex(spec.get("color",(255,0,0)))
+        pos=spec.get("pos",(0.5,0.5))
+        radius=float(spec.get("radius",0.05))
+        alpha=float(spec.get("alpha",0.5))
+        return MarkerData(label,float(pos[0]),float(pos[1]),clamp(radius,0.01,0.5),color,clamp(alpha,0.0,1.0))
+    def _normalize_marker(self,marker,window_rect):
+        label=getattr(marker,"label",None)
+        if label is None and isinstance(marker,dict):
+            label=marker.get("label")
+        if not label:
+            raise ValueError("缺少标志标签")
+        template=self._marker_template(label)
+        w=max(window_rect[2]-window_rect[0],1)
+        h=max(window_rect[3]-window_rect[1],1)
+        def getter(obj,attr,default):
+            if hasattr(obj,attr):
+                return getattr(obj,attr)
+            if isinstance(obj,dict):
+                return obj.get(attr,default)
+            return default
+        x_raw=getter(marker,"x_pct",template.x_pct)
+        y_raw=getter(marker,"y_pct",template.y_pct)
+        r_raw=getter(marker,"r_pct",template.r_pct)
+        alpha_raw=getter(marker,"alpha",template.alpha)
+        color_raw=getter(marker,"color",template.color)
+        if isinstance(alpha_raw,str):
+            try:
+                alpha_raw=float(alpha_raw)
+            except ValueError:
+                alpha_raw=template.alpha
+        x_pct=clamp(float(x_raw),0.0,1.0)
+        y_pct=clamp(float(y_raw),0.0,1.0)
+        r_pct=clamp(float(r_raw),0.01,0.5)
+        alpha_val=clamp(float(alpha_raw),0.0,1.0)
+        color=_color_to_hex(color_raw)
+        if not (0<=x_pct<=1 and 0<=y_pct<=1):
+            raise ValueError("标志坐标越界")
+        if w<=0 or h<=0:
+            raise ValueError("窗口尺寸异常")
+        return MarkerData(label,x_pct,y_pct,r_pct,color,alpha_val)
+    def validate_markers(self,markers,window_rect):
+        normalized=[]
+        seen=set()
+        issues=[]
+        for marker in markers:
+            try:
+                data=self._normalize_marker(marker,window_rect)
+            except Exception as e:
+                issues.append(str(e))
+                continue
+            if data.label in seen:
+                issues.append("重复标志:"+data.label)
+                continue
+            seen.add(data.label)
+            normalized.append(data)
+        for label,spec in MARKER_SPEC.items():
+            if spec.get("required") and label not in seen:
+                normalized.append(self._marker_template(label))
+        if issues:
+            logger.warning("标志校验提示:%s",";".join(issues))
+        return normalized
+    def _record_model_status(self,name,ok,detail):
+        self.model_status[name]={"ok":ok,"detail":detail}
+    def _reset_module_parameters(self,module):
+        def initializer(sub):
+            if hasattr(sub,"reset_parameters"):
+                try:
+                    sub.reset_parameters()
+                except Exception as e:
+                    logger.debug("参数重置失败:%s",e)
+        module.apply(initializer)
+    def _load_model_file(self,path,module,name):
+        if not os.path.exists(path):
+            self._reset_module_parameters(module)
+            self._record_model_status(name,False,"缺少模型文件")
+            return
+        try:
+            payload=torch.load(path,map_location="cpu")
+            if isinstance(payload,dict) and "state" in payload and "version" in payload:
+                version=int(payload.get("version",0))
+                if version!=self.model_version:
+                    raise ValueError("模型版本不匹配")
+                state=payload.get("state",{})
+            else:
+                state=payload
+            module.load_state_dict(state)
+            self._record_model_status(name,True,"已加载")
+        except (OSError,RuntimeError,ValueError) as e:
+            logger.warning("加载%s模型失败:%s",name,e)
+            self._reset_module_parameters(module)
+            self._record_model_status(name,False,"需要重新训练:"+str(e))
+    def _transactional_move(self,old_base,target_parent,target_base,notify):
+        stamp=datetime.now().strftime("%Y%m%d%H%M%S%f")
+        temp=os.path.join(target_parent,".aaa_tmp_"+stamp)
+        backup=os.path.join(target_parent,".aaa_backup_"+stamp)
+        try:
+            notify("copy_start",{"src":old_base,"tmp":temp})
+            shutil.copytree(old_base,temp,dirs_exist_ok=True)
+            notify("copy_done",{"tmp":temp})
+            if os.path.exists(backup):
+                shutil.rmtree(backup)
+            shutil.move(old_base,backup)
+            notify("backup_created",{"backup":backup})
+            if os.path.exists(target_base):
+                shutil.rmtree(target_base)
+            shutil.move(temp,target_base)
+            notify("placed",{"target":target_base})
+            shutil.rmtree(backup)
+            notify("cleanup",{"removed":backup})
+        except (OSError,shutil.Error) as e:
+            notify("error",{"error":str(e)})
+            try:
+                if os.path.exists(temp):
+                    shutil.rmtree(temp)
+            except Exception as cleanup:
+                logger.warning("清理临时目录失败:%s",cleanup)
+            if os.path.exists(backup) and not os.path.exists(old_base):
+                try:
+                    shutil.move(backup,old_base)
+                    notify("rollback",{"restored":old_base})
+                except Exception as rollback_error:
+                    logger.error("AAA目录回滚失败:%s",rollback_error)
+            elif os.path.exists(backup):
+                try:
+                    shutil.rmtree(backup)
+                except Exception as cleanup_backup:
+                    logger.warning("清理备份失败:%s",cleanup_backup)
+            raise self.OperationError("事务性迁移失败:"+str(e))
+    def get_model_status(self):
+        with self.lock:
+            return dict(self.model_status)
     def ensure_structure(self):
         with self.lock:
             if not os.path.exists(self.base_path):
@@ -212,15 +414,20 @@ class AAAFileManager:
                 with open(self.config_path,"w",encoding="utf-8") as f:
                     json.dump(default_cfg,f)
             if not os.path.exists(self.vision_model_path):
-                torch.save({},self.vision_model_path)
+                torch.save({"version":self.model_version,"state":{}},self.vision_model_path)
+                self._record_model_status("vision",False,"等待训练")
             if not os.path.exists(self.left_model_path):
-                torch.save({},self.left_model_path)
+                torch.save({"version":self.model_version,"state":{}},self.left_model_path)
+                self._record_model_status("left",False,"等待训练")
             if not os.path.exists(self.right_model_path):
-                torch.save({},self.right_model_path)
+                torch.save({"version":self.model_version,"state":{}},self.right_model_path)
+                self._record_model_status("right",False,"等待训练")
             if not os.path.exists(self.neuro_model_path):
-                torch.save({},self.neuro_model_path)
+                torch.save({"version":self.model_version,"state":{}},self.neuro_model_path)
+                self._record_model_status("neuro",False,"等待训练")
             if not os.path.exists(self.option_model_path):
-                torch.save({},self.option_model_path)
+                torch.save({"version":self.model_version,"state":{}},self.option_model_path)
+                self._record_model_status("planner",False,"等待训练")
     def _precheck_move(self,old_base,new_parent):
         if not new_parent:
             raise self.PrecheckError("目标路径为空",logging.INFO)
@@ -299,25 +506,38 @@ class AAAFileManager:
                     except (OSError,shutil.Error) as rollback_error:
                         logger.error("AAA目录回滚失败:%s",rollback_error)
             raise self.RecoveryError("恢复流程失败:"+str(e))
-    def move_dir(self,new_parent):
+    def move_dir(self,new_parent,progress_callback=None):
+        def notify(stage,detail=None):
+            if progress_callback:
+                try:
+                    progress_callback(stage,detail)
+                except Exception as e:
+                    logger.warning("AAA迁移进度回调失败:%s",e)
         with self.lock:
             old_base=os.path.abspath(self.base_path)
             try:
                 target_parent,target_base=self._precheck_move(old_base,new_parent)
+                notify("precheck",{"from":old_base,"to":target_base})
             except self.PrecheckError as e:
                 level=getattr(e,"level",logging.ERROR)
                 logger.log(level,"AAA目录预检查终止:%s",e)
+                notify("precheck_failed",{"error":str(e)})
                 return old_base,old_base
             try:
-                self._perform_move(old_base,target_base)
+                self._transactional_move(old_base,target_parent,target_base,notify)
             except self.OperationError as move_error:
-                logger.warning("AAA目录直接移动失败:%s",move_error)
+                logger.warning("AAA目录事务迁移失败:%s",move_error)
+                notify("transaction_failed",{"error":str(move_error)})
                 try:
                     self._recover_move(old_base,target_base,move_error)
+                    notify("recovered",{"path":old_base})
                 except self.RecoveryError as recovery_error:
                     logger.error("AAA目录迁移恢复失败:%s",recovery_error)
+                    notify("recovery_failed",{"error":str(recovery_error)})
                     return old_base,old_base
+                return old_base,old_base
             logger.info("AAA目录迁移完成:%s -> %s",old_base,target_base)
+            notify("success",{"from":old_base,"to":target_base})
             self.base_path=target_base
             self.ensure_structure()
             self.update_config_path()
@@ -348,10 +568,9 @@ class AAAFileManager:
                     cfg=json.load(f)
             else:
                 cfg={"aaa_path":self.base_path}
-            out=[]
-            for m in markers:
-                out.append({"label":m.label,"x_pct":m.x_pct,"y_pct":m.y_pct,"r_pct":m.r_pct,"color":m.color.name(),"alpha":m.alpha})
-            cfg["markers"]=out
+            rect=window_rect if window_rect else (0,0,1,1)
+            normalized=self.validate_markers(markers,rect)
+            cfg["markers"]=[m.to_dict() for m in normalized]
             with open(self.config_path,"w",encoding="utf-8") as f:
                 json.dump(cfg,f)
     def load_markers(self):
@@ -365,38 +584,23 @@ class AAAFileManager:
             return out
     def save_models(self,vision,left,right,neuro,planner):
         with self.lock:
-            torch.save(vision.state_dict(),self.vision_model_path)
-            torch.save(left.state_dict(),self.left_model_path)
-            torch.save(right.state_dict(),self.right_model_path)
-            torch.save(neuro.state_dict(),self.neuro_model_path)
-            torch.save(planner.state_dict(),self.option_model_path)
+            torch.save({"version":self.model_version,"state":vision.state_dict()},self.vision_model_path)
+            torch.save({"version":self.model_version,"state":left.state_dict()},self.left_model_path)
+            torch.save({"version":self.model_version,"state":right.state_dict()},self.right_model_path)
+            torch.save({"version":self.model_version,"state":neuro.state_dict()},self.neuro_model_path)
+            torch.save({"version":self.model_version,"state":planner.state_dict()},self.option_model_path)
+            self._record_model_status("vision",True,"已保存")
+            self._record_model_status("left",True,"已保存")
+            self._record_model_status("right",True,"已保存")
+            self._record_model_status("neuro",True,"已保存")
+            self._record_model_status("planner",True,"已保存")
     def load_models(self,vision,left,right,neuro,planner):
         with self.lock:
-            if os.path.exists(self.vision_model_path):
-                try:
-                    vision.load_state_dict(torch.load(self.vision_model_path,map_location="cpu"))
-                except (OSError,RuntimeError,ValueError) as e:
-                    logger.warning("加载视觉模型失败:%s",e)
-            if os.path.exists(self.left_model_path):
-                try:
-                    left.load_state_dict(torch.load(self.left_model_path,map_location="cpu"))
-                except (OSError,RuntimeError,ValueError) as e:
-                    logger.warning("加载左手模型失败:%s",e)
-            if os.path.exists(self.right_model_path):
-                try:
-                    right.load_state_dict(torch.load(self.right_model_path,map_location="cpu"))
-                except (OSError,RuntimeError,ValueError) as e:
-                    logger.warning("加载右手模型失败:%s",e)
-            if os.path.exists(self.neuro_model_path):
-                try:
-                    neuro.load_state_dict(torch.load(self.neuro_model_path,map_location="cpu"))
-                except (OSError,RuntimeError,ValueError) as e:
-                    logger.warning("加载神经模块失败:%s",e)
-            if os.path.exists(self.option_model_path):
-                try:
-                    planner.load_state_dict(torch.load(self.option_model_path,map_location="cpu"))
-                except (OSError,RuntimeError,ValueError) as e:
-                    logger.warning("加载意图规划器失败:%s",e)
+            self._load_model_file(self.vision_model_path,vision,"vision")
+            self._load_model_file(self.left_model_path,left,"left")
+            self._load_model_file(self.right_model_path,right,"right")
+            self._load_model_file(self.neuro_model_path,neuro,"neuro")
+            self._load_model_file(self.option_model_path,planner,"planner")
     def to_relative(self,abs_path):
         with self.lock:
             base=self.base_path
@@ -1561,10 +1765,22 @@ def ensure_qt_classes():
         def on_move_aaa(self):
             d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
             if d:
-                old_base,new_base=self.app_state.file_manager.move_dir(d)
-                self.app_state.buffer.on_aaa_moved(old_base,new_base)
-                self.app_state.ensure_overlay_initialized()
-                QtWidgets.QMessageBox.information(self,"完成","AAA目录已迁移")
+                events=[]
+                def progress(stage,detail):
+                    try:
+                        info=json.dumps(detail,ensure_ascii=False) if detail is not None else ""
+                    except TypeError:
+                        info=str(detail)
+                    events.append(stage+(":"+info if info else ""))
+                old_base,new_base=self.app_state.file_manager.move_dir(d,progress)
+                if new_base!=old_base:
+                    self.app_state.buffer.on_aaa_moved(old_base,new_base)
+                    self.app_state.ensure_overlay_initialized()
+                summary=";".join(events) if events else "AAA目录已迁移"
+                if new_base==old_base:
+                    QtWidgets.QMessageBox.warning(self,"迁移未完成",summary)
+                else:
+                    QtWidgets.QMessageBox.information(self,"完成",summary)
     MarkerWidget=_MarkerWidget
     OverlayWindow=_OverlayWindow
     WindowSelectorDialog=_WindowSelectorDialog
@@ -1723,6 +1939,70 @@ class HardwareAdaptiveRate:
         if level==1:
             return 272,272
         return 240,240
+class TrainingController:
+    def __init__(self,app_state):
+        self.app_state=app_state
+        self.lock=threading.Lock()
+        self.hidden={"left":None,"right":None}
+        self.action_queue=deque()
+        self.left_thread=None
+        self.right_thread=None
+    def reset_hidden(self):
+        with self.lock:
+            self.hidden={"left":None,"right":None}
+    def get_hidden(self,hand):
+        with self.lock:
+            value=self.hidden.get(hand)
+        if value is None:
+            return None
+        if hasattr(value,"clone"):
+            try:
+                return value.clone().detach()
+            except Exception:
+                return value
+        return value
+    def set_hidden_pair(self,left_state,right_state):
+        with self.lock:
+            self.hidden["left"]=left_state
+            self.hidden["right"]=right_state
+    def record_action(self,action):
+        with self.lock:
+            if len(self.action_queue)>64:
+                self.action_queue.popleft()
+            self.action_queue.append(action)
+    def consume_action(self):
+        with self.lock:
+            if self.action_queue:
+                return self.action_queue.popleft()
+            return None
+    def stop_threads(self):
+        with self.lock:
+            threads=[self.left_thread,self.right_thread]
+            self.left_thread=None
+            self.right_thread=None
+        for t in threads:
+            if t:
+                t.stop_flag=True
+        for t in threads:
+            if t:
+                t.join(timeout=1.0)
+        self.reset_hidden()
+    def ensure_threads(self):
+        need_left=False
+        need_right=False
+        with self.lock:
+            need_left=self.left_thread is None or not self.left_thread.is_alive()
+            need_right=self.right_thread is None or not self.right_thread.is_alive()
+        if need_left:
+            left=LeftHandThread(self.app_state)
+            left.start()
+            with self.lock:
+                self.left_thread=left
+        if need_right:
+            right=RightHandThread(self.app_state)
+            right.start()
+            with self.lock:
+                self.right_thread=right
 def enum_windows():
     result=[]
     def callback(hwnd,extra):
@@ -1808,19 +2088,17 @@ class AppState:
         self.cooldowns={"recall":False,"heal":False,"flash":False,"basic":False,"skill1":False,"skill2":False,"skill3":False,"skill4":False,"active_item":False,"cancel":False}
         self.last_user_input=time.time()
         self.progress=0
-        self.file_manager=file_manager
-        self.agent=agent
-        self.buffer=buffer
-        self.hardware=hardware_manager
+        self.context=SubsystemContext(file_manager,agent,buffer,hardware_manager)
+        self.file_manager=self.context.file_manager
+        self.agent=self.context.agent
+        self.buffer=self.context.buffer
+        self.hardware=self.context.hardware
         self.overlay=None
-        self.left_thread=None
-        self.right_thread=None
-        self.training_hidden_states={"left":None,"right":None}
+        self.training_controller=TrainingController(self)
         self.cancel_optimization=False
         self.idle_threshold=10.0
         self.paused_by_visibility=False
         self.current_hidden=torch.zeros(1,32)
-        self.ai_action_queue=deque()
         self.marker_spec=MARKER_SPEC
         self.pending_window_prompt=False
         self.pending_init_error=None
@@ -1902,19 +2180,7 @@ class AppState:
             user_intervened=(time.time()-self.last_user_input)<0.2
             return self.mode==Mode.TRAINING and ((not self.can_record()) or user_intervened)
     def stop_training_threads(self):
-        with self.lock:
-            left=self.left_thread
-            right=self.right_thread
-            self.left_thread=None
-            self.right_thread=None
-        for t in [left,right]:
-            if t:
-                t.stop_flag=True
-        for t in [left,right]:
-            if t:
-                t.join(timeout=1.0)
-        with self.lock:
-            self.training_hidden_states={"left":None,"right":None}
+        self.training_controller.stop_threads()
     def enter_learning(self):
         self.stop_training_threads()
         with self.lock:
@@ -1926,19 +2192,8 @@ class AppState:
                 return
             self.mode=Mode.TRAINING
             self.last_user_input=time.time()
-            self.training_hidden_states={"left":None,"right":None}
-            need_left=self.left_thread is None or not self.left_thread.is_alive()
-            need_right=self.right_thread is None or not self.right_thread.is_alive()
-        if need_left:
-            left=LeftHandThread(self)
-            left.start()
-            with self.lock:
-                self.left_thread=left
-        if need_right:
-            right=RightHandThread(self)
-            right.start()
-            with self.lock:
-                self.right_thread=right
+        self.training_controller.reset_hidden()
+        self.training_controller.ensure_threads()
     def update_state_from_frame(self,img):
         metrics,hero_dead,in_recall,cooldowns,hid=self.agent.infer_state(img)
         with self.lock:
@@ -1963,15 +2218,9 @@ class AppState:
         with self.lock:
             self.cancel_optimization=False
     def record_ai_action(self,action):
-        with self.lock:
-            if len(self.ai_action_queue)>64:
-                self.ai_action_queue.popleft()
-            self.ai_action_queue.append(action)
+        self.training_controller.record_action(action)
     def consume_ai_action(self):
-        with self.lock:
-            if self.ai_action_queue:
-                return self.ai_action_queue.popleft()
-            return None
+        return self.training_controller.consume_action()
     def get_marker_geometry(self,label):
         with self.lock:
             rect=self.window_rect
@@ -2232,8 +2481,8 @@ class LeftHandThread(threading.Thread):
                 cond=(self.app_state.mode==Mode.TRAINING and (not self.app_state.hero_dead) and (not self.app_state.in_recall) and window_visible(self.app_state.hwnd))
                 rect=self.app_state.window_rect
                 hidden_vec=self.app_state.current_hidden.clone().detach()
-                lh=self.app_state.training_hidden_states["left"]
-                rh=self.app_state.training_hidden_states["right"]
+            lh=self.app_state.training_controller.get_hidden("left")
+            rh=self.app_state.training_controller.get_hidden("right")
             if not cond:
                 time.sleep(0.01)
                 continue
@@ -2246,9 +2495,7 @@ class LeftHandThread(threading.Thread):
             laction,raction,lprob,rprob,lval,rval,lh2,rh2=self.app_state.agent.select_actions(h_state,lh,rh)
             lh2=lh2.detach() if lh2 is not None else None
             rh2=rh2.detach() if rh2 is not None else None
-            with self.app_state.lock:
-                self.app_state.training_hidden_states["left"]=lh2
-                self.app_state.training_hidden_states["right"]=rh2
+            self.app_state.training_controller.set_hidden_pair(lh2,rh2)
             center_x,center_y,r=self.app_state.get_marker_geometry("移动轮盘")
             angle=(laction/16.0)*2*math.pi
             dx=math.cos(angle)*r
@@ -2293,8 +2540,8 @@ class RightHandThread(threading.Thread):
                 cond=(self.app_state.mode==Mode.TRAINING and (not self.app_state.hero_dead) and (not self.app_state.in_recall) and window_visible(self.app_state.hwnd))
                 rect=self.app_state.window_rect
                 hidden_vec=self.app_state.current_hidden.clone().detach()
-                lh=self.app_state.training_hidden_states["left"]
-                rh=self.app_state.training_hidden_states["right"]
+            lh=self.app_state.training_controller.get_hidden("left")
+            rh=self.app_state.training_controller.get_hidden("right")
             if not cond:
                 time.sleep(0.01)
                 continue
@@ -2307,9 +2554,7 @@ class RightHandThread(threading.Thread):
             laction,raction,lprob,rprob,lval,rval,lh2,rh2=self.app_state.agent.select_actions(h_state,lh,rh)
             lh2=lh2.detach() if lh2 is not None else None
             rh2=rh2.detach() if rh2 is not None else None
-            with self.app_state.lock:
-                self.app_state.training_hidden_states["left"]=lh2
-                self.app_state.training_hidden_states["right"]=rh2
+            self.app_state.training_controller.set_hidden_pair(lh2,rh2)
             info=RIGHT_ACTION_TABLE[raction%len(RIGHT_ACTION_TABLE)]
             label=info[0]
             bins=info[1]
@@ -2397,7 +2642,8 @@ class InitializationThread(threading.Thread):
     def run(self):
         status={"timestamp":datetime.now().isoformat(),"dependencies":{},"aaa":{},"hardware":{}}
         missing=verify_dependencies()
-        status["dependencies"]={"missing":missing,"ok":len(missing)==0}
+        guidance=dependency_manager.get_missing_guidance()
+        status["dependencies"]={"missing":missing,"ok":len(missing)==0,"guidance":guidance}
         try:
             self.app_state.file_manager.ensure_structure()
             status["aaa"]={"ok":True,"path":self.app_state.file_manager.base_path}
@@ -2408,7 +2654,8 @@ class InitializationThread(threading.Thread):
         self.app_state.file_manager.write_init_status(status)
         error_msg=None
         if missing:
-            error_msg="缺少依赖:"+",".join(missing)
+            tips=";".join(item.get("guidance","") for item in guidance) if guidance else ""
+            error_msg="缺少依赖:"+",".join(missing)+(";"+tips if tips else "")
         if not status["aaa"].get("ok",False):
             detail=status["aaa"].get("error","AAA目录初始化失败")
             error_msg=(error_msg+";"+detail) if error_msg else detail
