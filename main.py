@@ -7,8 +7,10 @@ import shutil
 import math
 import random
 import ctypes
-import psutil
 import logging
+import importlib
+import queue
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
 from ctypes import wintypes
@@ -16,15 +18,34 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from PIL import ImageGrab,Image
 import numpy as np
-import pyautogui
-from pynput import mouse,keyboard
-import win32gui,win32con,win32api
 from collections import deque,OrderedDict
-from PyQt5 import QtCore,QtGui,QtWidgets
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logger=logging.getLogger("aaa_runtime")
+class LazyModule:
+    def __init__(self,name):
+        self.name=name
+        self.module=None
+    def _load(self):
+        if self.module is None:
+            self.module=importlib.import_module(self.name)
+        return self.module
+    def __getattr__(self,item):
+        return getattr(self._load(),item)
+    def __call__(self,*args,**kwargs):
+        return self._load()(*args,**kwargs)
+psutil=LazyModule("psutil")
+pyautogui=LazyModule("pyautogui")
+mouse=LazyModule("pynput.mouse")
+keyboard=LazyModule("pynput.keyboard")
+win32gui=LazyModule("win32gui")
+win32con=LazyModule("win32con")
+win32api=LazyModule("win32api")
+ImageModule=LazyModule("PIL.Image")
+ImageGrabModule=LazyModule("PIL.ImageGrab")
+QtCore=LazyModule("PyQt5.QtCore")
+QtGui=LazyModule("PyQt5.QtGui")
+QtWidgets=LazyModule("PyQt5.QtWidgets")
 class Mode(Enum):
     INIT=0
     LEARNING=1
@@ -357,26 +378,37 @@ class ExperienceBuffer:
                     self.frame_cache.move_to_end(key)
                 else:
                     missing.append((idx,key,frame))
-            if missing:
-                load_map={}
-                for idx,key,frame in missing:
-                    if key not in load_map:
-                        abs_path=self.manager.to_absolute(frame)
-                        try:
-                            img=Image.open(abs_path).convert("RGB")
-                            img=img.resize((w,h))
-                            arr=np.array(img,dtype=np.float32)/255.0
-                            arr=np.transpose(arr,(2,0,1))
-                            load_map[key]=arr
-                        except (OSError,ValueError,TypeError) as e:
-                            logger.warning("加载经验帧失败:%s",e)
-                            load_map[key]=None
-                    arr=load_map[key]
-                    if arr is not None:
-                        results[idx]=arr
-                        self.frame_cache[key]=arr
-                while len(self.frame_cache)>self.cache_capacity:
-                    self.frame_cache.popitem(last=False)
+        if not missing:
+            return results
+        load_queue=queue.Queue()
+        def loader(entry):
+            idx,key,frame=entry
+            arr=None
+            abs_path=self.manager.to_absolute(frame)
+            try:
+                with ImageModule.open(abs_path) as img:
+                    img=img.convert("RGB")
+                    img=img.resize((w,h))
+                    arr=np.asarray(img,dtype=np.float32)/255.0
+                arr=np.transpose(arr,(2,0,1))
+            except (OSError,ValueError,TypeError) as e:
+                logger.warning("加载经验帧失败:%s",e)
+                arr=None
+            load_queue.put((idx,key,arr))
+        workers=min(len(missing),max(1,os.cpu_count() or 1))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for entry in missing:
+                pool.submit(loader,entry)
+        loaded=[]
+        for _ in missing:
+            loaded.append(load_queue.get())
+        with self.cache_lock:
+            for idx,key,arr in loaded:
+                if arr is not None:
+                    results[idx]=arr
+                    self.frame_cache[key]=arr
+            while len(self.frame_cache)>self.cache_capacity:
+                self.frame_cache.popitem(last=False)
         return results
     def sample(self,batch_size=32):
         with self.lock:
@@ -484,6 +516,10 @@ class RLAgent:
         self.value_coef=0.5
         self.global_step=0
         self.neuro_state=torch.zeros(32,device=self.device)
+        self.batch_buffer=None
+        self.cpu_batch=None
+        self.batch_capacity=0
+        self.batch_shape=None
     def ensure_device(self):
         self.hardware.refresh()
         target=self.hardware.suggest_device()
@@ -500,6 +536,10 @@ class RLAgent:
                         st[k]=v.to(target)
         self.neuro_state=self.neuro_state.to(target)
         self.device=target
+        self.batch_buffer=None
+        self.cpu_batch=None
+        self.batch_capacity=0
+        self.batch_shape=None
     def preprocess_frame(self,img):
         self.ensure_device()
         w,h=self.hardware.suggest_visual_size()
@@ -542,6 +582,36 @@ class RLAgent:
     def reset_neuro_state(self):
         self.ensure_device()
         self.neuro_state=torch.zeros(32,device=self.device)
+    def _ensure_batch_buffers(self,count,shape):
+        c=shape[0]
+        h=shape[1]
+        w=shape[2]
+        target=(c,h,w)
+        if self.batch_shape!=target:
+            self.batch_shape=target
+            self.batch_capacity=0
+            self.batch_buffer=None
+            self.cpu_batch=None
+        capacity=self.batch_capacity
+        if self.batch_buffer is None or self.cpu_batch is None or capacity<count:
+            new_cap=max(count,capacity*2 if capacity>0 else count)
+            if self.device.type=='cuda':
+                cpu_tensor=torch.empty((new_cap,c,h,w),dtype=torch.float32).pin_memory()
+            else:
+                cpu_tensor=torch.empty((new_cap,c,h,w),dtype=torch.float32)
+            gpu_tensor=torch.empty((new_cap,c,h,w),dtype=torch.float32,device=self.device)
+            self.cpu_batch=cpu_tensor
+            self.batch_buffer=gpu_tensor
+            self.batch_capacity=new_cap
+    def _batch_from_arrays(self,arr_list):
+        count=len(arr_list)
+        shape=arr_list[0].shape
+        self._ensure_batch_buffers(count,shape)
+        for idx,arr in enumerate(arr_list):
+            self.cpu_batch[idx].copy_(torch.from_numpy(arr))
+        view=self.batch_buffer[:count]
+        view.copy_(self.cpu_batch[:count],non_blocking=(self.device.type=='cuda'))
+        return view
     def optimize_from_buffer(self,buffer,progress_get_cancel,progress_set,markers_updater,markers_persist,max_iters=1000):
         cancelled=False
         effective_steps=0
@@ -606,8 +676,7 @@ class RLAgent:
                     continue
                 any_step=True
                 effective_steps+=1
-                arr_stack=np.stack(arr_list,axis=0)
-                t_batch=torch.from_numpy(arr_stack).to(self.device)
+                t_batch=self._batch_from_arrays(arr_list)
                 metrics,flags,h=self.vision(t_batch)
                 h_brain=self.neuro_project(h)
                 with torch.no_grad():
@@ -668,181 +737,348 @@ class RLAgent:
         if markers_persist:
             markers_persist()
         return not cancelled
-class MarkerWidget(QtWidgets.QWidget):
-    def __init__(self,parent,label,color,alpha,x_pct,y_pct,r_pct):
-        super(MarkerWidget,self).__init__(parent)
-        self.label=label
-        self.color=QtGui.QColor(color)
-        self.alpha=alpha
-        self.x_pct=x_pct
-        self.y_pct=y_pct
-        self.r_pct=r_pct
-        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
-        self.dragging=False
-        self.resizing=False
-        self.selected=False
-        self.last_pos=None
-    def update_geometry_from_parent(self):
-        pr=self.parent()
-        if pr is None:
-            return
-        w=pr.width()
-        h=pr.height()
-        r=int(self.r_pct*min(w,h))
-        cx=int(self.x_pct*w)
-        cy=int(self.y_pct*h)
-        self.setGeometry(cx-r,cy-r,2*r,2*r)
-        self.update()
-    def paintEvent(self,e):
-        qp=QtGui.QPainter(self)
-        qp.setRenderHint(QtGui.QPainter.Antialiasing)
-        c=QtGui.QColor(self.color)
-        a=int(clamp(self.alpha,0.0,1.0)*255)
-        c.setAlpha(a)
-        qp.setBrush(QtGui.QBrush(c))
-        qp.setPen(QtGui.QPen(QtGui.QColor(255,255,255,255 if self.selected else a),2))
-        r=min(self.width(),self.height())/2
-        qp.drawEllipse(QtCore.QPointF(self.width()/2,self.height()/2),r-2,r-2)
-        qp.setPen(QtGui.QPen(QtGui.QColor(255,255,255,255),1))
-        qp.drawText(self.rect(),QtCore.Qt.AlignCenter,self.label)
-    def mousePressEvent(self,event):
-        pos=event.pos()
-        r=min(self.width(),self.height())/2
-        center=QtCore.QPointF(self.width()/2,self.height()/2)
-        dist=((pos.x()-center.x())**2+(pos.y()-center.y())**2)**0.5
-        edge=abs(dist-r)<8
-        if edge:
-            self.resizing=True
-        else:
-            self.dragging=True
-        self.selected=True
-        p=self.parent()
-        if hasattr(p,"selected_marker"):
-            p.selected_marker=self
-            for other in p.markers:
-                if other is not self:
-                    other.selected=False
-                    other.update()
-        self.last_pos=event.globalPos()
-        self.update()
-    def mouseMoveEvent(self,event):
-        if not self.last_pos:
-            return
-        delta=event.globalPos()-self.last_pos
-        pr=self.parent()
-        w=pr.width()
-        h=pr.height()
-        if self.dragging:
-            cx=self.x_pct*w+delta.x()
-            cy=self.y_pct*h+delta.y()
-            self.x_pct=clamp(cx/float(w),0.0,1.0)
-            self.y_pct=clamp(cy/float(h),0.0,1.0)
-        elif self.resizing:
-            r=int(self.r_pct*min(w,h))+max(delta.x(),delta.y())
-            self.r_pct=clamp(r/float(min(w,h)),0.01,0.5)
-        self.last_pos=event.globalPos()
-        self.update_geometry_from_parent()
-    def mouseReleaseEvent(self,event):
-        self.dragging=False
-        self.resizing=False
-        self.last_pos=None
-class OverlayWindow(QtWidgets.QWidget):
-    def __init__(self,app_state):
-        super(OverlayWindow,self).__init__(None,QtCore.Qt.WindowStaysOnTopHint|QtCore.Qt.FramelessWindowHint|QtCore.Qt.Tool)
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground,True)
-        self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
-        self.app_state=app_state
-        self.markers=[]
-        self.selected_marker=None
-        self.config_mode=False
-        self._marker_visible_cache={}
-        self._overlay_visible=False
-    def find_marker(self,label):
-        for m in self.markers:
-            if m.label==label:
-                return m
-        return None
-    def sync_with_window(self):
-        hwnd=self.app_state.hwnd
-        if hwnd is None:
-            if self._overlay_visible:
-                self.hide()
-                self._overlay_visible=False
-            for m in self.markers:
-                if self._marker_visible_cache.get(m,False):
-                    m.hide()
-                    self._marker_visible_cache[m]=False
-            return
-        rect=get_window_rect(hwnd)
-        x,y,w,h=rect[0],rect[1],rect[2]-rect[0],rect[3]-rect[1]
-        self.setGeometry(x,y,w,h)
-        for m in self.markers:
-            m.update_geometry_from_parent()
-        visible=window_visible(hwnd)
-        if not visible:
-            if self._overlay_visible:
-                self.hide()
-                self._overlay_visible=False
-            for m in self.markers:
-                if self._marker_visible_cache.get(m,False):
-                    m.hide()
-                    self._marker_visible_cache[m]=False
-            return
-        if not self._overlay_visible or not self.isVisible():
-            self.show()
-            self._overlay_visible=True
-        self._update_marker_visibility(False)
-    def _update_marker_visibility(self,force):
-        desired=self.config_mode and self._overlay_visible
-        for m in self.markers:
-            prev=self._marker_visible_cache.get(m,False)
-            if force or prev!=desired:
-                if desired:
-                    if not m.isVisible():
-                        m.show()
-                else:
-                    if m.isVisible():
-                        m.hide()
-                self._marker_visible_cache[m]=desired
-    def set_config_mode(self,enabled):
-        self.config_mode=enabled
-        if enabled:
-            self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,False)
-            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
-            for m in self.markers:
-                m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
-        else:
+MarkerWidget=None
+OverlayWindow=None
+WindowSelectorDialog=None
+MainWindow=None
+def ensure_qt_classes():
+    global QtCore,QtGui,QtWidgets,MarkerWidget,OverlayWindow,WindowSelectorDialog,MainWindow
+    if isinstance(QtCore,LazyModule):
+        QtCore=QtCore._load()
+    if isinstance(QtGui,LazyModule):
+        QtGui=QtGui._load()
+    if isinstance(QtWidgets,LazyModule):
+        QtWidgets=QtWidgets._load()
+    if MarkerWidget is not None and OverlayWindow is not None and WindowSelectorDialog is not None and MainWindow is not None:
+        return
+    class _MarkerWidget(QtWidgets.QWidget):
+        def __init__(self,parent,label,color,alpha,x_pct,y_pct,r_pct):
+            super(_MarkerWidget,self).__init__(parent)
+            self.label=label
+            self.color=QtGui.QColor(color)
+            self.alpha=alpha
+            self.x_pct=x_pct
+            self.y_pct=y_pct
+            self.r_pct=r_pct
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
+            self.dragging=False
+            self.resizing=False
+            self.selected=False
+            self.last_pos=None
+        def update_geometry_from_parent(self):
+            pr=self.parent()
+            if pr is None:
+                return
+            w=pr.width()
+            h=pr.height()
+            r=int(self.r_pct*min(w,h))
+            cx=int(self.x_pct*w)
+            cy=int(self.y_pct*h)
+            self.setGeometry(cx-r,cy-r,2*r,2*r)
+            self.update()
+        def paintEvent(self,e):
+            qp=QtGui.QPainter(self)
+            qp.setRenderHint(QtGui.QPainter.Antialiasing)
+            c=QtGui.QColor(self.color)
+            a=int(clamp(self.alpha,0.0,1.0)*255)
+            c.setAlpha(a)
+            qp.setBrush(QtGui.QBrush(c))
+            qp.setPen(QtGui.QPen(QtGui.QColor(255,255,255,255 if self.selected else a),2))
+            r=min(self.width(),self.height())/2
+            qp.drawEllipse(QtCore.QPointF(self.width()/2,self.height()/2),r-2,r-2)
+            qp.setPen(QtGui.QPen(QtGui.QColor(255,255,255,255),1))
+            qp.drawText(self.rect(),QtCore.Qt.AlignCenter,self.label)
+        def mousePressEvent(self,event):
+            pos=event.pos()
+            r=min(self.width(),self.height())/2
+            center=QtCore.QPointF(self.width()/2,self.height()/2)
+            dist=((pos.x()-center.x())**2+(pos.y()-center.y())**2)**0.5
+            edge=abs(dist-r)<8
+            if edge:
+                self.resizing=True
+            else:
+                self.dragging=True
+            self.selected=True
+            p=self.parent()
+            if hasattr(p,"selected_marker"):
+                p.selected_marker=self
+                for other in p.markers:
+                    if other is not self:
+                        other.selected=False
+                        other.update()
+            self.last_pos=event.globalPos()
+            self.update()
+        def mouseMoveEvent(self,event):
+            if not self.last_pos:
+                return
+            delta=event.globalPos()-self.last_pos
+            pr=self.parent()
+            w=pr.width()
+            h=pr.height()
+            if self.dragging:
+                cx=self.x_pct*w+delta.x()
+                cy=self.y_pct*h+delta.y()
+                self.x_pct=clamp(cx/float(w),0.0,1.0)
+                self.y_pct=clamp(cy/float(h),0.0,1.0)
+            elif self.resizing:
+                r=int(self.r_pct*min(w,h))+max(delta.x(),delta.y())
+                self.r_pct=clamp(r/float(min(w,h)),0.01,0.5)
+            self.last_pos=event.globalPos()
+            self.update_geometry_from_parent()
+        def mouseReleaseEvent(self,event):
+            self.dragging=False
+            self.resizing=False
+            self.last_pos=None
+    class _OverlayWindow(QtWidgets.QWidget):
+        def __init__(self,app_state):
+            super(_OverlayWindow,self).__init__(None,QtCore.Qt.WindowStaysOnTopHint|QtCore.Qt.FramelessWindowHint|QtCore.Qt.Tool)
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground,True)
             self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
-            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
-            for m in self.markers:
-                m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
-        self._update_marker_visibility(True)
-        self.sync_with_window()
-    def add_marker(self,label,color):
-        m=MarkerWidget(self,label,color,0.5,0.5,0.5,0.05)
-        self.markers.append(m)
-        m.update_geometry_from_parent()
-        desired=self.config_mode and self._overlay_visible
-        if desired:
-            m.show()
-        else:
-            m.hide()
-        m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,not self.config_mode)
-        self._marker_visible_cache[m]=desired
-        self.selected_marker=m
-    def remove_selected_marker(self):
-        if self.selected_marker in self.markers:
-            target=self.selected_marker
-            self.markers.remove(target)
-            if target in self._marker_visible_cache:
-                self._marker_visible_cache.pop(target,None)
-            target.setParent(None)
+            self.app_state=app_state
+            self.markers=[]
             self.selected_marker=None
-    def get_marker_data(self):
-        out=[]
-        for m in self.markers:
-            out.append(m)
-        return out
+            self.config_mode=False
+            self._marker_visible_cache={}
+            self._overlay_visible=False
+        def find_marker(self,label):
+            for m in self.markers:
+                if m.label==label:
+                    return m
+            return None
+        def sizeHint(self):
+            return QtCore.QSize(400,400)
+        def set_overlay_visible(self,visible):
+            self._overlay_visible=visible
+            self._update_marker_visibility(True)
+            if visible:
+                if not self.isVisible():
+                    self.show()
+            else:
+                if self.isVisible():
+                    self.hide()
+        def _update_marker_visibility(self,force=False):
+            for m in self.markers:
+                desired=self.config_mode and self._overlay_visible
+                if force or self._marker_visible_cache.get(m)!=desired:
+                    if desired:
+                        if not m.isVisible():
+                            m.show()
+                    else:
+                        if m.isVisible():
+                            m.hide()
+                    self._marker_visible_cache[m]=desired
+        def set_config_mode(self,enabled):
+            self.config_mode=enabled
+            if enabled:
+                self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,False)
+                self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
+                for m in self.markers:
+                    m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
+            else:
+                self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
+                self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
+                for m in self.markers:
+                    m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
+            self._update_marker_visibility(True)
+            self.sync_with_window()
+        def add_marker(self,label,color):
+            m=_MarkerWidget(self,label,color,0.5,0.5,0.5,0.05)
+            self.markers.append(m)
+            m.update_geometry_from_parent()
+            desired=self.config_mode and self._overlay_visible
+            if desired:
+                m.show()
+            else:
+                m.hide()
+            m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,not self.config_mode)
+            self._marker_visible_cache[m]=desired
+            self.selected_marker=m
+        def remove_selected_marker(self):
+            if self.selected_marker in self.markers:
+                target=self.selected_marker
+                self.markers.remove(target)
+                if target in self._marker_visible_cache:
+                    self._marker_visible_cache.pop(target,None)
+                target.setParent(None)
+                self.selected_marker=None
+        def get_marker_data(self):
+            out=[]
+            for m in self.markers:
+                out.append(m)
+            return out
+    class _WindowSelectorDialog(QtWidgets.QDialog):
+        def __init__(self,parent=None):
+            super(_WindowSelectorDialog,self).__init__(parent)
+            self.setWindowTitle("选择窗口")
+            self.layout=QtWidgets.QVBoxLayout(self)
+            self.listWidget=QtWidgets.QListWidget(self)
+            self.layout.addWidget(self.listWidget)
+            self.btnBox=QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok|QtWidgets.QDialogButtonBox.Cancel,self)
+            self.layout.addWidget(self.btnBox)
+            self.btnBox.accepted.connect(self.accept)
+            self.btnBox.rejected.connect(self.reject)
+            self.refresh_windows()
+        def refresh_windows(self):
+            self.listWidget.clear()
+            self.windows=[]
+            for hwnd,title,rect in enumerate_windows():
+                item=QtWidgets.QListWidgetItem(title)
+                item.setData(QtCore.Qt.UserRole,(hwnd,rect))
+                self.listWidget.addItem(item)
+        def selected(self):
+            item=self.listWidget.currentItem()
+            if not item:
+                return None
+            return item.data(QtCore.Qt.UserRole)
+    class _MainWindow(QtWidgets.QMainWindow):
+        def __init__(self,app_state,hardware):
+            super(_MainWindow,self).__init__()
+            self.app_state=app_state
+            self.hardware=hardware
+            self.setWindowTitle("AAA AI Game Player")
+            self.rootWidget=QtWidgets.QWidget(self)
+            self.setCentralWidget(self.rootWidget)
+            self.layout=QtWidgets.QGridLayout(self.rootWidget)
+            self.modeLabel=QtWidgets.QLabel("模式:初始化")
+            self.metricsLabelA=QtWidgets.QLabel("A:0")
+            self.metricsLabelB=QtWidgets.QLabel("B:0")
+            self.metricsLabelC=QtWidgets.QLabel("C:0")
+            self.heroDeadLabel=QtWidgets.QLabel("英雄存活:是")
+            self.cooldownLabel=QtWidgets.QLabel("冷却信息")
+            self.layout.addWidget(self.modeLabel,0,0,1,2)
+            self.layout.addWidget(self.metricsLabelA,1,0)
+            self.layout.addWidget(self.metricsLabelB,1,1)
+            self.layout.addWidget(self.metricsLabelC,1,2)
+            self.layout.addWidget(self.heroDeadLabel,2,0)
+            self.layout.addWidget(self.cooldownLabel,2,1,1,2)
+            self.progressBar=QtWidgets.QProgressBar()
+            self.layout.addWidget(self.progressBar,3,0,1,3)
+            self.chooseWindowBtn=QtWidgets.QPushButton("选择窗口")
+            self.optimizeBtn=QtWidgets.QPushButton("优化")
+            self.cancelOptimizeBtn=QtWidgets.QPushButton("取消优化")
+            self.configBtn=QtWidgets.QPushButton("配置")
+            self.saveConfigBtn=QtWidgets.QPushButton("保存配置")
+            self.addMarkerBtn=QtWidgets.QPushButton("添加标志")
+            self.delMarkerBtn=QtWidgets.QPushButton("删除标志")
+            self.moveAAABtn=QtWidgets.QPushButton("修改AAA位置")
+            self.layout.addWidget(self.chooseWindowBtn,4,0)
+            self.layout.addWidget(self.optimizeBtn,4,1)
+            self.layout.addWidget(self.cancelOptimizeBtn,4,2)
+            self.layout.addWidget(self.configBtn,5,0)
+            self.layout.addWidget(self.saveConfigBtn,5,1)
+            self.layout.addWidget(self.addMarkerBtn,6,0)
+            self.layout.addWidget(self.delMarkerBtn,6,1)
+            self.layout.addWidget(self.moveAAABtn,6,2)
+            self.cancelOptimizeBtn.setEnabled(False)
+            self.saveConfigBtn.setEnabled(False)
+            self.addMarkerBtn.setEnabled(False)
+            self.delMarkerBtn.setEnabled(False)
+            self.overlay=None
+            self.chooseWindowBtn.clicked.connect(self.on_choose_window)
+            self.optimizeBtn.clicked.connect(self.on_optimize)
+            self.cancelOptimizeBtn.clicked.connect(self.on_cancel_optimize)
+            self.configBtn.clicked.connect(self.on_configure)
+            self.saveConfigBtn.clicked.connect(self.on_save_config)
+            self.addMarkerBtn.clicked.connect(self.on_add_marker)
+            self.delMarkerBtn.clicked.connect(self.on_delete_marker)
+            self.moveAAABtn.clicked.connect(self.on_move_aaa)
+            self.timer=QtCore.QTimer(self)
+            self.timer.timeout.connect(self.on_tick)
+            self.timer.start(200)
+        def on_tick(self):
+            snap=self.app_state.get_state_snapshot()
+            mode_map={Mode.INIT:"初始化",Mode.LEARNING:"学习",Mode.OPTIMIZING:"优化",Mode.CONFIGURING:"配置",Mode.TRAINING:"训练"}
+            self.modeLabel.setText("模式:"+mode_map.get(snap["mode"],"未知"))
+            self.metricsLabelA.setText("A:"+str(snap["metrics"].get("A",0)))
+            self.metricsLabelB.setText("B:"+str(snap["metrics"].get("B",0)))
+            self.metricsLabelC.setText("C:"+str(snap["metrics"].get("C",0)))
+            self.heroDeadLabel.setText("英雄存活:"+("否" if snap["hero_dead"] else "是"))
+            cd=snap["cooldowns"]
+            cd_text="冷却:"+",".join(["%s:%s"%(k,"是" if v else "否") for k,v in cd.items()])
+            self.cooldownLabel.setText(cd_text)
+            self.progressBar.setValue(int(snap["progress"]))
+            self.cancelOptimizeBtn.setEnabled(self.app_state.mode==Mode.OPTIMIZING)
+            if self.app_state.mode==Mode.CONFIGURING:
+                self.saveConfigBtn.setEnabled(True)
+                self.addMarkerBtn.setEnabled(True)
+                self.delMarkerBtn.setEnabled(True)
+            else:
+                self.saveConfigBtn.setEnabled(False)
+                self.addMarkerBtn.setEnabled(False)
+                self.delMarkerBtn.setEnabled(False)
+        def on_choose_window(self):
+            ensure_qt_classes()
+            dlg=_WindowSelectorDialog(self)
+            app=self.app_state
+            if not app.ready:
+                QtWidgets.QMessageBox.warning(self,"未就绪","初始化尚未完成")
+                return
+            if dlg.exec_()==QtWidgets.QDialog.Accepted:
+                selected=dlg.selected()
+                if selected:
+                    hwnd,rect=selected
+                    app.set_hwnd(hwnd)
+                    app.window_rect=rect
+                    if not app.overlay:
+                        app.overlay=_OverlayWindow(app)
+                    app.overlay.sync_with_window()
+                    app.overlay.set_overlay_visible(True)
+                    QtWidgets.QMessageBox.information(self,"准备就绪","请选择一个窗口")
+        def on_optimize(self):
+            if self.app_state.mode!=Mode.LEARNING:
+                QtWidgets.QMessageBox.information(self,"切换模式","请先返回学习模式后再开始优化")
+                return
+            self.app_state.set_mode(Mode.OPTIMIZING)
+        def on_cancel_optimize(self):
+            self.app_state.request_cancel_optimization()
+        def on_configure(self):
+            if self.app_state.mode!=Mode.LEARNING:
+                QtWidgets.QMessageBox.information(self,"切换模式","请在学习模式下进行配置")
+                return
+            self.app_state.set_mode(Mode.CONFIGURING)
+            if not self.app_state.overlay:
+                self.app_state.overlay=_OverlayWindow(self.app_state)
+            self.app_state.overlay.set_overlay_visible(True)
+            self.app_state.overlay.set_config_mode(True)
+        def on_save_config(self):
+            if self.app_state.mode!=Mode.CONFIGURING:
+                return
+            reply=QtWidgets.QMessageBox.question(self,"确认保存","确认保存当前配置？",QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
+            if reply!=QtWidgets.QMessageBox.Yes:
+                return
+            self.save_markers_to_manager()
+            QtWidgets.QMessageBox.information(self,"已保存","配置已保存")
+            self.app_state.set_mode(Mode.LEARNING)
+            if self.app_state.overlay:
+                self.app_state.overlay.set_config_mode(False)
+                self.app_state.overlay.set_overlay_visible(False)
+        def save_markers_to_manager(self):
+            overlay=self.app_state.overlay
+            if not overlay:
+                return
+            rect=self.app_state.window_rect
+            markers=[]
+            for m in overlay.markers:
+                markers.append(m)
+            self.app_state.file_manager.save_markers(markers,rect)
+        def on_add_marker(self):
+            overlay=self.app_state.overlay
+            if overlay:
+                overlay.add_marker(random.choice(RIGHT_ACTION_LABELS),QtGui.QColor(255,0,0))
+        def on_delete_marker(self):
+            overlay=self.app_state.overlay
+            if overlay:
+                overlay.remove_selected_marker()
+        def on_move_aaa(self):
+            d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
+            if d:
+                old_base,new_base=self.app_state.file_manager.move_dir(d)
+                self.app_state.buffer.on_aaa_moved(old_base,new_base)
+                QtWidgets.QMessageBox.information(self,"完成","AAA目录已迁移")
+    MarkerWidget=_MarkerWidget
+    OverlayWindow=_OverlayWindow
+    WindowSelectorDialog=_WindowSelectorDialog
+    MainWindow=_MainWindow
 class HardwareAdaptiveRate:
     def __init__(self):
         self.batch_size=32
@@ -858,6 +1094,11 @@ class HardwareAdaptiveRate:
         self.snapshot_lock=threading.Lock()
         self.snapshot={"cpu":0.0,"mem":0.5,"gpu":0.5,"time":0.0}
         self.monitor_stop=False
+        self.monitor_interval=0.75
+        self._ema_cpu=None
+        self._ema_mem=None
+        self._ema_gpu=None
+        self._ema_alpha=0.2
         self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
         self.monitor_thread.start()
     def _collect_snapshot(self):
@@ -885,26 +1126,33 @@ class HardwareAdaptiveRate:
                 logger.warning("获取GPU信息失败:%s",e)
                 gpu_free=0.5
         return {"cpu":cpu,"mem":mem_free,"gpu":gpu_free,"time":time.time()}
+    def _apply_snapshot(self,snap):
+        if self._ema_cpu is None:
+            self._ema_cpu=snap["cpu"]
+            self._ema_mem=snap["mem"]
+            self._ema_gpu=snap["gpu"]
+        else:
+            alpha=self._ema_alpha
+            self._ema_cpu=self._ema_cpu+(snap["cpu"]-self._ema_cpu)*alpha
+            self._ema_mem=self._ema_mem+(snap["mem"]-self._ema_mem)*alpha
+            self._ema_gpu=self._ema_gpu+(snap["gpu"]-self._ema_gpu)*alpha
+        with self.snapshot_lock:
+            self.snapshot["cpu"]=self._ema_cpu
+            self.snapshot["mem"]=self._ema_mem
+            self.snapshot["gpu"]=self._ema_gpu
+            self.snapshot["time"]=snap["time"]
     def _monitor_loop(self):
         while not self.monitor_stop:
             snap=self._collect_snapshot()
-            with self.snapshot_lock:
-                self.snapshot["cpu"]=snap["cpu"]
-                self.snapshot["mem"]=snap["mem"]
-                self.snapshot["gpu"]=snap["gpu"]
-                self.snapshot["time"]=snap["time"]
-            time.sleep(0.25)
+            self._apply_snapshot(snap)
+            time.sleep(self.monitor_interval)
     def refresh(self,force=False):
         now=time.time()
         with self.lock:
             if force:
                 snap=self._collect_snapshot()
-                with self.snapshot_lock:
-                    self.snapshot["cpu"]=snap["cpu"]
-                    self.snapshot["mem"]=snap["mem"]
-                    self.snapshot["gpu"]=snap["gpu"]
-                    self.snapshot["time"]=snap["time"]
-            elif now-self.last_refresh<0.1:
+                self._apply_snapshot(snap)
+            elif now-self.last_refresh<self.monitor_interval*0.5:
                 return
             with self.snapshot_lock:
                 cpu=self.snapshot["cpu"]
@@ -1315,7 +1563,7 @@ class ScreenshotRecorder(threading.Thread):
             if active and hwnd is not None:
                 rect=get_window_rect(hwnd)
                 try:
-                    img=ImageGrab.grab(bbox=rect)
+                    img=ImageGrabModule.grab(bbox=rect)
                 except Exception as e:
                     logger.warning("截图失败:%s",e)
                     img=None
@@ -1509,257 +1757,9 @@ class OptimizationThread(threading.Thread):
             self.app_state.set_progress(100)
         else:
             self.app_state.set_progress(0)
-class WindowSelectorDialog(QtWidgets.QDialog):
-    def __init__(self,parent):
-        super(WindowSelectorDialog,self).__init__(parent)
-        self.setWindowTitle("选择窗口")
-        self.setModal(True)
-        self.layout=QtWidgets.QVBoxLayout(self)
-        self.listWidget=QtWidgets.QListWidget(self)
-        self.layout.addWidget(self.listWidget)
-        self.btnBox=QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok|QtWidgets.QDialogButtonBox.Cancel,self)
-        self.layout.addWidget(self.btnBox)
-        self.btnBox.accepted.connect(self.accept)
-        self.btnBox.rejected.connect(self.reject)
-        self.refresh()
-    def refresh(self):
-        self.listWidget.clear()
-        ws=enum_windows()
-        for hwnd,title in ws:
-            item=QtWidgets.QListWidgetItem(title)
-            item.setData(QtCore.Qt.UserRole,hwnd)
-            self.listWidget.addItem(item)
-    def get_selected_hwnd(self):
-        it=self.listWidget.currentItem()
-        if it:
-            return it.data(QtCore.Qt.UserRole)
-        return None
-class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self,app_state,rate_controller):
-        super(MainWindow,self).__init__()
-        self.app_state=app_state
-        self.rate_controller=rate_controller
-        self.optimize_thread=None
-        self.setWindowTitle("AI控制面板-强化学习-深度学习-正则化-自适应-类脑智能")
-        self.rootWidget=QtWidgets.QWidget(self)
-        self.setCentralWidget(self.rootWidget)
-        self.layout=QtWidgets.QGridLayout(self.rootWidget)
-        self.modeLabel=QtWidgets.QLabel("模式:初始化")
-        self.layout.addWidget(self.modeLabel,0,0,1,2)
-        self.metricsLabelA=QtWidgets.QLabel("A:0")
-        self.metricsLabelB=QtWidgets.QLabel("B:0")
-        self.metricsLabelC=QtWidgets.QLabel("C:0")
-        self.heroDeadLabel=QtWidgets.QLabel("英雄存活:是")
-        self.cooldownLabel=QtWidgets.QLabel("冷却信息")
-        self.layout.addWidget(self.metricsLabelA,1,0)
-        self.layout.addWidget(self.metricsLabelB,1,1)
-        self.layout.addWidget(self.metricsLabelC,2,0)
-        self.layout.addWidget(self.heroDeadLabel,2,1)
-        self.layout.addWidget(self.cooldownLabel,3,0,1,2)
-        self.progressBar=QtWidgets.QProgressBar()
-        self.progressBar.setRange(0,100)
-        self.progressBar.setValue(0)
-        self.progressBar.setFormat("%p%")
-        self.layout.addWidget(self.progressBar,4,0,1,2)
-        self.chooseWindowBtn=QtWidgets.QPushButton("选择窗口")
-        self.optimizeBtn=QtWidgets.QPushButton("优化")
-        self.cancelOptimizeBtn=QtWidgets.QPushButton("取消优化")
-        self.configBtn=QtWidgets.QPushButton("配置")
-        self.saveConfigBtn=QtWidgets.QPushButton("保存配置")
-        self.addMarkerBtn=QtWidgets.QPushButton("添加标志")
-        self.delMarkerBtn=QtWidgets.QPushButton("删除标志")
-        self.moveAAABtn=QtWidgets.QPushButton("修改AAA位置")
-        self.layout.addWidget(self.chooseWindowBtn,5,0)
-        self.layout.addWidget(self.optimizeBtn,5,1)
-        self.layout.addWidget(self.cancelOptimizeBtn,6,0)
-        self.layout.addWidget(self.configBtn,6,1)
-        self.layout.addWidget(self.saveConfigBtn,7,0)
-        self.layout.addWidget(self.addMarkerBtn,7,1)
-        self.layout.addWidget(self.delMarkerBtn,8,0)
-        self.layout.addWidget(self.moveAAABtn,8,1)
-        self.chooseWindowBtn.setEnabled(False)
-        self.cancelOptimizeBtn.setEnabled(False)
-        self.saveConfigBtn.setEnabled(False)
-        self.addMarkerBtn.setEnabled(False)
-        self.delMarkerBtn.setEnabled(False)
-        self.marker_templates=[("移动轮盘",QtGui.QColor(255,0,0)),("回城",QtGui.QColor(255,165,0)),("恢复",QtGui.QColor(0,255,0)),("闪现",QtGui.QColor(255,255,0)),("普攻",QtGui.QColor(0,0,255)),("一技能",QtGui.QColor(75,0,130)),("二技能",QtGui.QColor(75,0,130)),("三技能",QtGui.QColor(75,0,130)),("四技能",QtGui.QColor(75,0,130)),("取消施法",QtGui.QColor(0,0,0)),("主动装备",QtGui.QColor(128,0,128)),("数据A",QtGui.QColor(255,255,255)),("数据B",QtGui.QColor(255,255,255)),("数据C",QtGui.QColor(255,255,255))]
-        self.marker_template_idx=0
-        self.chooseWindowBtn.clicked.connect(self.on_choose_window)
-        self.optimizeBtn.clicked.connect(self.on_optimize)
-        self.cancelOptimizeBtn.clicked.connect(self.on_cancel_optimize)
-        self.configBtn.clicked.connect(self.on_config)
-        self.saveConfigBtn.clicked.connect(self.on_save_config)
-        self.addMarkerBtn.clicked.connect(self.on_add_marker)
-        self.delMarkerBtn.clicked.connect(self.on_del_marker)
-        self.moveAAABtn.clicked.connect(self.on_move_aaa)
-        self.timer=QtCore.QTimer(self)
-        self.timer.timeout.connect(self.on_timer)
-        self.timer.start(100)
-    def hardware_ok(self):
-        cpu_cnt=psutil.cpu_count()
-        mem=psutil.virtual_memory().total/(1024**3)
-        return cpu_cnt>=2 and mem>=2
-    def file_ok(self):
-        mgr=self.app_state.file_manager
-        return os.path.exists(mgr.vision_model_path) and os.path.exists(mgr.left_model_path) and os.path.exists(mgr.right_model_path) and os.path.exists(mgr.experience_dir) and os.path.exists(mgr.config_path)
-    def maybe_init(self):
-        if self.app_state.mode==Mode.INIT and (not self.app_state.ready) and self.hardware_ok() and self.file_ok():
-            QtWidgets.QMessageBox.information(self,"准备就绪","请选择一个窗口")
-            self.app_state.ready=True
-            self.chooseWindowBtn.setEnabled(True)
-    def on_choose_window(self):
-        if not self.app_state.ready:
-            QtWidgets.QMessageBox.warning(self,"未就绪","初始化尚未完成")
-            return
-        dlg=WindowSelectorDialog(self)
-        if dlg.exec_()==QtWidgets.QDialog.Accepted:
-            hwnd=dlg.get_selected_hwnd()
-            if hwnd:
-                self.app_state.set_hwnd(hwnd)
-                if self.app_state.overlay is None:
-                    self.app_state.overlay=OverlayWindow(self.app_state)
-                    cfg_markers=self.app_state.file_manager.load_markers()
-                    for m in cfg_markers:
-                        w=MarkerWidget(self.app_state.overlay,m["label"],QtGui.QColor(m["color"]),m["alpha"],m["x_pct"],m["y_pct"],m["r_pct"])
-                        self.app_state.overlay.markers.append(w)
-                        w.hide()
-                        w.update_geometry_from_parent()
-                    self.app_state.overlay.show()
-                self.app_state.overlay.sync_with_window()
-                if self.app_state.mode==Mode.INIT:
-                    self.app_state.set_mode(Mode.LEARNING)
-                    self.modeLabel.setText("模式:学习")
-                    self.app_state.recording=True
-    def on_optimize(self):
-        if self.app_state.mode==Mode.LEARNING:
-            self.app_state.set_mode(Mode.OPTIMIZING)
-            self.modeLabel.setText("模式:优化")
-            self.app_state.recording=False
-            self.cancelOptimizeBtn.setEnabled(True)
-            self.optimize_thread=OptimizationThread(self.app_state)
-            self.app_state.cancel_optimization=False
-            self.app_state.set_progress(0)
-            self.optimize_thread.start()
-        elif self.app_state.mode==Mode.TRAINING:
-            QtWidgets.QMessageBox.information(self,"切换模式","请先返回学习模式后再开始优化")
-    def on_cancel_optimize(self):
-        if self.app_state.mode==Mode.OPTIMIZING:
-            self.app_state.request_cancel_optimization()
-            self.app_state.set_progress(0)
-            self.cancelOptimizeBtn.setEnabled(False)
-            self.app_state.set_mode(Mode.LEARNING)
-            self.modeLabel.setText("模式:学习")
-            self.app_state.recording=True
-    def on_config(self):
-        if self.app_state.mode==Mode.LEARNING:
-            self.app_state.set_mode(Mode.CONFIGURING)
-            self.modeLabel.setText("模式:配置")
-            self.app_state.recording=False
-            self.saveConfigBtn.setEnabled(True)
-            self.addMarkerBtn.setEnabled(True)
-            self.delMarkerBtn.setEnabled(True)
-            if self.app_state.overlay:
-                self.app_state.overlay.set_config_mode(True)
-                self.app_state.overlay.sync_with_window()
-        elif self.app_state.mode==Mode.TRAINING:
-            QtWidgets.QMessageBox.information(self,"切换模式","请在学习模式下进行配置")
-    def on_save_config(self):
-        if self.app_state.mode==Mode.CONFIGURING:
-            reply=QtWidgets.QMessageBox.question(self,"确认保存","确认保存当前配置？",QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
-            if reply!=QtWidgets.QMessageBox.Yes:
-                return
-            overlay=self.app_state.overlay
-            if overlay:
-                overlay.set_config_mode(False)
-            self.saveConfigBtn.setEnabled(False)
-            self.addMarkerBtn.setEnabled(False)
-            self.delMarkerBtn.setEnabled(False)
-            if overlay:
-                overlay.sync_with_window()
-                self.app_state.file_manager.save_markers(overlay.get_marker_data(),self.app_state.window_rect)
-            QtWidgets.QMessageBox.information(self,"已保存","配置已保存")
-            self.app_state.mark_user_input()
-            self.app_state.set_mode(Mode.LEARNING)
-            self.modeLabel.setText("模式:学习")
-            self.app_state.recording=True
-            if overlay:
-                overlay.sync_with_window()
-    def on_add_marker(self):
-        if self.app_state.overlay:
-            tpl=self.marker_templates[self.marker_template_idx%len(self.marker_templates)]
-            self.marker_template_idx+=1
-            self.app_state.overlay.add_marker(tpl[0],tpl[1])
-            self.app_state.overlay.sync_with_window()
-    def on_del_marker(self):
-        if self.app_state.overlay:
-            self.app_state.overlay.remove_selected_marker()
-            self.app_state.overlay.sync_with_window()
-    def on_move_aaa(self):
-        d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
-        if d:
-            old_base,new_base=self.app_state.file_manager.move_dir(d)
-            self.app_state.buffer.on_aaa_moved(old_base,new_base)
-    def start_training_threads(self):
-        if self.app_state.left_thread is None or not self.app_state.left_thread.is_alive():
-            self.app_state.left_thread=LeftHandThread(self.app_state)
-            self.app_state.left_thread.start()
-        if self.app_state.right_thread is None or not self.app_state.right_thread.is_alive():
-            self.app_state.right_thread=RightHandThread(self.app_state)
-            self.app_state.right_thread.start()
-    def stop_training_threads(self):
-        threads=[]
-        if self.app_state.left_thread is not None:
-            self.app_state.left_thread.stop_flag=True
-            threads.append(("left_thread",self.app_state.left_thread))
-        if self.app_state.right_thread is not None:
-            self.app_state.right_thread.stop_flag=True
-            threads.append(("right_thread",self.app_state.right_thread))
-        for name,thr in threads:
-            try:
-                thr.join(timeout=1.0)
-            except Exception as e:
-                logger.warning("线程关闭失败:%s",e)
-            setattr(self.app_state,name,None)
-    def on_timer(self):
-        self.rate_controller.refresh()
-        self.maybe_init()
-        self.app_state.update_window_rect()
-        snap=self.app_state.get_state_snapshot()
-        self.metricsLabelA.setText("A:"+str(snap["metrics"]["A"]))
-        self.metricsLabelB.setText("B:"+str(snap["metrics"]["B"]))
-        self.metricsLabelC.setText("C:"+str(snap["metrics"]["C"]))
-        self.heroDeadLabel.setText("英雄存活:否" if snap["hero_dead"] else "英雄存活:是")
-        cds=snap["cooldowns"]
-        cd_text="冷却:"+",".join([k+":"+("冷却" if cds.get(k,False) else "可用") for k in ["recall","heal","flash","basic","skill1","skill2","skill3","skill4","active_item","cancel"]])
-        self.cooldownLabel.setText(cd_text)
-        self.progressBar.setValue(snap["progress"])
-        if self.app_state.overlay:
-            self.app_state.overlay.sync_with_window()
-        visible_ok=window_visible(self.app_state.hwnd) if self.app_state.hwnd else False
-        self.app_state.set_visibility_paused(not visible_ok)
-        if self.app_state.mode==Mode.LEARNING:
-            if self.app_state.should_switch_to_training():
-                self.app_state.set_mode(Mode.TRAINING)
-                self.modeLabel.setText("模式:训练")
-                self.app_state.recording=True
-                self.start_training_threads()
-        elif self.app_state.mode==Mode.TRAINING:
-            if self.app_state.must_back_to_learning():
-                self.app_state.set_mode(Mode.LEARNING)
-                self.modeLabel.setText("模式:学习")
-                self.app_state.recording=True
-                self.stop_training_threads()
-        elif self.app_state.mode==Mode.OPTIMIZING:
-            if self.optimize_thread and (not self.optimize_thread.is_alive()):
-                self.cancelOptimizeBtn.setEnabled(False)
-                QtWidgets.QMessageBox.information(self,"优化完成","优化完成")
-                self.app_state.set_mode(Mode.LEARNING)
-                self.modeLabel.setText("模式:学习")
-                self.app_state.recording=True
-        elif self.app_state.mode==Mode.CONFIGURING:
-            pass
 def main():
     app=QtWidgets.QApplication(sys.argv)
+    ensure_qt_classes()
     rate_controller=HardwareAdaptiveRate()
     rate_controller.refresh(True)
     file_manager=AAAFileManager()
