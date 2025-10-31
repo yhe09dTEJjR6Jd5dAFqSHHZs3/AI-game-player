@@ -2302,6 +2302,7 @@ class HardwareAdaptiveRate:
         self.cpu_load=0.0
         self.mem_free=0.5
         self.gpu_free=0.5
+        self.gpu_usage=0.5
         self.last_refresh=0.0
         self.visual_level=1
         self.lock=threading.Lock()
@@ -2436,9 +2437,10 @@ class HardwareAdaptiveRate:
             self.cpu_load=cpu
             self.mem_free=mem
             self.gpu_free=gpu
+            gpu_ratio=clamp(gpu,0.0,1.0)
+            self.gpu_usage=float(clamp(1.0-gpu_ratio,0.0,1.0))
             cpu_ratio=clamp(cpu/100.0,0.0,1.0)
             mem_ratio=clamp(mem,0.0,1.0)
-            gpu_ratio=clamp(gpu,0.0,1.0)
             latencies=self._aggregate_latencies()
             cpu_error=self.cpu_target-cpu_ratio
             mem_error=mem_ratio-self.mem_target
@@ -2517,9 +2519,9 @@ class HardwareAdaptiveRate:
             self.parallel_plan={"time":time.time(),"batch":self.batch_size,"parallel":self.parallel,"device":str(self.device),"monitor":self.monitor_interval,"hand_interval":self.hand_interval}
     def get_hz(self):
         with self.lock:
-            score=(1.0-self.cpu_load/100.0)*0.4+self.mem_free*0.2+self.gpu_free*0.4
-            score=clamp(score,0.0,1.0)
-            hz=int(max(1,min(120,int(1.0+score*(120.0-1.0)))))
+            usage=self.gpu_usage if hasattr(self,'gpu_usage') else float(clamp(1.0-self.gpu_free,0.0,1.0))
+            availability=float(clamp(1.0-usage,0.0,1.0))
+            hz=int(max(1,round(100.0*availability)))
             return hz
     def suggest_batch_size(self):
         with self.lock:
@@ -2538,12 +2540,11 @@ class HardwareAdaptiveRate:
             return self.visual_level
     def suggest_visual_size(self):
         with self.lock:
-            level=self.visual_level
+            usage=self.gpu_usage if hasattr(self,'gpu_usage') else float(clamp(1.0-self.gpu_free,0.0,1.0))
             vw,vh=self.viewport_size
         vw=max(1,vw)
         vh=max(1,vh)
-        scale_map={0:0.45,1:0.6,2:0.8,3:1.0}
-        scale=scale_map.get(level,0.6)
+        scale=float(clamp(1.0-usage,0.0,1.0))
         tw=int(max(1,round(vw*scale)))
         th=int(max(1,round(vh*scale)))
         return min(tw,vw),min(th,vh)
