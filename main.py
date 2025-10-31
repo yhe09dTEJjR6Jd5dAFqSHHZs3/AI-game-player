@@ -333,7 +333,8 @@ def build_right_decode_table(mapping):
     return table
 RIGHT_ACTION_MAPPING=build_right_mapping()
 RIGHT_ACTION_TABLE=build_right_decode_table(RIGHT_ACTION_MAPPING)
-MARKER_SPEC={"移动轮盘":{"color":(255,0,0),"radius":0.14,"alpha":0.5,"required":True,"pos":(0.2,0.78)},"回城":{"color":(255,165,0),"radius":0.08,"alpha":0.5,"required":True,"pos":(0.88,0.82)},"恢复":{"color":(0,255,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.74,0.82)},"闪现":{"color":(255,255,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.62,0.82)},"普攻":{"color":(0,0,255),"radius":0.07,"alpha":0.5,"required":True,"pos":(0.86,0.68)},"一技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.74,0.64)},"二技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.88,0.56)},"三技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.66,0.52)},"四技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.94,0.48)},"取消施法":{"color":(0,0,0),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.5,0.5)},"主动装备":{"color":(128,0,128),"radius":0.06,"alpha":0.5,"required":True,"pos":(0.7,0.75)},"数据A":{"color":(200,200,0),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.1,0.1)},"数据B":{"color":(0,200,200),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.2,0.1)},"数据C":{"color":(200,0,200),"radius":0.05,"alpha":0.5,"required":True,"pos":(0.3,0.1)}}
+MARKER_SPEC={"移动轮盘":{"color":(255,0,0),"radius":0.14,"alpha":0.5,"required":False,"pos":(0.2,0.78)},"回城":{"color":(255,165,0),"radius":0.08,"alpha":0.5,"required":False,"pos":(0.88,0.82)},"恢复":{"color":(0,255,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.74,0.82)},"闪现":{"color":(255,255,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.62,0.82)},"普攻":{"color":(0,0,255),"radius":0.07,"alpha":0.5,"required":False,"pos":(0.86,0.68)},"一技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.74,0.64)},"二技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.88,0.56)},"三技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.66,0.52)},"四技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.94,0.48)},"取消施法":{"color":(0,0,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.5,0.5)},"主动装备":{"color":(128,0,128),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.7,0.75)},"数据A":{"color":(200,200,0),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.1,0.1)},"数据B":{"color":(0,200,200),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.2,0.1)},"数据C":{"color":(200,0,200),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.3,0.1)}}
+OVERLAY_HANDLES=set()
 def verify_dependencies():
     return dependency_manager.verify()
 def get_desktop_path():
@@ -1801,6 +1802,8 @@ def ensure_qt_classes():
             self.setAttribute(QtCore.Qt.WA_TranslucentBackground,True)
             self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
             self.app_state=app_state
+            global OVERLAY_HANDLES
+            OVERLAY_HANDLES.add(int(self.winId()))
             self.markers=[]
             self.selected_marker=None
             self.config_mode=False
@@ -1949,6 +1952,8 @@ def ensure_qt_classes():
             self._update_marker_visibility(True)
             self.sync_with_window()
         def sync_with_window(self):
+            global OVERLAY_HANDLES
+            OVERLAY_HANDLES.add(int(self.winId()))
             with self.app_state.lock:
                 hwnd=self.app_state.hwnd
                 rect=self.app_state.window_rect
@@ -2995,6 +3000,8 @@ def window_visible(hwnd):
         except Exception as e:
             logger.warning("窗口点检测失败:%s",e)
             top_root=None
+        if top_root and top_root in OVERLAY_HANDLES:
+            continue
         if top_root not in [target_root,hwnd]:
             try:
                 ex=win32gui.GetWindowLong(top_root,win32con.GWL_EXSTYLE)
