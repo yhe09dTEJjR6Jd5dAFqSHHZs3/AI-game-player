@@ -2129,7 +2129,7 @@ def ensure_qt_classes():
                 except Exception:
                     continue
                 item=QtWidgets.QListWidgetItem(title)
-                item.setData(QtCore.Qt.UserRole,(hwnd,rect))
+                item.setData(QtCore.Qt.UserRole,(hwnd,rect,title))
                 self.listWidget.addItem(item)
         def selected(self):
             item=self.listWidget.currentItem()
@@ -2150,18 +2150,28 @@ def ensure_qt_classes():
             self.modeLabel=QtWidgets.QLabel("模式:初始化")
             self.windowStatusLabel=QtWidgets.QLabel("窗口:未选择")
             self.windowStatusLabel.setStyleSheet("color:#888888")
+            self.windowNameLabel=QtWidgets.QLabel("窗口名称:未选择")
+            self.windowVisibleLabel=QtWidgets.QLabel("窗口可见:否")
             self.metricsLabelA=QtWidgets.QLabel("A:0")
             self.metricsLabelB=QtWidgets.QLabel("B:0")
             self.metricsLabelC=QtWidgets.QLabel("C:0")
-            self.heroDeadLabel=QtWidgets.QLabel("英雄存活:是")
-            self.cooldownLabel=QtWidgets.QLabel("冷却信息")
-            self.statusLayout.addWidget(self.modeLabel,0,0,1,2)
-            self.statusLayout.addWidget(self.windowStatusLabel,0,2)
-            self.statusLayout.addWidget(self.metricsLabelA,1,0)
-            self.statusLayout.addWidget(self.metricsLabelB,1,1)
-            self.statusLayout.addWidget(self.metricsLabelC,1,2)
-            self.statusLayout.addWidget(self.heroDeadLabel,2,0)
-            self.statusLayout.addWidget(self.cooldownLabel,2,1,1,2)
+            self.heroDeadLabel=QtWidgets.QLabel("英雄阵亡:否")
+            self.markerSummaryLabel=QtWidgets.QLabel("标志:[]")
+            self.markerSummaryLabel.setWordWrap(True)
+            self.resourceLabel=QtWidgets.QLabel("资源:CPU0.0% 内存0.0% GPU0.0% 显存0.0% 频率0Hz 缩放1.00")
+            self.cooldownLabel=QtWidgets.QLabel("冷却:一技能(否) 二技能(否) 三技能(否) 四技能(否) 主动装备(否) 恢复(否) 闪现(否)")
+            self.cooldownLabel.setWordWrap(True)
+            self.statusLayout.addWidget(self.modeLabel,0,0)
+            self.statusLayout.addWidget(self.windowNameLabel,0,1,1,2)
+            self.statusLayout.addWidget(self.windowStatusLabel,1,0)
+            self.statusLayout.addWidget(self.windowVisibleLabel,1,1)
+            self.statusLayout.addWidget(self.heroDeadLabel,1,2)
+            self.statusLayout.addWidget(self.metricsLabelA,2,0)
+            self.statusLayout.addWidget(self.metricsLabelB,2,1)
+            self.statusLayout.addWidget(self.metricsLabelC,2,2)
+            self.statusLayout.addWidget(self.resourceLabel,3,0,1,3)
+            self.statusLayout.addWidget(self.markerSummaryLabel,4,0,1,3)
+            self.statusLayout.addWidget(self.cooldownLabel,5,0,1,3)
             self.mainLayout.addWidget(self.statusGroup)
             self.progressBar=QtWidgets.QProgressBar()
             self.mainLayout.addWidget(self.progressBar)
@@ -2346,10 +2356,9 @@ def ensure_qt_classes():
             self.metricsLabelA.setText("A:"+str(snap["metrics"].get("A",0)))
             self.metricsLabelB.setText("B:"+str(snap["metrics"].get("B",0)))
             self.metricsLabelC.setText("C:"+str(snap["metrics"].get("C",0)))
-            self.heroDeadLabel.setText("英雄存活:"+("否" if snap["hero_dead"] else "是"))
-            cd=snap["cooldowns"]
-            cd_text="冷却:"+",".join(["%s:%s"%(k,"是" if v else "否") for k,v in cd.items()])
-            self.cooldownLabel.setText(cd_text)
+            self.heroDeadLabel.setText("英雄阵亡:"+("是" if snap["hero_dead"] else "否"))
+            window_name=snap.get("window_title") or "未选择"
+            self.windowNameLabel.setText("窗口名称:"+window_name)
             self.progressBar.setValue(int(snap["progress"]))
             running_opt=self.app_state.optimization_running()
             rect=snap["window_rect"]
@@ -2357,8 +2366,11 @@ def ensure_qt_classes():
             if not has_window:
                 self.windowStatusLabel.setText("窗口:未选择")
                 self.windowStatusLabel.setStyleSheet("color:#888888")
+                self.windowVisibleLabel.setText("窗口可见:否")
             else:
-                if snap.get("window_visible") and not snap["paused"]:
+                visible=snap.get("window_visible") and not snap["paused"]
+                self.windowVisibleLabel.setText("窗口可见:"+("是" if visible else "否"))
+                if visible:
                     self.windowStatusLabel.setText("窗口:可用")
                     self.windowStatusLabel.setStyleSheet("color:#009944")
                 elif not snap.get("window_visible"):
@@ -2367,6 +2379,15 @@ def ensure_qt_classes():
                 else:
                     self.windowStatusLabel.setText("窗口:暂停")
                     self.windowStatusLabel.setStyleSheet("color:#cc6600")
+            markers_list=snap.get("markers") or []
+            markers_text="标志:["+",".join(markers_list)+"]" if markers_list else "标志:[]"
+            self.markerSummaryLabel.setText(markers_text)
+            cd=snap["cooldowns"]
+            cd_order=[("一技能","skill1"),("二技能","skill2"),("三技能","skill3"),("四技能","skill4"),("主动装备","active_item"),("恢复","heal"),("闪现","flash")]
+            parts=[]
+            for label,key in cd_order:
+                parts.append("%s(%s)"%(label,"是" if cd.get(key,False) else "否"))
+            self.cooldownLabel.setText("冷却:"+" ".join(parts))
             self.chooseWindowBtn.setEnabled(snap["ready"])
             self.optimizeBtn.setEnabled(snap["mode"]==Mode.LEARNING and snap["ready"] and has_window and not running_opt)
             self.cancelOptimizeBtn.setEnabled(running_opt)
@@ -2380,19 +2401,30 @@ def ensure_qt_classes():
             buffer_metrics=self.app_state.buffer.get_performance_metrics()
             self.perfView.clear()
             resources=perf["resources"]
-            cpu_usage=resources.get("cpu",0.0)
-            mem_raw=resources.get("mem",0.0)
-            gpu_raw=resources.get("gpu",0.0)
-            mem_usage=mem_raw if mem_raw>100.0 else (1.0-max(0.0,min(mem_raw,1.0)))*100.0
-            gpu_usage=gpu_raw if gpu_raw>100.0 else (1.0-max(0.0,min(gpu_raw,1.0)))*100.0
+            cpu_val=resources.get("cpu",0.0)
+            mem_val=resources.get("mem",0.0)
+            gpu_mem_val=resources.get("gpu",0.0)
+            gpu_util_val=resources.get("gpu_util",0.0)
+            cpu_usage=float(cpu_val if cpu_val is not None else 0.0)
+            mem_raw=float(mem_val if mem_val is not None else 0.0)
+            gpu_mem_raw=float(gpu_mem_val if gpu_mem_val is not None else 0.0)
+            gpu_util_raw=float(gpu_util_val if gpu_util_val is not None else 0.0)
+            mem_usage_ratio=float(max(0.0,min(1.0,1.0-mem_raw if mem_raw<=1.0 else mem_raw/100.0)))
+            vram_usage_ratio=float(max(0.0,min(1.0,1.0-gpu_mem_raw if gpu_mem_raw<=1.0 else gpu_mem_raw/100.0)))
+            gpu_util_ratio=float(max(0.0,min(1.0,gpu_util_raw/100.0 if gpu_util_raw>1.0 else gpu_util_raw)))
+            mem_usage=mem_usage_ratio*100.0
+            vram_usage=vram_usage_ratio*100.0
+            gpu_usage=gpu_util_ratio*100.0
             res_item=QtWidgets.QTreeWidgetItem(["CPU","%.1f%%"%cpu_usage])
             mem_item=QtWidgets.QTreeWidgetItem(["内存","%.1f%%"%mem_usage])
             gpu_item=QtWidgets.QTreeWidgetItem(["GPU","%.1f%%"%gpu_usage])
+            vram_item=QtWidgets.QTreeWidgetItem(["显存","%.1f%%"%vram_usage])
             plan_item=QtWidgets.QTreeWidgetItem(["并行","批次:%d 流:%d"%(perf["plan"].get("batch_size",0),perf["plan"].get("parallel",0))])
             plan_item.addChild(QtWidgets.QTreeWidgetItem(["间隔","截图%.3fs 手%.3fs"%(perf["plan"].get("monitor_interval",0.0),perf["plan"].get("hand_interval",0.0))]))
             self.perfView.addTopLevelItem(res_item)
             self.perfView.addTopLevelItem(mem_item)
             self.perfView.addTopLevelItem(gpu_item)
+            self.perfView.addTopLevelItem(vram_item)
             self.perfView.addTopLevelItem(plan_item)
             latency_item=QtWidgets.QTreeWidgetItem(["时延","-"])
             for key,value in perf["latency"].items():
@@ -2422,6 +2454,10 @@ def ensure_qt_classes():
                 failure_item.addChild(QtWidgets.QTreeWidgetItem([last.get("hand","?"),last.get("reason","")]))
             self.perfView.addTopLevelItem(failure_item)
             self.perfView.expandAll()
+            m_ratio=max(mem_usage_ratio,vram_usage_ratio)
+            hz=int(max(1,round(100.0*(1.0-m_ratio))))
+            scale=max(0.0,1.0-m_ratio)
+            self.resourceLabel.setText("资源:CPU%.1f%% 内存%.1f%% GPU%.1f%% 显存%.1f%% 频率%dHz 缩放%.2f"%(cpu_usage,mem_usage,gpu_usage,vram_usage,hz,scale))
         def on_choose_window(self):
             ensure_qt_classes()
             dlg=_WindowSelectorDialog(self)
@@ -2432,8 +2468,8 @@ def ensure_qt_classes():
             if dlg.exec_()==QtWidgets.QDialog.Accepted:
                 selected=dlg.selected()
                 if selected:
-                    hwnd,rect=selected
-                    app.on_window_selected(hwnd,rect)
+                    hwnd,rect,title=selected
+                    app.on_window_selected(hwnd,rect,title)
                     app.mark_user_input()
                     QtWidgets.QMessageBox.information(self,"学习模式","窗口已选择，已进入学习模式")
         def on_optimize(self):
@@ -2531,7 +2567,7 @@ def ensure_qt_classes():
                 except Exception as e:
                     payload=(callback,False,str(e))
                 if callback:
-                    QtCore.QMetaObject.invokeMethod(self,"_finish_async_save",QtCore.Qt.QueuedConnection,QtCore.Q_ARG(object,payload))
+                    QtCore.QTimer.singleShot(0,lambda payload=payload:self._finish_async_save(payload))
             threading.Thread(target=worker,daemon=True).start()
         def _finish_async_save(self,payload):
             callback,success,message=payload
@@ -2599,11 +2635,14 @@ class HardwareAdaptiveRate:
         self.mem_free=0.5
         self.gpu_free=0.5
         self.gpu_usage=0.5
+        self.mem_usage_ratio=0.5
+        self.vram_usage_ratio=0.5
+        self.gpu_util_ratio=0.5
         self.last_refresh=0.0
         self.visual_level=1
         self.lock=threading.Lock()
         self.snapshot_lock=threading.Lock()
-        self.snapshot={"cpu":0.0,"mem":0.5,"gpu":0.5,"time":0.0}
+        self.snapshot={"cpu":0.0,"mem":0.5,"gpu":0.5,"gpu_util":0.0,"time":0.0}
         self.monitor_stop=False
         self.monitor_interval=0.75
         self._ema_cpu=None
@@ -2641,6 +2680,7 @@ class HardwareAdaptiveRate:
             logger.error("获取内存信息失败:%s",e)
             mem_free=0.0
         gpu_free=0.5
+        gpu_util=0.0
         if torch.cuda.is_available():
             try:
                 props=torch.cuda.get_device_properties(0)
@@ -2649,10 +2689,21 @@ class HardwareAdaptiveRate:
                 reserved=float(torch.cuda.memory_reserved(0))
                 used=max(allocated,reserved)
                 gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
+                try:
+                    util=torch.cuda.utilization(0)
+                except Exception:
+                    try:
+                        util=torch.cuda.utilization()
+                    except Exception:
+                        util=None
+                if util is None:
+                    gpu_util=float(clamp((1.0-gpu_free)*100.0,0.0,100.0))
+                else:
+                    gpu_util=float(clamp(util,0.0,100.0))
             except Exception as e:
                 logger.warning("获取GPU信息失败:%s",e)
                 gpu_free=0.5
-        return {"cpu":cpu,"mem":mem_free,"gpu":gpu_free,"time":time.time()}
+        return {"cpu":cpu,"mem":mem_free,"gpu":gpu_free,"gpu_util":gpu_util,"time":time.time()}
     def _apply_snapshot(self,snap):
         if self._ema_cpu is None:
             self._ema_cpu=snap["cpu"]
@@ -2667,6 +2718,7 @@ class HardwareAdaptiveRate:
             self.snapshot["cpu"]=self._ema_cpu
             self.snapshot["mem"]=self._ema_mem
             self.snapshot["gpu"]=self._ema_gpu
+            self.snapshot["gpu_util"]=snap.get("gpu_util",0.0)
             self.snapshot["time"]=snap["time"]
     def _discover_devices(self):
         pool=[{"device":torch.device("cpu"),"index":None}]
@@ -2730,13 +2782,21 @@ class HardwareAdaptiveRate:
                 cpu=self.snapshot["cpu"]
                 mem=self.snapshot["mem"]
                 gpu=self.snapshot["gpu"]
+                gpu_util_val=self.snapshot.get("gpu_util",0.0)
             self.cpu_load=cpu
             self.mem_free=mem
             self.gpu_free=gpu
             gpu_ratio=clamp(gpu,0.0,1.0)
-            self.gpu_usage=float(clamp(1.0-gpu_ratio,0.0,1.0))
+            mem_ratio_free=clamp(mem,0.0,1.0)
+            util_ratio=float(clamp(gpu_util_val/100.0 if gpu_util_val>1.0 else gpu_util_val,0.0,1.0))
+            if util_ratio==0.0:
+                util_ratio=float(clamp(1.0-gpu_ratio,0.0,1.0))
+            self.gpu_usage=util_ratio
+            self.gpu_util_ratio=util_ratio
+            self.mem_usage_ratio=float(clamp(1.0-mem_ratio_free,0.0,1.0))
+            self.vram_usage_ratio=float(clamp(1.0-gpu_ratio,0.0,1.0))
             cpu_ratio=clamp(cpu/100.0,0.0,1.0)
-            mem_ratio=clamp(mem,0.0,1.0)
+            mem_ratio=mem_ratio_free
             latencies=self._aggregate_latencies()
             cpu_error=self.cpu_target-cpu_ratio
             mem_error=mem_ratio-self.mem_target
@@ -2815,9 +2875,8 @@ class HardwareAdaptiveRate:
             self.parallel_plan={"time":time.time(),"batch":self.batch_size,"parallel":self.parallel,"device":str(self.device),"monitor":self.monitor_interval,"hand_interval":self.hand_interval}
     def get_hz(self):
         with self.lock:
-            usage=self.gpu_usage if hasattr(self,'gpu_usage') else float(clamp(1.0-self.gpu_free,0.0,1.0))
-            availability=float(clamp(1.0-usage,0.0,1.0))
-            hz=int(max(1,round(100.0*availability)))
+            m_ratio=max(self.mem_usage_ratio,self.vram_usage_ratio)
+            hz=int(max(1,round(100.0*(1.0-m_ratio))))
             return hz
     def suggest_batch_size(self):
         with self.lock:
@@ -2836,11 +2895,11 @@ class HardwareAdaptiveRate:
             return self.visual_level
     def suggest_visual_size(self):
         with self.lock:
-            usage=self.gpu_usage if hasattr(self,'gpu_usage') else float(clamp(1.0-self.gpu_free,0.0,1.0))
+            m_ratio=max(self.mem_usage_ratio,self.vram_usage_ratio)
             vw,vh=self.viewport_size
         vw=max(1,vw)
         vh=max(1,vh)
-        scale=float(clamp(1.0-usage,0.0,1.0))
+        scale=float(clamp(1.0-m_ratio,0.0,1.0))
         tw=int(max(1,round(vw*scale)))
         th=int(max(1,round(vh*scale)))
         return min(tw,vw),min(th,vh)
@@ -3031,6 +3090,7 @@ class AppState:
         self.ready=False
         self.hwnd=None
         self.window_rect=(0,0,0,0)
+        self.window_title=""
         self.recording=False
         self.hero_dead=False
         self.in_recall=False
@@ -3067,6 +3127,20 @@ class AppState:
         with self.lock:
             if self.hwnd is not None:
                 self.window_rect=get_window_rect(self.hwnd)
+    def refresh_window_title(self):
+        with self.lock:
+            hwnd=self.hwnd
+        if hwnd is None:
+            with self.lock:
+                self.window_title=""
+            return ""
+        try:
+            title=win32gui.GetWindowText(hwnd)
+        except Exception:
+            title=""
+        with self.lock:
+            self.window_title=title or ""
+            return self.window_title
     def set_mode(self,m):
         with self.lock:
             self.mode=m
@@ -3159,7 +3233,9 @@ class AppState:
                 visible=window_visible(self.hwnd) if self.hwnd is not None else False
             except Exception:
                 visible=False
-            return {"mode":self.mode,"metrics":self.metrics,"hero_dead":self.hero_dead,"in_recall":self.in_recall,"cooldowns":self.cooldowns,"progress":self.progress,"window_rect":self.window_rect,"ready":self.ready,"paused":self.paused_by_visibility,"window_visible":visible}
+            overlay=self.overlay
+            markers=[m.label for m in overlay.markers] if overlay else []
+            return {"mode":self.mode,"metrics":self.metrics,"hero_dead":self.hero_dead,"in_recall":self.in_recall,"cooldowns":self.cooldowns,"progress":self.progress,"window_rect":self.window_rect,"ready":self.ready,"paused":self.paused_by_visibility,"window_visible":visible,"window_title":self.window_title,"markers":markers}
     def set_progress(self,v):
         with self.lock:
             self.progress=v
@@ -3207,10 +3283,17 @@ class AppState:
         self.overlay.ensure_required_markers(self.marker_spec)
         self.overlay.sync_with_window()
         return self.overlay
-    def on_window_selected(self,hwnd,rect):
+    def on_window_selected(self,hwnd,rect,title=None):
+        name=title
+        if not name:
+            try:
+                name=win32gui.GetWindowText(hwnd)
+            except Exception:
+                name=""
         with self.lock:
             self.hwnd=hwnd
             self.window_rect=rect
+            self.window_title=name or ""
             self.agent.reset_neuro_state()
             self.last_user_input=time.time()
             self.mode=Mode.LEARNING
@@ -3394,6 +3477,7 @@ class ScreenshotRecorder(threading.Thread):
                 time.sleep(dt)
                 continue
             rect=get_window_rect(hwnd)
+            self.app_state.refresh_window_title()
             self.rate_controller.update_viewport(rect)
             with self.app_state.lock:
                 self.app_state.window_rect=rect
