@@ -1640,6 +1640,9 @@ def ensure_qt_classes():
             self.last_pos=None
             self.placeholder=False
             self.modified=False
+            self.handle_mode=None
+            self.handle_radius=9
+            self.setMouseTracking(True)
         def _notify_parent_change(self,final=False):
             p=self.parent()
             if hasattr(p,"on_marker_adjusted"):
@@ -1667,16 +1670,25 @@ def ensure_qt_classes():
             qp.drawEllipse(QtCore.QPointF(self.width()/2,self.height()/2),r-2,r-2)
             qp.setPen(QtGui.QPen(QtGui.QColor(255,255,255,255),1))
             qp.drawText(self.rect(),QtCore.Qt.AlignCenter,self.label)
+            if self.selected or self.resizing:
+                qp.setBrush(QtGui.QBrush(QtGui.QColor(255,255,255,200)))
+                qp.setPen(QtGui.QPen(QtGui.QColor(0,0,0,220),1))
+                for pos in self._handle_positions().values():
+                    size=6
+                    qp.drawRect(QtCore.QRectF(pos.x()-size/2,pos.y()-size/2,size,size))
         def mousePressEvent(self,event):
             pos=event.pos()
             r=min(self.width(),self.height())/2
             center=QtCore.QPointF(self.width()/2,self.height()/2)
             dist=((pos.x()-center.x())**2+(pos.y()-center.y())**2)**0.5
-            edge=abs(dist-r)<8
-            if edge:
+            handle=self._hit_test_handle(pos)
+            if handle:
                 self.resizing=True
-            else:
+                self.handle_mode=handle
+                self.dragging=False
+            elif dist<=r:
                 self.dragging=True
+                self.handle_mode=None
             self.selected=True
             p=self.parent()
             self.modified=False
@@ -1693,8 +1705,11 @@ def ensure_qt_classes():
             self.last_pos=event.globalPos()
             self.update()
         def mouseMoveEvent(self,event):
-            if not self.last_pos:
+            if not self.dragging and not self.resizing:
+                self._update_cursor(event.pos())
                 return
+            if not self.last_pos:
+                self.last_pos=event.globalPos()
             delta=event.globalPos()-self.last_pos
             pr=self.parent()
             w=pr.width()
@@ -1707,9 +1722,12 @@ def ensure_qt_classes():
                 self.y_pct=clamp(cy/float(h),0.0,1.0)
                 changed=delta.x()!=0 or delta.y()!=0
             elif self.resizing:
-                r=int(self.r_pct*min(w,h))+max(delta.x(),delta.y())
-                self.r_pct=clamp(r/float(min(w,h)),0.01,0.5)
-                changed=max(delta.x(),delta.y())!=0
+                direction=self._handle_direction(self.handle_mode)
+                proj=delta.x()*direction.x()+delta.y()*direction.y()
+                base=self.r_pct*min(w,h)
+                base=max(1.0,base+proj)
+                self.r_pct=clamp(base/float(min(w,h)),0.01,0.5)
+                changed=proj!=0
             self.last_pos=event.globalPos()
             self.update_geometry_from_parent()
             if changed:
@@ -1718,10 +1736,65 @@ def ensure_qt_classes():
         def mouseReleaseEvent(self,event):
             self.dragging=False
             self.resizing=False
+            self.handle_mode=None
             self.last_pos=None
             if self.modified:
                 self._notify_parent_change(True)
+            p=self.parent()
+            if hasattr(p,"selected_marker") and getattr(p,"selected_marker") is self:
+                self.selected=True
             self.modified=False
+            self._update_cursor(event.pos())
+            self.update()
+        def leaveEvent(self,event):
+            self._update_cursor(None)
+        def wheelEvent(self,event):
+            delta=event.angleDelta().y()/120.0
+            if delta==0:
+                return
+            pr=self.parent()
+            size=float(min(pr.width(),pr.height()))
+            radius=max(1.0,self.r_pct*size+delta*size*0.02)
+            prev=self.r_pct
+            self.r_pct=clamp(radius/size,0.01,0.5)
+            if self.r_pct!=prev:
+                self.update_geometry_from_parent()
+                self.modified=True
+                self._notify_parent_change(False)
+        def _handle_positions(self):
+            center=QtCore.QPointF(self.width()/2,self.height()/2)
+            r=min(self.width(),self.height())/2
+            offsets={"north":QtCore.QPointF(0,-r),"south":QtCore.QPointF(0,r),"east":QtCore.QPointF(r,0),"west":QtCore.QPointF(-r,0),"ne":QtCore.QPointF(r*0.7071,-r*0.7071),"nw":QtCore.QPointF(-r*0.7071,-r*0.7071),"se":QtCore.QPointF(r*0.7071,r*0.7071),"sw":QtCore.QPointF(-r*0.7071,r*0.7071)}
+            return {key:QtCore.QPointF(center.x()+vec.x(),center.y()+vec.y()) for key,vec in offsets.items()}
+        def _hit_test_handle(self,pos):
+            for key,point in self._handle_positions().items():
+                if ((pos.x()-point.x())**2+(pos.y()-point.y())**2)**0.5<=self.handle_radius:
+                    return key
+            return None
+        def _handle_direction(self,mode):
+            mapping={"north":QtCore.QPointF(0,-1),"south":QtCore.QPointF(0,1),"east":QtCore.QPointF(1,0),"west":QtCore.QPointF(-1,0),"ne":QtCore.QPointF(0.7071,-0.7071),"nw":QtCore.QPointF(-0.7071,-0.7071),"se":QtCore.QPointF(0.7071,0.7071),"sw":QtCore.QPointF(-0.7071,0.7071)}
+            return mapping.get(mode,QtCore.QPointF(1,0))
+        def _update_cursor(self,pos):
+            if pos is None:
+                self.setCursor(QtCore.Qt.ArrowCursor)
+                return
+            handle=self._hit_test_handle(pos)
+            if handle in ["east","west"]:
+                self.setCursor(QtCore.Qt.SizeHorCursor)
+            elif handle in ["north","south"]:
+                self.setCursor(QtCore.Qt.SizeVerCursor)
+            elif handle in ["ne","sw"]:
+                self.setCursor(QtCore.Qt.SizeBDiagCursor)
+            elif handle in ["nw","se"]:
+                self.setCursor(QtCore.Qt.SizeFDiagCursor)
+            else:
+                center=QtCore.QPointF(self.width()/2,self.height()/2)
+                r=min(self.width(),self.height())/2
+                dist=((pos.x()-center.x())**2+(pos.y()-center.y())**2)**0.5
+                if dist<=r:
+                    self.setCursor(QtCore.Qt.SizeAllCursor)
+                else:
+                    self.setCursor(QtCore.Qt.ArrowCursor)
     class _OverlayWindow(QtWidgets.QWidget):
         def __init__(self,app_state):
             super(_OverlayWindow,self).__init__(None,QtCore.Qt.WindowStaysOnTopHint|QtCore.Qt.FramelessWindowHint|QtCore.Qt.Tool)
@@ -1735,7 +1808,6 @@ def ensure_qt_classes():
             self._overlay_visible=False
             self.undo_stack=deque(maxlen=32)
             self.redo_stack=deque(maxlen=32)
-            self.heatmap=None
             self.last_save_prompt=time.time()
             self._history_enabled=True
             self.editing_marker=None
@@ -1743,6 +1815,7 @@ def ensure_qt_classes():
             self.sync_timer=QtCore.QTimer(self)
             self.sync_timer.timeout.connect(self.sync_with_window)
             self.sync_timer.start(200)
+            self.window_visible=True
         def mark_dirty(self):
             self.dirty=True
         def consume_dirty(self):
@@ -1817,9 +1890,6 @@ def ensure_qt_classes():
             self._update_marker_visibility(True)
             self.mark_dirty()
             self.app_state.mark_user_input()
-        def update_heatmap(self,heatmap):
-            self.heatmap=heatmap
-            self.update()
         def should_prompt_save(self):
             if not self.config_mode:
                 return False
@@ -1831,25 +1901,6 @@ def ensure_qt_classes():
         def paintEvent(self,event):
             qp=QtGui.QPainter(self)
             qp.setRenderHint(QtGui.QPainter.Antialiasing)
-            if self.heatmap:
-                grid=int(self.heatmap.get("grid",0))
-                counts=self.heatmap.get("counts")
-                if grid>0 and counts:
-                    width=float(max(1,self.width()))
-                    height=float(max(1,self.height()))
-                    cell_w=width/grid
-                    cell_h=height/grid
-                    for iy in range(min(grid,len(counts))):
-                        row=counts[iy]
-                        for ix in range(min(grid,len(row))):
-                            value=row[ix]
-                            if value<=0:
-                                continue
-                            alpha=int(clamp(value*600.0,0.0,180.0))
-                            if alpha<=0:
-                                continue
-                            color=QtGui.QColor(255,100,0,alpha)
-                            qp.fillRect(QtCore.QRectF(ix*cell_w,iy*cell_h,cell_w,cell_h),color)
             qp.end()
             QtWidgets.QWidget.paintEvent(self,event)
         def find_marker(self,label):
@@ -1862,16 +1913,17 @@ def ensure_qt_classes():
         def set_overlay_visible(self,visible):
             self._overlay_visible=visible
             self.sync_with_window()
-            self._update_marker_visibility(True)
-            if visible:
+            desired_visible=self._overlay_visible and (not self.config_mode or self.window_visible)
+            if desired_visible:
                 if not self.isVisible():
                     self.show()
             else:
                 if self.isVisible():
                     self.hide()
+            self._update_marker_visibility(True)
         def _update_marker_visibility(self,force=False):
             for m in self.markers:
-                desired=self.config_mode and self._overlay_visible
+                desired=self.config_mode and self._overlay_visible and self.window_visible
                 if force or self._marker_visible_cache.get(m)!=desired:
                     if desired:
                         if not m.isVisible():
@@ -1903,6 +1955,7 @@ def ensure_qt_classes():
             if hwnd is None:
                 if self.isVisible():
                     self.hide()
+                self.window_visible=False
                 return
             try:
                 rect=get_window_rect(hwnd)
@@ -1910,12 +1963,26 @@ def ensure_qt_classes():
                     self.app_state.window_rect=rect
             except Exception as e:
                 logger.debug("同步窗口失败:%s",e)
+            visible_now=window_visible(hwnd)
+            self.window_visible=visible_now
             x1,y1,x2,y2=self.app_state.window_rect
             if x2<=x1 or y2<=y1:
                 if self.isVisible():
                     self.hide()
+                self._update_marker_visibility(True)
                 return
             self.setGeometry(x1,y1,x2-x1,y2-y1)
+            if not visible_now:
+                if self.isVisible():
+                    self.hide()
+                self._update_marker_visibility(True)
+                return
+            if self._overlay_visible and (not self.config_mode or self.window_visible):
+                if not self.isVisible():
+                    self.show()
+            else:
+                if self.isVisible():
+                    self.hide()
             for m in self.markers:
                 m.update_geometry_from_parent()
         def load_from_config(self,records,spec):
@@ -2303,8 +2370,6 @@ def ensure_qt_classes():
             overlay=self.app_state.overlay
             if overlay:
                 overlay.sync_with_window()
-                heatmap=self.app_state.buffer.get_heatmap()
-                overlay.update_heatmap(heatmap)
             self._refresh_marker_list(overlay)
             perf=self.hardware.get_performance_snapshot()
             buffer_metrics=self.app_state.buffer.get_performance_metrics()
@@ -2432,8 +2497,6 @@ def ensure_qt_classes():
             overlay=self.app_state.ensure_overlay_initialized()
             stats=self.app_state.buffer.get_user_click_stats()
             overlay.apply_calibration(stats)
-            heatmap=self.app_state.buffer.get_heatmap()
-            overlay.update_heatmap(heatmap)
         def save_markers_to_manager(self,async_mode=False,callback=None):
             overlay=self.app_state.overlay
             if not overlay:
