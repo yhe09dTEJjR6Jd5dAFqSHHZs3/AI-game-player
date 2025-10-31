@@ -2179,7 +2179,7 @@ def ensure_qt_classes():
             self.optimizeBtn=QtWidgets.QPushButton("优化")
             self.cancelOptimizeBtn=QtWidgets.QPushButton("取消优化")
             self.configBtn=QtWidgets.QPushButton("配置")
-            self.saveConfigBtn=QtWidgets.QPushButton("保存配置")
+            self.saveConfigBtn=QtWidgets.QPushButton("保存")
             self.addMarkerBtn=QtWidgets.QPushButton("添加标志")
             self.delMarkerBtn=QtWidgets.QPushButton("删除标志")
             self.moveAAABtn=QtWidgets.QPushButton("修改AAA位置")
@@ -2302,7 +2302,7 @@ def ensure_qt_classes():
             self.undoBtn.setEnabled(enabled)
             self.redoBtn.setEnabled(enabled)
             self.calibrateBtn.setEnabled(enabled)
-            target_text="保存中..." if self.saving_config and self.app_state.mode==Mode.CONFIGURING else "保存配置"
+            target_text="保存中..." if self.saving_config and self.app_state.mode==Mode.CONFIGURING else "保存"
             if self.saveConfigBtn.text()!=target_text:
                 self.saveConfigBtn.setText(target_text)
         def on_marker_list_clicked(self,item):
@@ -2323,8 +2323,8 @@ def ensure_qt_classes():
             self.saving_config=False
             overlay=self.app_state.overlay
             if success:
-                QtWidgets.QMessageBox.information(self,"已保存","配置已保存")
-                self.app_state.set_mode(Mode.LEARNING)
+                QtWidgets.QMessageBox.information(self,"已保存","配置已保存，已返回学习模式")
+                self.app_state.enter_learning()
                 if overlay:
                     overlay.set_config_mode(False)
                     overlay.set_overlay_visible(False)
@@ -2512,7 +2512,7 @@ def ensure_qt_classes():
             if self.app_state.mode!=Mode.CONFIGURING:
                 return
             if self.saving_config:
-                QtWidgets.QMessageBox.information(self,"保存中","正在保存配置，请稍候")
+                QtWidgets.QMessageBox.information(self,"保存中","正在保存，请稍候")
                 return
             reply=QtWidgets.QMessageBox.question(self,"确认保存","确认保存当前配置？",QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
             if reply!=QtWidgets.QMessageBox.Yes:
