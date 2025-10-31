@@ -1840,7 +1840,7 @@ def ensure_qt_classes():
             self.config_mode=enabled
             if enabled:
                 self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,False)
-                self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
+                self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
                 for m in self.markers:
                     m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
                 self.last_save_prompt=time.time()
@@ -2019,7 +2019,9 @@ def ensure_qt_classes():
             self.setWindowTitle("AAA AI Game Player")
             self.rootWidget=QtWidgets.QWidget(self)
             self.setCentralWidget(self.rootWidget)
-            self.layout=QtWidgets.QGridLayout(self.rootWidget)
+            self.mainLayout=QtWidgets.QVBoxLayout(self.rootWidget)
+            self.statusGroup=QtWidgets.QGroupBox("运行状态")
+            self.statusLayout=QtWidgets.QGridLayout(self.statusGroup)
             self.modeLabel=QtWidgets.QLabel("模式:初始化")
             self.windowStatusLabel=QtWidgets.QLabel("窗口:未选择")
             self.windowStatusLabel.setStyleSheet("color:#888888")
@@ -2028,15 +2030,16 @@ def ensure_qt_classes():
             self.metricsLabelC=QtWidgets.QLabel("C:0")
             self.heroDeadLabel=QtWidgets.QLabel("英雄存活:是")
             self.cooldownLabel=QtWidgets.QLabel("冷却信息")
-            self.layout.addWidget(self.modeLabel,0,0,1,2)
-            self.layout.addWidget(self.windowStatusLabel,0,2)
-            self.layout.addWidget(self.metricsLabelA,1,0)
-            self.layout.addWidget(self.metricsLabelB,1,1)
-            self.layout.addWidget(self.metricsLabelC,1,2)
-            self.layout.addWidget(self.heroDeadLabel,2,0)
-            self.layout.addWidget(self.cooldownLabel,2,1,1,2)
+            self.statusLayout.addWidget(self.modeLabel,0,0,1,2)
+            self.statusLayout.addWidget(self.windowStatusLabel,0,2)
+            self.statusLayout.addWidget(self.metricsLabelA,1,0)
+            self.statusLayout.addWidget(self.metricsLabelB,1,1)
+            self.statusLayout.addWidget(self.metricsLabelC,1,2)
+            self.statusLayout.addWidget(self.heroDeadLabel,2,0)
+            self.statusLayout.addWidget(self.cooldownLabel,2,1,1,2)
+            self.mainLayout.addWidget(self.statusGroup)
             self.progressBar=QtWidgets.QProgressBar()
-            self.layout.addWidget(self.progressBar,3,0,1,3)
+            self.mainLayout.addWidget(self.progressBar)
             self.chooseWindowBtn=QtWidgets.QPushButton("选择窗口")
             self.optimizeBtn=QtWidgets.QPushButton("优化")
             self.cancelOptimizeBtn=QtWidgets.QPushButton("取消优化")
@@ -2048,22 +2051,42 @@ def ensure_qt_classes():
             self.undoBtn=QtWidgets.QPushButton("撤销")
             self.redoBtn=QtWidgets.QPushButton("重做")
             self.calibrateBtn=QtWidgets.QPushButton("标志校准")
+            self.controlGroup=QtWidgets.QGroupBox("操作面板")
+            self.controlLayout=QtWidgets.QGridLayout(self.controlGroup)
+            self.controlLayout.addWidget(self.chooseWindowBtn,0,0)
+            self.controlLayout.addWidget(self.optimizeBtn,0,1)
+            self.controlLayout.addWidget(self.cancelOptimizeBtn,0,2)
+            self.controlLayout.addWidget(self.configBtn,1,0)
+            self.controlLayout.addWidget(self.saveConfigBtn,1,1)
+            self.controlLayout.addWidget(self.moveAAABtn,1,2)
+            self.controlLayout.addWidget(self.addMarkerBtn,2,0)
+            self.controlLayout.addWidget(self.delMarkerBtn,2,1)
+            self.controlLayout.addWidget(self.calibrateBtn,2,2)
+            self.controlLayout.addWidget(self.undoBtn,3,0)
+            self.controlLayout.addWidget(self.redoBtn,3,1)
+            spacer=QtWidgets.QSpacerItem(20,20,QtWidgets.QSizePolicy.Expanding,QtWidgets.QSizePolicy.Minimum)
+            self.controlLayout.addItem(spacer,3,2)
+            self.mainLayout.addWidget(self.controlGroup)
+            self.markerList=QtWidgets.QListWidget()
+            self.markerList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            self.markerList.setAlternatingRowColors(True)
+            self.markerList.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self.markerGroup=QtWidgets.QGroupBox("标志列表")
+            self.markerLayout=QtWidgets.QVBoxLayout(self.markerGroup)
+            self.markerLayout.addWidget(self.markerList)
             self.perfView=QtWidgets.QTreeWidget()
             self.perfView.setColumnCount(2)
             self.perfView.setHeaderLabels(["项目","数值"])
             self.perfView.setRootIsDecorated(False)
-            self.layout.addWidget(self.chooseWindowBtn,4,0)
-            self.layout.addWidget(self.optimizeBtn,4,1)
-            self.layout.addWidget(self.cancelOptimizeBtn,4,2)
-            self.layout.addWidget(self.configBtn,5,0)
-            self.layout.addWidget(self.saveConfigBtn,5,1)
-            self.layout.addWidget(self.addMarkerBtn,6,0)
-            self.layout.addWidget(self.delMarkerBtn,6,1)
-            self.layout.addWidget(self.moveAAABtn,6,2)
-            self.layout.addWidget(self.undoBtn,7,0)
-            self.layout.addWidget(self.redoBtn,7,1)
-            self.layout.addWidget(self.calibrateBtn,7,2)
-            self.layout.addWidget(self.perfView,8,0,1,3)
+            self.perfGroup=QtWidgets.QGroupBox("性能监控")
+            self.perfLayout=QtWidgets.QVBoxLayout(self.perfGroup)
+            self.perfLayout.addWidget(self.perfView)
+            self.infoSplitter=QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+            self.infoSplitter.addWidget(self.markerGroup)
+            self.infoSplitter.addWidget(self.perfGroup)
+            self.infoSplitter.setStretchFactor(0,1)
+            self.infoSplitter.setStretchFactor(1,2)
+            self.mainLayout.addWidget(self.infoSplitter)
             self.cancelOptimizeBtn.setEnabled(False)
             self.saveConfigBtn.setEnabled(False)
             self.addMarkerBtn.setEnabled(False)
@@ -2071,6 +2094,7 @@ def ensure_qt_classes():
             self.undoBtn.setEnabled(False)
             self.redoBtn.setEnabled(False)
             self.calibrateBtn.setEnabled(False)
+            self.markerListSnapshot=[]
             self.overlay=None
             self.chooseWindowBtn.clicked.connect(self.on_choose_window)
             self.optimizeBtn.clicked.connect(self.on_optimize)
@@ -2083,10 +2107,56 @@ def ensure_qt_classes():
             self.undoBtn.clicked.connect(self.on_undo_marker)
             self.redoBtn.clicked.connect(self.on_redo_marker)
             self.calibrateBtn.clicked.connect(self.on_calibrate)
+            self.markerList.itemClicked.connect(self.on_marker_list_clicked)
             self.timer=QtCore.QTimer(self)
             self.timer.timeout.connect(self.on_tick)
             self.timer.start(200)
-            self.last_config_reminder=0.0
+        def _refresh_marker_list(self,overlay):
+            items=[]
+            if overlay:
+                for marker in overlay.markers:
+                    text="%s %.0f%%/%.0f%% r%.0f%%"%(marker.label,marker.x_pct*100.0,marker.y_pct*100.0,marker.r_pct*100.0)
+                    if getattr(marker,"placeholder",False):
+                        text+=" [待定位]"
+                    items.append((marker.label,text))
+            if items!=self.markerListSnapshot:
+                self.markerListSnapshot=list(items)
+                self.markerList.blockSignals(True)
+                self.markerList.clear()
+                for label,text in items:
+                    item=QtWidgets.QListWidgetItem(text)
+                    item.setData(QtCore.Qt.UserRole,label)
+                    self.markerList.addItem(item)
+                self.markerList.blockSignals(False)
+            target=None
+            if overlay and overlay.selected_marker:
+                target=overlay.selected_marker.label
+            if target:
+                for i in range(self.markerList.count()):
+                    item=self.markerList.item(i)
+                    if item.data(QtCore.Qt.UserRole)==target:
+                        if self.markerList.currentRow()!=i:
+                            self.markerList.blockSignals(True)
+                            self.markerList.setCurrentRow(i)
+                            self.markerList.blockSignals(False)
+                        break
+            else:
+                if self.markerList.currentRow()!=-1:
+                    self.markerList.blockSignals(True)
+                    self.markerList.clearSelection()
+                    self.markerList.blockSignals(False)
+        def on_marker_list_clicked(self,item):
+            overlay=self.app_state.overlay
+            if not overlay:
+                return
+            label=item.data(QtCore.Qt.UserRole)
+            marker=overlay.find_marker(label)
+            if not marker:
+                return
+            overlay.selected_marker=marker
+            for m in overlay.markers:
+                m.selected=(m is marker)
+                m.update()
         def on_tick(self):
             if self.app_state.consume_window_prompt():
                 QtWidgets.QMessageBox.information(self,"初始化完成","依赖与资源已就绪，请选择窗口")
@@ -2147,12 +2217,12 @@ def ensure_qt_classes():
                 self.undoBtn.setEnabled(False)
                 self.redoBtn.setEnabled(False)
                 self.calibrateBtn.setEnabled(False)
-            if self.app_state.overlay:
-                self.app_state.overlay.sync_with_window()
+            overlay=self.app_state.overlay
+            if overlay:
+                overlay.sync_with_window()
                 heatmap=self.app_state.buffer.get_heatmap()
-                self.app_state.overlay.update_heatmap(heatmap)
-                if self.app_state.overlay.should_prompt_save():
-                    QtWidgets.QMessageBox.information(self,"提示","请记得保存配置以保留标志调整")
+                overlay.update_heatmap(heatmap)
+            self._refresh_marker_list(overlay)
             perf=self.hardware.get_performance_snapshot()
             buffer_metrics=self.app_state.buffer.get_performance_metrics()
             self.perfView.clear()
@@ -2295,6 +2365,7 @@ def ensure_qt_classes():
                 if marker:
                     marker.selected=True
                     marker.update()
+                self._refresh_marker_list(overlay)
         def on_delete_marker(self):
             overlay=self.app_state.overlay
             if overlay:
@@ -2305,6 +2376,7 @@ def ensure_qt_classes():
                     QtWidgets.QMessageBox.warning(self,"不可删除","该标志为必需项，无法删除")
                     return
                 overlay.remove_selected_marker()
+                self._refresh_marker_list(overlay)
         def on_move_aaa(self):
             d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
             if d:
