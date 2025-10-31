@@ -2392,10 +2392,15 @@ def ensure_qt_classes():
             if self.app_state.mode!=Mode.LEARNING:
                 QtWidgets.QMessageBox.information(self,"切换模式","请在学习模式下进行配置")
                 return
-            self.app_state.set_mode(Mode.CONFIGURING)
             overlay=self.app_state.ensure_overlay_initialized()
-            overlay.set_overlay_visible(True)
+            self.app_state.set_mode(Mode.CONFIGURING)
             overlay.set_config_mode(True)
+            overlay.set_overlay_visible(True)
+            overlay.raise_()
+            overlay.activateWindow()
+            overlay.sync_with_window()
+            self._refresh_marker_list(overlay)
+            self._update_marker_hint(overlay.selected_marker)
             self._sync_config_controls()
         def on_save_config(self):
             if self.app_state.mode!=Mode.CONFIGURING:
@@ -2454,14 +2459,16 @@ def ensure_qt_classes():
             def worker():
                 try:
                     self.app_state.file_manager.save_markers(markers,rect)
-                    success=True
-                    message=""
+                    payload=(callback,True,"")
                 except Exception as e:
-                    success=False
-                    message=str(e)
+                    payload=(callback,False,str(e))
                 if callback:
-                    QtCore.QTimer.singleShot(0,lambda s=success,m=message: callback(s,m))
+                    QtCore.QMetaObject.invokeMethod(self,"_finish_async_save",QtCore.Qt.QueuedConnection,QtCore.Q_ARG(object,payload))
             threading.Thread(target=worker,daemon=True).start()
+        def _finish_async_save(self,payload):
+            callback,success,message=payload
+            if callback:
+                callback(success,message)
         def on_add_marker(self):
             overlay=self.app_state.ensure_overlay_initialized()
             available=overlay.get_missing_labels(self.app_state.marker_spec)
