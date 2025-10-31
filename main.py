@@ -339,7 +339,7 @@ def verify_dependencies():
 def get_desktop_path():
     return os.path.join(os.path.expanduser("~"),"Desktop")
 MODEL_SCHEMA_VERSION=1
-CONFIG_VERSION=2
+CONFIG_VERSION=3
 def _color_to_hex(color):
     if hasattr(color,"name"):
         return color.name()
@@ -359,8 +359,9 @@ class MarkerData:
     r_pct:float
     color:str
     alpha:float
+    placeholder:bool
     def to_dict(self):
-        return {"label":self.label,"x_pct":self.x_pct,"y_pct":self.y_pct,"r_pct":self.r_pct,"color":self.color,"alpha":self.alpha}
+        return {"label":self.label,"x_pct":self.x_pct,"y_pct":self.y_pct,"r_pct":self.r_pct,"color":self.color,"alpha":self.alpha,"placeholder":self.placeholder}
 @dataclass
 class SubsystemContext:
     file_manager:"AAAFileManager"
@@ -397,7 +398,7 @@ class AAAFileManager:
         pos=spec.get("pos",(0.5,0.5))
         radius=float(spec.get("radius",0.05))
         alpha=float(spec.get("alpha",0.5))
-        return MarkerData(label,float(pos[0]),float(pos[1]),clamp(radius,0.01,0.5),color,clamp(alpha,0.0,1.0))
+        return MarkerData(label,float(pos[0]),float(pos[1]),clamp(radius,0.01,0.5),color,clamp(alpha,0.0,1.0),False)
     def _normalize_marker(self,marker,window_rect):
         label=getattr(marker,"label",None)
         if label is None and isinstance(marker,dict):
@@ -432,7 +433,8 @@ class AAAFileManager:
             raise ValueError("标志坐标越界")
         if w<=0 or h<=0:
             raise ValueError("窗口尺寸异常")
-        return MarkerData(label,x_pct,y_pct,r_pct,color,alpha_val)
+        placeholder=bool(getter(marker,"placeholder",False))
+        return MarkerData(label,x_pct,y_pct,r_pct,color,alpha_val,placeholder)
     def validate_markers(self,markers,window_rect):
         normalized=[]
         seen=set()
@@ -450,7 +452,10 @@ class AAAFileManager:
             normalized.append(data)
         for label,spec in MARKER_SPEC.items():
             if spec.get("required") and label not in seen:
-                normalized.append(self._marker_template(label))
+                tmp=self._marker_template(label)
+                tmp.placeholder=True
+                normalized.append(tmp)
+                seen.add(label)
         if issues:
             logger.warning("标志校验提示:%s",";".join(issues))
         return normalized
@@ -1633,6 +1638,7 @@ def ensure_qt_classes():
             self.resizing=False
             self.selected=False
             self.last_pos=None
+            self.placeholder=False
         def update_geometry_from_parent(self):
             pr=self.parent()
             if pr is None:
@@ -1719,7 +1725,7 @@ def ensure_qt_classes():
         def _serialize_markers(self):
             data=[]
             for m in self.markers:
-                data.append({"label":m.label,"x_pct":m.x_pct,"y_pct":m.y_pct,"r_pct":m.r_pct,"color":m.color.name(),"alpha":m.alpha})
+                data.append({"label":m.label,"x_pct":m.x_pct,"y_pct":m.y_pct,"r_pct":m.r_pct,"color":m.color.name(),"alpha":m.alpha,"placeholder":getattr(m,"placeholder",False)})
             return data
         def _restore_markers(self,records):
             flag=self._history_enabled
@@ -1730,7 +1736,7 @@ def ensure_qt_classes():
             self.selected_marker=None
             self._marker_visible_cache={}
             for rec in records:
-                marker=self.add_marker(rec.get("label"),QtGui.QColor(rec.get("color","#ff0000")),rec.get("alpha"),rec.get("x_pct"),rec.get("y_pct"),rec.get("r_pct"))
+                marker=self.add_marker(rec.get("label"),QtGui.QColor(rec.get("color","#ff0000")),rec.get("alpha"),rec.get("x_pct"),rec.get("y_pct"),rec.get("r_pct"),rec.get("placeholder",False))
                 if marker:
                     marker.update_geometry_from_parent()
             self._update_marker_visibility(True)
@@ -1900,6 +1906,7 @@ def ensure_qt_classes():
                 marker=_MarkerWidget(self,label,color,alpha,x_pct,y_pct,r_pct)
                 marker.update_geometry_from_parent()
                 self.markers.append(marker)
+                marker.placeholder=bool(rec.get("placeholder",False))
                 seen.add(label)
             self.ensure_required_markers(spec,seen)
             self._update_marker_visibility(True)
@@ -1913,11 +1920,18 @@ def ensure_qt_classes():
                 if label in existing:
                     continue
                 color_tuple=cfg.get("color",(255,0,0))
-                marker=self.add_marker(label,QtGui.QColor(color_tuple[0],color_tuple[1],color_tuple[2]),cfg.get("alpha",0.5),cfg.get("pos",(0.5,0.5))[0],cfg.get("pos",(0.5,0.5))[1],cfg.get("radius",0.05))
+                marker=self.add_marker(label,QtGui.QColor(color_tuple[0],color_tuple[1],color_tuple[2]),cfg.get("alpha",0.5),cfg.get("pos",(0.5,0.5))[0],cfg.get("pos",(0.5,0.5))[1],cfg.get("radius",0.05),True)
                 if marker:
                     existing.add(label)
             self._update_marker_visibility(True)
-        def add_marker(self,label,color=None,alpha=None,x_pct=None,y_pct=None,r_pct=None):
+        def get_missing_labels(self,spec):
+            missing=[]
+            for label in spec.keys():
+                marker=self.find_marker(label)
+                if marker is None or getattr(marker,"placeholder",False):
+                    missing.append(label)
+            return missing
+        def add_marker(self,label,color=None,alpha=None,x_pct=None,y_pct=None,r_pct=None,placeholder=False):
             if not label:
                 return None
             self._push_history()
@@ -1931,6 +1945,7 @@ def ensure_qt_classes():
             rp=r_pct if r_pct is not None else float(cfg.get("radius",0.05))
             m=_MarkerWidget(self,label,target_color,target_alpha,clamp(float(xp),0.0,1.0),clamp(float(yp),0.0,1.0),clamp(float(rp),0.01,0.5))
             self.markers.append(m)
+            m.placeholder=bool(placeholder)
             m.update_geometry_from_parent()
             desired=self.config_mode and self._overlay_visible
             if desired:
@@ -1938,6 +1953,22 @@ def ensure_qt_classes():
             else:
                 m.hide()
             return m
+        def promote_placeholder(self,label):
+            marker=self.find_marker(label)
+            if marker is None:
+                return self.add_marker(label)
+            if not getattr(marker,"placeholder",False):
+                return marker
+            self._push_history()
+            cfg=MARKER_SPEC.get(label,MARKER_SPEC.get("普攻"))
+            marker.placeholder=False
+            marker.alpha=0.5
+            marker.x_pct=0.5
+            marker.y_pct=0.5
+            marker.r_pct=clamp(float(cfg.get("radius",0.05)),0.01,0.5)
+            marker.update_geometry_from_parent()
+            marker.update()
+            return marker
         def remove_selected_marker(self):
             if self.selected_marker in self.markers:
                 self._push_history()
@@ -1950,7 +1981,7 @@ def ensure_qt_classes():
         def get_marker_data(self):
             out=[]
             for m in self.markers:
-                out.append(MarkerData(m.label,m.x_pct,m.y_pct,m.r_pct,m.color.name(),m.alpha))
+                out.append(MarkerData(m.label,m.x_pct,m.y_pct,m.r_pct,m.color.name(),m.alpha,getattr(m,"placeholder",False)))
             return out
     class _WindowSelectorDialog(QtWidgets.QDialog):
         def __init__(self,parent=None):
@@ -2249,13 +2280,17 @@ def ensure_qt_classes():
             self.app_state.file_manager.save_markers(markers,rect)
         def on_add_marker(self):
             overlay=self.app_state.ensure_overlay_initialized()
-            available=[label for label in MARKER_SPEC.keys() if overlay.find_marker(label) is None]
+            available=overlay.get_missing_labels(self.app_state.marker_spec)
             if not available:
                 QtWidgets.QMessageBox.information(self,"无需添加","所有标志均已存在")
                 return
             label,ok=QtWidgets.QInputDialog.getItem(self,"选择标志","标志",available,0,False)
             if ok and label:
-                marker=overlay.add_marker(label)
+                existing=overlay.find_marker(label)
+                if existing and getattr(existing,"placeholder",False):
+                    marker=overlay.promote_placeholder(label)
+                else:
+                    marker=overlay.add_marker(label,alpha=0.5,x_pct=0.5,y_pct=0.5)
                 overlay.selected_marker=marker
                 if marker:
                     marker.selected=True
