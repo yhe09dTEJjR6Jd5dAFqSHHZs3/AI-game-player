@@ -2137,6 +2137,7 @@ def ensure_qt_classes():
                 return None
             return item.data(QtCore.Qt.UserRole)
     class _MainWindow(QtWidgets.QMainWindow):
+        saveFinished=QtCore.pyqtSignal(object)
         def __init__(self,app_state,hardware):
             super(_MainWindow,self).__init__()
             self.app_state=app_state
@@ -2247,6 +2248,7 @@ def ensure_qt_classes():
             self.redoBtn.clicked.connect(self.on_redo_marker)
             self.calibrateBtn.clicked.connect(self.on_calibrate)
             self.markerList.itemClicked.connect(self.on_marker_list_clicked)
+            self.saveFinished.connect(self._finish_async_save)
             self.timer=QtCore.QTimer(self)
             self.timer.timeout.connect(self.on_tick)
             self.timer.start(200)
@@ -2567,7 +2569,7 @@ def ensure_qt_classes():
                 except Exception as e:
                     payload=(callback,False,str(e))
                 if callback:
-                    QtCore.QTimer.singleShot(0,lambda payload=payload:self._finish_async_save(payload))
+                    self.saveFinished.emit(payload)
             threading.Thread(target=worker,daemon=True).start()
         def _finish_async_save(self,payload):
             callback,success,message=payload
