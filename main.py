@@ -1639,6 +1639,11 @@ def ensure_qt_classes():
             self.selected=False
             self.last_pos=None
             self.placeholder=False
+            self.modified=False
+        def _notify_parent_change(self,final=False):
+            p=self.parent()
+            if hasattr(p,"on_marker_adjusted"):
+                p.on_marker_adjusted(self,final)
         def update_geometry_from_parent(self):
             pr=self.parent()
             if pr is None:
@@ -1674,12 +1679,17 @@ def ensure_qt_classes():
                 self.dragging=True
             self.selected=True
             p=self.parent()
+            self.modified=False
+            if hasattr(p,"prepare_marker_edit"):
+                p.prepare_marker_edit(self)
             if hasattr(p,"selected_marker"):
                 p.selected_marker=self
                 for other in p.markers:
                     if other is not self:
                         other.selected=False
                         other.update()
+            if hasattr(p,"app_state"):
+                p.app_state.mark_user_input()
             self.last_pos=event.globalPos()
             self.update()
         def mouseMoveEvent(self,event):
@@ -1689,20 +1699,29 @@ def ensure_qt_classes():
             pr=self.parent()
             w=pr.width()
             h=pr.height()
+            changed=False
             if self.dragging:
                 cx=self.x_pct*w+delta.x()
                 cy=self.y_pct*h+delta.y()
                 self.x_pct=clamp(cx/float(w),0.0,1.0)
                 self.y_pct=clamp(cy/float(h),0.0,1.0)
+                changed=delta.x()!=0 or delta.y()!=0
             elif self.resizing:
                 r=int(self.r_pct*min(w,h))+max(delta.x(),delta.y())
                 self.r_pct=clamp(r/float(min(w,h)),0.01,0.5)
+                changed=max(delta.x(),delta.y())!=0
             self.last_pos=event.globalPos()
             self.update_geometry_from_parent()
+            if changed:
+                self.modified=True
+                self._notify_parent_change(False)
         def mouseReleaseEvent(self,event):
             self.dragging=False
             self.resizing=False
             self.last_pos=None
+            if self.modified:
+                self._notify_parent_change(True)
+            self.modified=False
     class _OverlayWindow(QtWidgets.QWidget):
         def __init__(self,app_state):
             super(_OverlayWindow,self).__init__(None,QtCore.Qt.WindowStaysOnTopHint|QtCore.Qt.FramelessWindowHint|QtCore.Qt.Tool)
@@ -1719,9 +1738,31 @@ def ensure_qt_classes():
             self.heatmap=None
             self.last_save_prompt=time.time()
             self._history_enabled=True
+            self.editing_marker=None
+            self.dirty=False
             self.sync_timer=QtCore.QTimer(self)
             self.sync_timer.timeout.connect(self.sync_with_window)
             self.sync_timer.start(200)
+        def mark_dirty(self):
+            self.dirty=True
+        def consume_dirty(self):
+            if self.dirty:
+                self.dirty=False
+                return True
+            return False
+        def prepare_marker_edit(self,marker):
+            self._push_history()
+            self.editing_marker=marker
+        def on_marker_adjusted(self,marker,final=False):
+            if getattr(marker,"placeholder",False):
+                marker.placeholder=False
+            marker.update_geometry_from_parent()
+            self.mark_dirty()
+            self.app_state.mark_user_input()
+            if final:
+                self.editing_marker=None
+        def finalize_marker_edit(self,marker):
+            self.on_marker_adjusted(marker,True)
         def _serialize_markers(self):
             data=[]
             for m in self.markers:
@@ -1734,6 +1775,7 @@ def ensure_qt_classes():
                 m.setParent(None)
             self.markers=[]
             self.selected_marker=None
+            self.editing_marker=None
             self._marker_visible_cache={}
             for rec in records:
                 marker=self.add_marker(rec.get("label"),QtGui.QColor(rec.get("color","#ff0000")),rec.get("alpha"),rec.get("x_pct"),rec.get("y_pct"),rec.get("r_pct"),rec.get("placeholder",False))
@@ -1741,6 +1783,7 @@ def ensure_qt_classes():
                     marker.update_geometry_from_parent()
             self._update_marker_visibility(True)
             self._history_enabled=flag
+            self.mark_dirty()
         def _push_history(self):
             if not self._history_enabled:
                 return
@@ -1772,6 +1815,8 @@ def ensure_qt_classes():
                     m.r_pct=clamp(float(st.get("r_pct",m.r_pct)),0.01,0.5)
                     m.update_geometry_from_parent()
             self._update_marker_visibility(True)
+            self.mark_dirty()
+            self.app_state.mark_user_input()
         def update_heatmap(self,heatmap):
             self.heatmap=heatmap
             self.update()
@@ -1878,6 +1923,7 @@ def ensure_qt_classes():
                 m.setParent(None)
             self.markers=[]
             self.selected_marker=None
+            self.editing_marker=None
             self._marker_visible_cache={}
             self.undo_stack.clear()
             self.redo_stack.clear()
@@ -1912,6 +1958,7 @@ def ensure_qt_classes():
             self._update_marker_visibility(True)
             self._history_enabled=True
             self.undo_stack.append(self._serialize_markers())
+            self.dirty=True
         def ensure_required_markers(self,spec,seen=None):
             existing=seen if seen is not None else set(m.label for m in self.markers)
             for label,cfg in spec.items():
@@ -1946,6 +1993,8 @@ def ensure_qt_classes():
             m=_MarkerWidget(self,label,target_color,target_alpha,clamp(float(xp),0.0,1.0),clamp(float(yp),0.0,1.0),clamp(float(rp),0.01,0.5))
             self.markers.append(m)
             m.placeholder=bool(placeholder)
+            self.mark_dirty()
+            self.app_state.mark_user_input()
             m.update_geometry_from_parent()
             desired=self.config_mode and self._overlay_visible
             if desired:
@@ -1968,6 +2017,8 @@ def ensure_qt_classes():
             marker.r_pct=clamp(float(cfg.get("radius",0.05)),0.01,0.5)
             marker.update_geometry_from_parent()
             marker.update()
+            self.mark_dirty()
+            self.app_state.mark_user_input()
             return marker
         def remove_selected_marker(self):
             if self.selected_marker in self.markers:
@@ -1978,6 +2029,8 @@ def ensure_qt_classes():
                     self._marker_visible_cache.pop(target,None)
                 target.setParent(None)
                 self.selected_marker=None
+                self.mark_dirty()
+                self.app_state.mark_user_input()
         def get_marker_data(self):
             out=[]
             for m in self.markers:
@@ -2074,6 +2127,9 @@ def ensure_qt_classes():
             self.markerGroup=QtWidgets.QGroupBox("标志列表")
             self.markerLayout=QtWidgets.QVBoxLayout(self.markerGroup)
             self.markerLayout.addWidget(self.markerList)
+            self.markerInfoLabel=QtWidgets.QLabel("选择列表中的标志以在画面中定位和调整大小")
+            self.markerInfoLabel.setWordWrap(True)
+            self.markerLayout.addWidget(self.markerInfoLabel)
             self.perfView=QtWidgets.QTreeWidget()
             self.perfView.setColumnCount(2)
             self.perfView.setHeaderLabels(["项目","数值"])
@@ -2096,6 +2152,7 @@ def ensure_qt_classes():
             self.calibrateBtn.setEnabled(False)
             self.markerListSnapshot=[]
             self.overlay=None
+            self.saving_config=False
             self.chooseWindowBtn.clicked.connect(self.on_choose_window)
             self.optimizeBtn.clicked.connect(self.on_optimize)
             self.cancelOptimizeBtn.clicked.connect(self.on_cancel_optimize)
@@ -2111,13 +2168,19 @@ def ensure_qt_classes():
             self.timer=QtCore.QTimer(self)
             self.timer.timeout.connect(self.on_tick)
             self.timer.start(200)
+        def _update_marker_hint(self,marker):
+            if marker is None:
+                self.markerInfoLabel.setText("选择列表中的标志以在画面中定位和调整大小")
+            else:
+                status="待定位" if getattr(marker,"placeholder",False) else "已定位"
+                self.markerInfoLabel.setText("%s:%s，拖动圆心移动，拖动边缘缩放"%(marker.label,status))
         def _refresh_marker_list(self,overlay):
             items=[]
             if overlay:
                 for marker in overlay.markers:
-                    text="%s %.0f%%/%.0f%% r%.0f%%"%(marker.label,marker.x_pct*100.0,marker.y_pct*100.0,marker.r_pct*100.0)
-                    if getattr(marker,"placeholder",False):
-                        text+=" [待定位]"
+                    status="待定位" if getattr(marker,"placeholder",False) else "已定位"
+                    prefix="▶" if overlay.selected_marker is marker else ""
+                    text="%s%s %.0f%%/%.0f%% r%.0f%% [%s]"%(prefix,marker.label,marker.x_pct*100.0,marker.y_pct*100.0,marker.r_pct*100.0,status)
                     items.append((marker.label,text))
             if items!=self.markerListSnapshot:
                 self.markerListSnapshot=list(items)
@@ -2145,6 +2208,21 @@ def ensure_qt_classes():
                     self.markerList.blockSignals(True)
                     self.markerList.clearSelection()
                     self.markerList.blockSignals(False)
+            self._update_marker_hint(overlay.selected_marker if overlay else None)
+        def _sync_config_controls(self):
+            if self.app_state.mode==Mode.CONFIGURING:
+                enabled=not self.saving_config
+            else:
+                enabled=False
+            self.saveConfigBtn.setEnabled(enabled)
+            self.addMarkerBtn.setEnabled(enabled)
+            self.delMarkerBtn.setEnabled(enabled)
+            self.undoBtn.setEnabled(enabled)
+            self.redoBtn.setEnabled(enabled)
+            self.calibrateBtn.setEnabled(enabled)
+            target_text="保存中..." if self.saving_config and self.app_state.mode==Mode.CONFIGURING else "保存配置"
+            if self.saveConfigBtn.text()!=target_text:
+                self.saveConfigBtn.setText(target_text)
         def on_marker_list_clicked(self,item):
             overlay=self.app_state.overlay
             if not overlay:
@@ -2157,6 +2235,24 @@ def ensure_qt_classes():
             for m in overlay.markers:
                 m.selected=(m is marker)
                 m.update()
+            self._update_marker_hint(marker)
+            self.app_state.mark_user_input()
+        def _on_config_save_finished(self,success,message):
+            self.saving_config=False
+            overlay=self.app_state.overlay
+            if success:
+                QtWidgets.QMessageBox.information(self,"已保存","配置已保存")
+                self.app_state.set_mode(Mode.LEARNING)
+                if overlay:
+                    overlay.set_config_mode(False)
+                    overlay.set_overlay_visible(False)
+                self.app_state.mark_user_input()
+                self._update_marker_hint(None)
+            else:
+                QtWidgets.QMessageBox.critical(self,"保存失败",message or "保存失败")
+                self.app_state.mark_user_input()
+            self._sync_config_controls()
+            self._refresh_marker_list(overlay)
         def on_tick(self):
             if self.app_state.consume_window_prompt():
                 QtWidgets.QMessageBox.information(self,"初始化完成","依赖与资源已就绪，请选择窗口")
@@ -2203,20 +2299,7 @@ def ensure_qt_classes():
             self.optimizeBtn.setEnabled(snap["mode"]==Mode.LEARNING and snap["ready"] and has_window and not running_opt)
             self.cancelOptimizeBtn.setEnabled(running_opt)
             self.configBtn.setEnabled(snap["mode"]==Mode.LEARNING and has_window and not running_opt)
-            if self.app_state.mode==Mode.CONFIGURING:
-                self.saveConfigBtn.setEnabled(True)
-                self.addMarkerBtn.setEnabled(True)
-                self.delMarkerBtn.setEnabled(True)
-                self.undoBtn.setEnabled(True)
-                self.redoBtn.setEnabled(True)
-                self.calibrateBtn.setEnabled(True)
-            else:
-                self.saveConfigBtn.setEnabled(False)
-                self.addMarkerBtn.setEnabled(False)
-                self.delMarkerBtn.setEnabled(False)
-                self.undoBtn.setEnabled(False)
-                self.redoBtn.setEnabled(False)
-                self.calibrateBtn.setEnabled(False)
+            self._sync_config_controls()
             overlay=self.app_state.overlay
             if overlay:
                 overlay.sync_with_window()
@@ -2313,18 +2396,25 @@ def ensure_qt_classes():
             overlay=self.app_state.ensure_overlay_initialized()
             overlay.set_overlay_visible(True)
             overlay.set_config_mode(True)
+            self._sync_config_controls()
         def on_save_config(self):
             if self.app_state.mode!=Mode.CONFIGURING:
+                return
+            if self.saving_config:
+                QtWidgets.QMessageBox.information(self,"保存中","正在保存配置，请稍候")
                 return
             reply=QtWidgets.QMessageBox.question(self,"确认保存","确认保存当前配置？",QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
             if reply!=QtWidgets.QMessageBox.Yes:
                 return
-            self.save_markers_to_manager()
-            QtWidgets.QMessageBox.information(self,"已保存","配置已保存")
-            self.app_state.set_mode(Mode.LEARNING)
-            if self.app_state.overlay:
-                self.app_state.overlay.set_config_mode(False)
-                self.app_state.overlay.set_overlay_visible(False)
+            overlay=self.app_state.overlay
+            if not overlay or not overlay.markers:
+                QtWidgets.QMessageBox.warning(self,"无法保存","没有可保存的标志")
+                return
+            self.saving_config=True
+            self._sync_config_controls()
+            started=self.save_markers_to_manager(True,self._on_config_save_finished)
+            if not started:
+                self._on_config_save_finished(False,"未找到覆盖层")
         def on_undo_marker(self):
             overlay=self.app_state.overlay
             if overlay:
@@ -2339,15 +2429,39 @@ def ensure_qt_classes():
             overlay.apply_calibration(stats)
             heatmap=self.app_state.buffer.get_heatmap()
             overlay.update_heatmap(heatmap)
-        def save_markers_to_manager(self):
+        def save_markers_to_manager(self,async_mode=False,callback=None):
             overlay=self.app_state.overlay
             if not overlay:
-                return
-            rect=self.app_state.window_rect
-            markers=[]
-            for m in overlay.markers:
-                markers.append(m)
-            self.app_state.file_manager.save_markers(markers,rect)
+                if callback:
+                    QtCore.QTimer.singleShot(0,lambda: callback(False,"未找到覆盖层"))
+                return False
+            with self.app_state.lock:
+                rect=tuple(self.app_state.window_rect)
+            snapshot=[m.to_dict() for m in overlay.get_marker_data()]
+            if async_mode:
+                self._start_async_marker_save(snapshot,rect,callback)
+                return True
+            try:
+                self.app_state.file_manager.save_markers(snapshot,rect)
+            except Exception as e:
+                if callback:
+                    QtCore.QTimer.singleShot(0,lambda: callback(False,str(e)))
+                return False
+            if callback:
+                QtCore.QTimer.singleShot(0,lambda: callback(True,""))
+            return True
+        def _start_async_marker_save(self,markers,rect,callback):
+            def worker():
+                try:
+                    self.app_state.file_manager.save_markers(markers,rect)
+                    success=True
+                    message=""
+                except Exception as e:
+                    success=False
+                    message=str(e)
+                if callback:
+                    QtCore.QTimer.singleShot(0,lambda s=success,m=message: callback(s,m))
+            threading.Thread(target=worker,daemon=True).start()
         def on_add_marker(self):
             overlay=self.app_state.ensure_overlay_initialized()
             available=overlay.get_missing_labels(self.app_state.marker_spec)
@@ -2360,7 +2474,7 @@ def ensure_qt_classes():
                 if existing and getattr(existing,"placeholder",False):
                     marker=overlay.promote_placeholder(label)
                 else:
-                    marker=overlay.add_marker(label,alpha=0.5,x_pct=0.5,y_pct=0.5)
+                    marker=overlay.add_marker(label,alpha=0.5,x_pct=0.5,y_pct=0.5,placeholder=True)
                 overlay.selected_marker=marker
                 if marker:
                     marker.selected=True
