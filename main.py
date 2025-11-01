@@ -1936,6 +1936,20 @@ def ensure_qt_classes():
                             m.hide()
                     self._marker_visible_cache[m]=desired
                 m.update_geometry_from_parent()
+        def _marker_at_global(self,point):
+            for m in self.markers:
+                if not m.isVisible():
+                    continue
+                rect=QtCore.QRect(m.mapToGlobal(QtCore.QPoint(0,0)),m.size())
+                if not rect.contains(point):
+                    continue
+                local=m.mapFromGlobal(point)
+                center=QtCore.QPointF(m.width()/2,m.height()/2)
+                r=min(m.width(),m.height())/2
+                dist=((local.x()-center.x())**2+(local.y()-center.y())**2)**0.5
+                if dist<=r or m._hit_test_handle(QtCore.QPointF(local.x(),local.y())):
+                    return m
+            return None
         def set_config_mode(self,enabled):
             self.config_mode=enabled
             if enabled:
@@ -1951,6 +1965,18 @@ def ensure_qt_classes():
                     m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
             self._update_marker_visibility(True)
             self.sync_with_window()
+        def nativeEvent(self,eventType,message):
+            if eventType=="windows_generic_MSG":
+                msg=ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message==0x0084:
+                    if not (self.config_mode and self._overlay_visible and self.window_visible and self.isVisible()):
+                        return True,-1
+                    pt=msg.pt
+                    marker=self._marker_at_global(QtCore.QPoint(pt.x,pt.y))
+                    if marker is not None:
+                        return True,1
+                    return True,-1
+            return super(_OverlayWindow,self).nativeEvent(eventType,message)
         def sync_with_window(self):
             global OVERLAY_HANDLES
             OVERLAY_HANDLES.add(int(self.winId()))
