@@ -1670,6 +1670,9 @@ def ensure_qt_classes():
             r=min(self.width(),self.height())/2
             qp.drawEllipse(QtCore.QPointF(self.width()/2,self.height()/2),r-2,r-2)
             qp.setPen(QtGui.QPen(QtGui.QColor(255,255,255,255),1))
+            font=qp.font()
+            font.setPixelSize(max(8,int(r*0.6)))
+            qp.setFont(font)
             qp.drawText(self.rect(),QtCore.Qt.AlignCenter,self.label)
             if self.selected or self.resizing:
                 qp.setBrush(QtGui.QBrush(QtGui.QColor(255,255,255,200)))
@@ -1816,11 +1819,28 @@ def ensure_qt_classes():
             self.editing_marker=None
             self.dirty=False
             self.window_visible=True
+            self._auto_save_timer=QtCore.QTimer(self)
+            self._auto_save_timer.setSingleShot(True)
+            self._auto_save_timer.timeout.connect(self._perform_auto_save)
             self.setAttribute(QtCore.Qt.WA_TranslucentBackground,True)
             self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
             self.setMouseTracking(True)
         def mark_dirty(self):
             self.dirty=True
+            self._schedule_auto_save()
+        def _schedule_auto_save(self):
+            if not self.config_mode:
+                return
+            if self._auto_save_timer.isActive():
+                self._auto_save_timer.stop()
+            self._auto_save_timer.start(200)
+        def _perform_auto_save(self):
+            if not self.config_mode:
+                return
+            records=[m.to_dict() for m in self.get_marker_data()]
+            with self.app_state.lock:
+                rect=tuple(self.app_state.window_rect) if self.app_state.window_rect else (0,0,1,1)
+            self.app_state.file_manager.save_markers(records,rect)
         def consume_dirty(self):
             if self.dirty:
                 self.dirty=False
