@@ -13,6 +13,7 @@ import queue
 import subprocess
 import statistics
 import itertools
+import gc
 import io
 import tokenize
 from concurrent.futures import ThreadPoolExecutor
@@ -1516,10 +1517,26 @@ class RLAgent:
                 cancelled=True
                 break
             self.ensure_device()
-            inner_count=max(1,self.hardware.suggest_parallel())
+            mem_pressure=max(self.hardware.mem_usage_ratio,self.hardware.vram_usage_ratio)
+            gpu_pressure=self.hardware.gpu_util_ratio
+            pressure=max(mem_pressure,gpu_pressure)
+            if pressure>=0.98:
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                gc.collect()
+                time.sleep(0.01)
+            dynamic_scale=float(clamp(1.0-pressure,0.25,1.0))
+            base_batch=self.hardware.suggest_batch_size()
+            target_batch=int(max(self.hardware.min_batch,round(base_batch*dynamic_scale)))
+            inner_plan=self.hardware.suggest_parallel()
+            inner_count=max(1,int(max(1,round(inner_plan*dynamic_scale))))
+            self.hardware.report_effective_plan(target_batch,inner_count)
             any_step=False
             for inner in range(inner_count):
-                batch=buffer.sample(self.hardware.suggest_batch_size())
+                batch=buffer.sample(target_batch)
                 if not batch:
                     continue
                 size=self.hardware.suggest_visual_size()
@@ -2574,8 +2591,17 @@ def ensure_qt_classes():
             mem_item=QtWidgets.QTreeWidgetItem(["内存","%.1f%%"%mem_usage])
             gpu_item=QtWidgets.QTreeWidgetItem(["GPU","%.1f%%"%gpu_usage])
             vram_item=QtWidgets.QTreeWidgetItem(["显存","%.1f%%"%vram_usage])
-            plan_item=QtWidgets.QTreeWidgetItem(["并行","批次:%d 流:%d"%(perf["plan"].get("batch_size",0),perf["plan"].get("parallel",0))])
-            plan_item.addChild(QtWidgets.QTreeWidgetItem(["间隔","截图%.3fs 手%.3fs"%(perf["plan"].get("monitor_interval",0.0),perf["plan"].get("hand_interval",0.0))]))
+            plan=perf["plan"]
+            base_batch=plan.get("batch_size",0)
+            base_parallel=plan.get("parallel",0)
+            eff_batch=plan.get("effective_batch")
+            eff_parallel=plan.get("effective_parallel")
+            if eff_batch is not None or eff_parallel is not None:
+                disp="批次:%d→%d 流:%d→%d"%(base_batch,eff_batch if eff_batch is not None else base_batch,base_parallel,eff_parallel if eff_parallel is not None else base_parallel)
+            else:
+                disp="批次:%d 流:%d"%(base_batch,base_parallel)
+            plan_item=QtWidgets.QTreeWidgetItem(["并行",disp])
+            plan_item.addChild(QtWidgets.QTreeWidgetItem(["间隔","截图%.3fs 手%.3fs"%(plan.get("monitor_interval",0.0),plan.get("hand_interval",0.0))]))
             self.perfView.addTopLevelItem(res_item)
             self.perfView.addTopLevelItem(mem_item)
             self.perfView.addTopLevelItem(gpu_item)
@@ -2832,6 +2858,8 @@ class HardwareAdaptiveRate:
         self.performance_log=deque(maxlen=240)
         self.device_pool=self._discover_devices()
         self.parallel_plan={}
+        self.effective_batch=None
+        self.effective_parallel=None
         self.viewport_size=(336,336)
         self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
         self.monitor_thread.start()
@@ -2924,8 +2952,16 @@ class HardwareAdaptiveRate:
         lat=self._aggregate_latencies()
         with self.lock:
             info={"batch_size":self.batch_size,"parallel":self.parallel,"hand_interval":self.hand_interval,"device":str(self.device),"monitor_interval":self.monitor_interval}
+            if self.effective_batch is not None:
+                info["effective_batch"]=self.effective_batch
+            if self.effective_parallel is not None:
+                info["effective_parallel"]=self.effective_parallel
         hist=list(self.performance_log)
         return {"resources":snap,"latency":lat,"plan":info,"history":hist,"install":dependency_manager.get_install_feedback()}
+    def report_effective_plan(self,batch,parallel):
+        with self.lock:
+            self.effective_batch=batch
+            self.effective_parallel=parallel
     def suggest_parallel_plan(self,workload=None):
         self.refresh()
         with self.lock:
@@ -3022,6 +3058,8 @@ class HardwareAdaptiveRate:
             dynamic_level=int(clamp(math.floor(resource_score*4.0),0,3))
             self.visual_level=dynamic_level
             self.parallel_plan={"time":now,"batch":self.batch_size,"parallel":self.parallel,"device":str(self.device),"monitor":self.monitor_interval,"hand_interval":self.hand_interval}
+            self.effective_batch=self.batch_size
+            self.effective_parallel=self.parallel
             self.performance_log.append({"time":now,"cpu":cpu_ratio,"mem":mem_ratio,"gpu":gpu_ratio,"batch":self.batch_size,"parallel":self.parallel})
             self.last_refresh=now
     def handle_oom(self,batch_attempt=0):
@@ -3420,6 +3458,9 @@ class AppState:
     def set_mode(self,m):
         with self.lock:
             self.mode=m
+    def is_visibility_paused(self):
+        with self.lock:
+            return self.paused_by_visibility
     def can_record(self):
         with self.lock:
             mode=self.mode
@@ -3804,7 +3845,8 @@ class ScreenshotRecorder(threading.Thread):
             with self.app_state.lock:
                 hwnd=self.app_state.hwnd
                 mode=self.app_state.mode
-            if hwnd is None:
+            preview_mode=mode in [Mode.LEARNING,Mode.TRAINING,Mode.OPTIMIZING,Mode.CONFIGURING]
+            if hwnd is None or not preview_mode:
                 time.sleep(dt)
                 continue
             visible=window_visible(hwnd)
@@ -3812,9 +3854,8 @@ class ScreenshotRecorder(threading.Thread):
             if not visible:
                 time.sleep(dt)
                 continue
-            if not self.app_state.can_record():
-                time.sleep(dt)
-                continue
+            record_mode=mode in [Mode.LEARNING,Mode.TRAINING]
+            record_enabled=record_mode and not self.app_state.is_visibility_paused()
             rect=get_window_rect(hwnd)
             self.app_state.refresh_window_title()
             self.rate_controller.update_viewport(rect)
@@ -3841,27 +3882,33 @@ class ScreenshotRecorder(threading.Thread):
                 except Exception:
                     preview_img=img.copy()
                 self.app_state.update_preview_buffer(preview_img)
-                if mode==Mode.LEARNING:
-                    actions=[]
-                    while True:
-                        act=self.input_tracker.pop_action()
-                        if act is None:
-                            break
-                        self.app_state.register_action(act,"user")
-                        actions.append(act)
-                    src="user"
+                if record_enabled:
+                    if mode==Mode.LEARNING:
+                        actions=[]
+                        while True:
+                            act=self.input_tracker.pop_action()
+                            if act is None:
+                                break
+                            self.app_state.register_action(act,"user")
+                            actions.append(act)
+                        src="user"
+                    else:
+                        actions=[]
+                        while True:
+                            act=self.app_state.consume_ai_action()
+                            if act is None:
+                                break
+                            actions.append(act)
+                        src="ai"
+                    if not actions:
+                        actions=[None]
+                    for act in actions:
+                        self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
                 else:
-                    actions=[]
-                    while True:
-                        act=self.app_state.consume_ai_action()
-                        if act is None:
-                            break
-                        actions.append(act)
-                    src="ai"
-                if not actions:
-                    actions=[None]
-                for act in actions:
-                    self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
+                    while self.input_tracker.pop_action() is not None:
+                        pass
+                    while self.app_state.consume_ai_action() is not None:
+                        pass
             time.sleep(dt)
 class LeftHandThread(threading.Thread):
     def __init__(self,app_state):
