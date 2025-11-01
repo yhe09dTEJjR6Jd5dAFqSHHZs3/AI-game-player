@@ -1800,7 +1800,6 @@ def ensure_qt_classes():
         def __init__(self,app_state):
             super(_OverlayWindow,self).__init__(None,QtCore.Qt.WindowStaysOnTopHint|QtCore.Qt.FramelessWindowHint|QtCore.Qt.Tool)
             self.setAttribute(QtCore.Qt.WA_TranslucentBackground,True)
-            self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
             self.app_state=app_state
             global OVERLAY_HANDLES
             OVERLAY_HANDLES.add(int(self.winId()))
@@ -1819,6 +1818,7 @@ def ensure_qt_classes():
             self.sync_timer.timeout.connect(self.sync_with_window)
             self.sync_timer.start(200)
             self.window_visible=True
+            self._apply_passthrough(True)
         def _ensure_topmost(self):
             try:
                 win32gui.SetWindowPos(int(self.winId()),win32con.HWND_TOPMOST,0,0,0,0,win32con.SWP_NOMOVE|win32con.SWP_NOSIZE|win32con.SWP_NOACTIVATE)
@@ -1965,17 +1965,16 @@ def ensure_qt_classes():
             flags=self.windowFlags()
             current=bool(flags&QtCore.Qt.WindowTransparentForInput)
             target=bool(enabled)
-            if current==target:
-                return
             if target:
                 flags|=QtCore.Qt.WindowTransparentForInput
             else:
                 flags&=~QtCore.Qt.WindowTransparentForInput
-            was_visible=self.isVisible()
-            self.setWindowFlags(flags)
-            if was_visible and not self.isVisible():
-                if self._overlay_visible and (not self.config_mode or self.window_visible):
-                    self.show()
+            if current!=target:
+                was_visible=self.isVisible()
+                self.setWindowFlags(flags)
+                if was_visible and not self.isVisible():
+                    if self._overlay_visible and (not self.config_mode or self.window_visible):
+                        self.show()
             try:
                 hwnd=int(self.winId())
                 style=win32gui.GetWindowLong(hwnd,win32con.GWL_EXSTYLE)
