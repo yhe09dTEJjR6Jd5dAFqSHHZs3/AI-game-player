@@ -1067,6 +1067,11 @@ class BrainInspiredNeuroModule(nn.Module):
         self.encoder=nn.Linear(dim,dim)
         self.gate=nn.Linear(dim,dim)
     def forward(self,x,state):
+        param=self.encoder.weight
+        if x.dtype!=param.dtype or x.device!=param.device:
+            x=x.to(device=param.device,dtype=param.dtype)
+        if state.dtype!=param.dtype or state.device!=param.device:
+            state=state.to(device=param.device,dtype=param.dtype)
         sensory=torch.tanh(self.encoder(x))
         gating=torch.sigmoid(self.gate(x))
         updated=state*0.9+gating*sensory
