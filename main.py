@@ -3438,6 +3438,7 @@ class AppState:
         self.preview_size=(0,0)
         self.preview_changed=False
         self.training_controller=TrainingController(self)
+        self.training_start_time=0.0
         self.cancel_optimization=False
         self.idle_threshold=10.0
         self.paused_by_visibility=False
@@ -3541,12 +3542,16 @@ class AppState:
                 return status
             return None
     def should_switch_to_training(self):
+        now=time.time()
         with self.lock:
             mode=self.mode
-            idle=time.time()-self.last_user_input
+            idle=now-self.last_user_input
             hwnd=self.hwnd
             paused=self.paused_by_visibility
             override=self.user_override
+            if mode==Mode.LEARNING and override:
+                self.user_override=False
+                override=False
         if override:
             return False
         if mode!=Mode.LEARNING:
@@ -3557,17 +3562,20 @@ class AppState:
             return False
         return True
     def must_back_to_learning(self):
+        now=time.time()
         with self.lock:
             mode=self.mode
-            elapsed=time.time()-self.last_user_input
+            last=self.last_user_input
+            elapsed=now-last
             hwnd=self.hwnd
             paused=self.paused_by_visibility
             override=self.user_override
+            training_start=self.training_start_time
         if mode!=Mode.TRAINING:
             return False
         if override:
             return True
-        if elapsed<self.intervention_window:
+        if training_start>0.0 and last>training_start and elapsed<self.intervention_window:
             return True
         if hwnd is None or paused:
             return True
@@ -3581,16 +3589,19 @@ class AppState:
             self.mode=Mode.LEARNING
             self.user_override=False
             self.last_user_input=t
+            self.training_start_time=0.0
     def enter_training(self):
         t=time.time()
         with self.lock:
             if self.mode==Mode.TRAINING:
                 self.user_override=False
                 self.last_user_input=t
+                self.training_start_time=t
                 return
             self.mode=Mode.TRAINING
             self.user_override=False
             self.last_user_input=t
+            self.training_start_time=t
         self.training_controller.reset_hidden()
         self.training_controller.ensure_threads()
     def update_state_from_frame(self,img):
@@ -3704,8 +3715,9 @@ class AppState:
             overlay.set_overlay_visible(False)
         self.buffer.refresh_paths()
 class InputTracker:
-    def __init__(self,app_state):
+    def __init__(self,app_state,quit_callback):
         self.app_state=app_state
+        self.quit_callback=quit_callback
         self.action_queue=deque()
         self.lock=threading.Lock()
         self.left_labels=["移动轮盘"]
@@ -3839,7 +3851,7 @@ class InputTracker:
     def on_key_press(self,key):
         try:
             if key==keyboard.Key.esc:
-                os._exit(0)
+                self.quit_callback()
             else:
                 self.app_state.mark_user_input("keyboard")
         except Exception as e:
@@ -4187,7 +4199,8 @@ def main():
     agent=RLAgent(file_manager,rate_controller)
     buffer=ExperienceBuffer(file_manager)
     app_state=AppState(file_manager,agent,buffer,rate_controller)
-    input_tracker=InputTracker(app_state)
+    quit_callback=lambda: QtCore.QMetaObject.invokeMethod(QtCore.QCoreApplication.instance(),"quit",QtCore.Qt.QueuedConnection)
+    input_tracker=InputTracker(app_state,quit_callback)
     recorder=ScreenshotRecorder(app_state,buffer,rate_controller,input_tracker)
     recorder.start()
     init_thread=InitializationThread(app_state)
@@ -4196,6 +4209,31 @@ def main():
     mode_manager=ModeManagerThread(app_state)
     app_state.mode_manager_thread=mode_manager
     mode_manager.start()
+    def cleanup():
+        recorder.stop_flag=True
+        mode_manager.stop_flag=True
+        app_state.training_controller.stop_threads(True)
+        opt=app_state.optimization_thread
+        if opt and opt.is_alive():
+            opt.stop_flag=True
+            opt.join(timeout=1.0)
+        try:
+            recorder.join(timeout=1.0)
+        except Exception as e:
+            logger.error("截图线程停止失败:%s",e)
+        try:
+            mode_manager.join(timeout=1.0)
+        except Exception as e:
+            logger.error("模式线程停止失败:%s",e)
+        try:
+            input_tracker.listener_mouse.stop()
+        except Exception as e:
+            logger.error("鼠标监听停止失败:%s",e)
+        try:
+            input_tracker.listener_keyboard.stop()
+        except Exception as e:
+            logger.error("键盘监听停止失败:%s",e)
+    app.aboutToQuit.connect(cleanup)
     w=MainWindow(app_state,rate_controller)
     w.show()
     sys.exit(app.exec_())
