@@ -1952,16 +1952,30 @@ def ensure_qt_classes():
                 if dist<=r or m._hit_test_handle(QtCore.QPointF(local.x(),local.y())):
                     return m
             return None
+        def _apply_passthrough(self,enabled):
+            flags=self.windowFlags()
+            current=bool(flags&QtCore.Qt.WindowTransparentForInput)
+            target=bool(enabled)
+            if current==target:
+                return
+            if target:
+                flags|=QtCore.Qt.WindowTransparentForInput
+            else:
+                flags&=~QtCore.Qt.WindowTransparentForInput
+            was_visible=self.isVisible()
+            self.setWindowFlags(flags)
+            if was_visible and not self.isVisible():
+                if self._overlay_visible and (not self.config_mode or self.window_visible):
+                    self.show()
         def set_config_mode(self,enabled):
             self.config_mode=enabled
+            self._apply_passthrough(not enabled)
             if enabled:
-                self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,False)
                 self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
                 for m in self.markers:
                     m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
                 self.last_save_prompt=time.time()
             else:
-                self.setWindowFlag(QtCore.Qt.WindowTransparentForInput,True)
                 self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
                 for m in self.markers:
                     m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
