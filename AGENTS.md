@@ -134,3 +134,5 @@ AI优化过程和配置模式不属于学习模式，因此在用户点击“确
 
 
 回城期间，英雄阵亡期间，暂停一切操作，直到：传送回泉水/在泉水复活/出现其他AI认为需要进行操作的情形。
+
+FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
