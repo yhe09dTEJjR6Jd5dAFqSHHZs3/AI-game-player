@@ -21,7 +21,7 @@ from enum import Enum
 from dataclasses import dataclass,field
 from ctypes import wintypes
 import torch
-import torch.cuda.amp as amp
+from torch import amp
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -1237,7 +1237,7 @@ class RLAgent:
         self.cpu_batch=None
         self.batch_capacity=0
         self.batch_shape=None
-        self.scaler=amp.GradScaler(enabled=torch.cuda.is_available())
+        self.scaler=amp.GradScaler('cuda',enabled=torch.cuda.is_available())
         self.policy_temperature=1.2
         self.min_temperature=0.25
         self.temperature_decay=0.9995
@@ -1261,7 +1261,7 @@ class RLAgent:
                         st[k]=v.to(target)
         self.neuro_state=self.neuro_state.to(target)
         self.device=target
-        self.scaler=amp.GradScaler(enabled=(self.device.type=='cuda' and torch.cuda.is_available()))
+        self.scaler=amp.GradScaler('cuda',enabled=(self.device.type=='cuda' and torch.cuda.is_available()))
         self.batch_buffer=None
         self.cpu_batch=None
         self.batch_capacity=0
@@ -1423,6 +1423,8 @@ class RLAgent:
         return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,None,None
     def neuro_project(self,h_batch):
         self.ensure_device()
+        if h_batch.device!=self.device:
+            h_batch=h_batch.to(self.device)
         outputs=[]
         state=torch.zeros(h_batch.size(1),device=self.device,dtype=h_batch.dtype)
         for i in range(h_batch.size(0)):
@@ -1538,9 +1540,10 @@ class RLAgent:
                 if not arr_list:
                     continue
                 use_amp=self.scaler.is_enabled() and self.device.type=='cuda'
+                amp_device='cuda' if self.device.type=='cuda' else 'cpu'
                 try:
                     t_batch=self._batch_from_arrays(arr_list)
-                    with amp.autocast(enabled=use_amp):
+                    with amp.autocast(amp_device,enabled=use_amp):
                         metrics,flags,h=self.vision(t_batch)
                 except torch.cuda.OutOfMemoryError:
                     self.hardware.handle_oom(len(arr_list))
@@ -1567,7 +1570,7 @@ class RLAgent:
                     continue
                 any_step=True
                 effective_steps+=1
-                with amp.autocast(enabled=use_amp):
+                with amp.autocast(amp_device,enabled=use_amp):
                     h_brain=self.neuro_project(h)
                     sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
                     planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
