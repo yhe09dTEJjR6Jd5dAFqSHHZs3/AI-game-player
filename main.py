@@ -2525,8 +2525,7 @@ def ensure_qt_classes():
                 else:
                     QtWidgets.QMessageBox.warning(self,"优化已取消","优化过程已取消，进度已重置")
                 self.app_state.enter_learning()
-                if opt_status!="completed":
-                    self.app_state.set_progress(0)
+                self.app_state.set_progress(0)
             snap=self.app_state.get_state_snapshot()
             mode_map={Mode.INIT:"初始化",Mode.LEARNING:"学习",Mode.OPTIMIZING:"优化",Mode.CONFIGURING:"配置",Mode.TRAINING:"训练"}
             self.modeLabel.setText("模式:"+mode_map.get(snap["mode"],"未知"))
@@ -3487,11 +3486,13 @@ class AppState:
             hwnd=self.hwnd
             paused=self.paused_by_visibility
         return mode in [Mode.LEARNING,Mode.TRAINING] and hwnd is not None and window_visible(hwnd) and not paused
-    def mark_user_input(self):
+    def mark_user_input(self,kind="generic"):
         t=time.time()
         with self.lock:
+            if self.mode==Mode.TRAINING and kind=="mouse":
+                return
             self.last_user_input=t
-            if self.mode==Mode.TRAINING:
+            if self.mode==Mode.TRAINING and kind!="mouse":
                 self.user_override=True
     def set_visibility_paused(self,paused):
         with self.lock:
@@ -3782,13 +3783,13 @@ class InputTracker:
         tracked=button in [mouse.Button.left,mouse.Button.right,mouse.Button.middle]
         if pressed:
             if self.in_window(x,y):
-                self.app_state.mark_user_input()
+                self.app_state.mark_user_input("mouse")
                 if tracked:
                     self.button_state.add(button)
                     self.button_paths[button]=[(x,y,time.time())]
         else:
             if tracked and button in self.button_state:
-                self.app_state.mark_user_input()
+                self.app_state.mark_user_input("mouse")
                 path=self.button_paths.get(button,[])
                 t=time.time()
                 if path:
@@ -3816,11 +3817,11 @@ class InputTracker:
                 self.button_state.discard(button)
                 self.button_paths[button]=[]
             elif not pressed and self.in_window(x,y):
-                self.app_state.mark_user_input()
+                self.app_state.mark_user_input("mouse")
     def on_move(self,x,y):
         inside=self.in_window(x,y)
         if inside:
-            self.app_state.mark_user_input()
+            self.app_state.mark_user_input("mouse")
         if self.button_state:
             t=time.time()
             for btn in list(self.button_state):
@@ -3829,7 +3830,7 @@ class InputTracker:
                 self.button_paths[btn].append((x,y,t))
     def on_scroll(self,x,y,dx,dy):
         if self.in_window(x,y):
-            self.app_state.mark_user_input()
+            self.app_state.mark_user_input("mouse")
             a={"type":"scroll","delta":(dx,dy),"pos":(x,y),"label":None,"action_id":None,"hand":"right"}
             with self.lock:
                 if len(self.action_queue)>256:
@@ -3840,7 +3841,7 @@ class InputTracker:
             if key==keyboard.Key.esc:
                 os._exit(0)
             else:
-                self.app_state.mark_user_input()
+                self.app_state.mark_user_input("keyboard")
         except Exception as e:
             logger.error("键盘事件处理失败:%s",e)
     def pop_action(self):
