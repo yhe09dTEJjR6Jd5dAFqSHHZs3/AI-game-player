@@ -1848,7 +1848,9 @@ def ensure_qt_classes():
             flag=self._history_enabled
             self._history_enabled=False
             for m in list(self.markers):
+                m.hide()
                 m.setParent(None)
+                m.deleteLater()
             self.markers=[]
             self.selected_marker=None
             self.editing_marker=None
@@ -2018,7 +2020,9 @@ def ensure_qt_classes():
                 m.update_geometry_from_parent()
         def load_from_config(self,records,spec):
             for m in list(self.markers):
+                m.hide()
                 m.setParent(None)
+                m.deleteLater()
             self.markers=[]
             self.selected_marker=None
             self.editing_marker=None
@@ -2125,7 +2129,9 @@ def ensure_qt_classes():
                 self.markers.remove(target)
                 if target in self._marker_visible_cache:
                     self._marker_visible_cache.pop(target,None)
+                target.hide()
                 target.setParent(None)
+                target.deleteLater()
                 self.selected_marker=None
                 self.mark_dirty()
                 self.app_state.mark_user_input()
@@ -3328,6 +3334,7 @@ class AppState:
         self.hardware.update_viewport(rect)
         self.set_visibility_paused(not window_visible(hwnd))
         overlay=self.ensure_overlay_initialized()
+        overlay.set_config_mode(False)
         overlay.set_overlay_visible(False)
         self.buffer.refresh_paths()
 class InputTracker:
