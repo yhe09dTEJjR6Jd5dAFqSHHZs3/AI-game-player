@@ -1249,21 +1249,36 @@ class RLAgent:
         self.hierarchical_prior={"left":{"default":["移动轮盘"]},"right":{"burst":["普攻","一技能","二技能","三技能","四技能"],"mobility":["闪现"],"sustain":["恢复","回城"],"utility":["主动装备","数据A","数据B","数据C"],"cancel":["取消施法"]}}
     def compute_reward(self,A,B,C):
         return self.reward_model.compute((A,B,C))
-    def ensure_device(self):
-        self.hardware.refresh()
-        target=self.hardware.suggest_device()
-        if target==self.device:
-            return
-        self.vision.to(target)
-        self.left.to(target)
-        self.right.to(target)
-        self.neuro_module.to(target)
-        self.option_planner.to(target)
-        for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]:
-            for st in opt.state.values():
-                for k,v in list(st.items()):
-                    if torch.is_tensor(v):
-                        st[k]=v.to(target)
+    def _module_sequence(self):
+        return [self.vision,self.left,self.right,self.neuro_module,self.option_planner]
+    def _optimizer_sequence(self):
+        return [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]
+    def _needs_device_sync(self,target):
+        if target!=self.device:
+            return True
+        for module in self._module_sequence():
+            for param in module.parameters():
+                if param.device!=target:
+                    return True
+            for buffer in module.buffers():
+                if buffer.device!=target:
+                    return True
+        for opt in self._optimizer_sequence():
+            for state in opt.state.values():
+                for value in state.values():
+                    if torch.is_tensor(value) and value.device!=target:
+                        return True
+        if self.neuro_state.device!=target:
+            return True
+        return False
+    def _move_to_device(self,target):
+        for module in self._module_sequence():
+            module.to(target)
+        for opt in self._optimizer_sequence():
+            for state in opt.state.values():
+                for key,value in list(state.items()):
+                    if torch.is_tensor(value) and value.device!=target:
+                        state[key]=value.to(target)
         self.neuro_state=self.neuro_state.to(target)
         self.device=target
         self.scaler=amp.GradScaler('cuda',enabled=(self.device.type=='cuda' and torch.cuda.is_available()))
@@ -1271,6 +1286,12 @@ class RLAgent:
         self.cpu_batch=None
         self.batch_capacity=0
         self.batch_shape=None
+    def ensure_device(self):
+        self.hardware.refresh()
+        target=self.hardware.suggest_device()
+        if not self._needs_device_sync(target):
+            return
+        self._move_to_device(target)
     def preprocess_frame(self,img):
         self.ensure_device()
         w,h=self.hardware.suggest_visual_size()
