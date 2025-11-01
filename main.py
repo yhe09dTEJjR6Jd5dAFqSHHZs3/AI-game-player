@@ -1917,6 +1917,9 @@ def ensure_qt_classes():
             return QtCore.QSize(400,400)
         def set_overlay_visible(self,visible):
             self._overlay_visible=visible
+            self.setVisible(visible)
+            if visible:
+                self.raise_()
             self._update_marker_visibility(True)
         def _update_marker_visibility(self,force=False):
             desired=self.config_mode and self._overlay_visible
@@ -2625,6 +2628,7 @@ def ensure_qt_classes():
                 if marker:
                     marker.selected=True
                     marker.update()
+                    overlay.sync_with_window()
                 self._refresh_marker_list(overlay)
         def on_delete_marker(self):
             overlay=self.app_state.overlay
@@ -3264,7 +3268,7 @@ class AppState:
             return False
         if hwnd is None or paused:
             return False
-        return window_visible(hwnd)
+        return True
     def must_back_to_learning(self):
         with self.lock:
             mode=self.mode
