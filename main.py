@@ -21,6 +21,7 @@ from enum import Enum
 from dataclasses import dataclass,field
 from ctypes import wintypes
 import torch
+import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -922,11 +923,42 @@ class ExperienceBuffer:
         with self.lock:
             self.read_history.append({"timestamp":time.time(),"duration":duration,"count":len(records)})
         return results
+    def _priority_score(self,rec):
+        metrics=rec.get("metrics") or {}
+        A=float(metrics.get("A",0))
+        B=float(metrics.get("B",0))
+        C=float(metrics.get("C",0))
+        source=rec.get("source")
+        cooldowns=rec.get("cooldowns") or {}
+        penalty=sum(0.05 for v in cooldowns.values() if v)
+        base=1.0+2.2*A-1.5*B+1.1*C-penalty
+        if source=="user":
+            base+=0.6
+        elif source=="ai":
+            base+=0.2
+        action=rec.get("action")
+        if action and action.get("label") in ["数据A","数据B","数据C"]:
+            base+=0.3
+        return max(base,0.01)
     def sample(self,batch_size=32):
         with self.lock:
             if len(self.data)==0:
                 return []
-            idx=[random.randint(0,len(self.data)-1) for _ in range(min(batch_size,len(self.data)))]
+            total=len(self.data)
+            actual=min(batch_size,total)
+            if total==1:
+                return [self.data[0]]
+            scores=[self._priority_score(self.data[i]) for i in range(total)]
+            sum_scores=float(sum(scores))
+            if sum_scores<=0:
+                idx=[random.randint(0,total-1) for _ in range(actual)]
+            else:
+                probs=[s/sum_scores for s in scores]
+                if actual>=total:
+                    idx=list(range(total))
+                    random.shuffle(idx)
+                else:
+                    idx=list(np.random.choice(total,actual,replace=False,p=probs))
             return [self.data[i] for i in idx]
     def get_user_click_stats(self):
         with self.lock:
@@ -1205,6 +1237,7 @@ class RLAgent:
         self.cpu_batch=None
         self.batch_capacity=0
         self.batch_shape=None
+        self.scaler=amp.GradScaler(enabled=torch.cuda.is_available())
         self.policy_temperature=1.2
         self.min_temperature=0.25
         self.temperature_decay=0.9995
@@ -1228,6 +1261,7 @@ class RLAgent:
                         st[k]=v.to(target)
         self.neuro_state=self.neuro_state.to(target)
         self.device=target
+        self.scaler=amp.GradScaler(enabled=(self.device.type=='cuda' and torch.cuda.is_available()))
         self.batch_buffer=None
         self.cpu_batch=None
         self.batch_capacity=0
@@ -1503,9 +1537,11 @@ class RLAgent:
                     rl_mask_right.append(right_rl)
                 if not arr_list:
                     continue
+                use_amp=self.scaler.is_enabled() and self.device.type=='cuda'
                 try:
                     t_batch=self._batch_from_arrays(arr_list)
-                    metrics,flags,h=self.vision(t_batch)
+                    with amp.autocast(enabled=use_amp):
+                        metrics,flags,h=self.vision(t_batch)
                 except torch.cuda.OutOfMemoryError:
                     self.hardware.handle_oom(len(arr_list))
                     self.batch_buffer=None
@@ -1531,69 +1567,83 @@ class RLAgent:
                     continue
                 any_step=True
                 effective_steps+=1
-                h_brain=self.neuro_project(h)
-                sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
-                planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
-                with torch.no_grad():
-                    R=torch.tensor(rewards,dtype=torch.float32,device=self.device).unsqueeze(1)
-                option_indices=torch.tensor(option_targets,dtype=torch.long,device=self.device)
-                option_super=torch.tensor(option_supervision,dtype=torch.float32,device=self.device).unsqueeze(1)
-                option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=self.device).unsqueeze(1)
-                chosen_embeddings=option_embeddings.index_select(0,option_indices)
-                left_logits,left_val=self.left(sequence,chosen_embeddings)
-                right_logits,right_val=self.right(sequence,chosen_embeddings)
-                left_logprob=F.log_softmax(left_logits,dim=-1)
-                right_logprob=F.log_softmax(right_logits,dim=-1)
-                left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
-                right_ent=(-right_logprob.exp()*right_logprob).sum(dim=-1).mean()
-                tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=self.device)
-                tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=self.device)
-                ml=torch.tensor(mask_left,dtype=torch.float32,device=self.device)
-                mr=torch.tensor(mask_right,dtype=torch.float32,device=self.device)
-                ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum()>0 else torch.tensor(0.0,device=self.device)
-                rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum()>0 else torch.tensor(0.0,device=self.device)
-                adv_left=(R-left_val).detach()
-                adv_right=(R-right_val).detach()
-                rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=self.device).unsqueeze(1)
-                rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=self.device).unsqueeze(1)
-                if rl_ml.sum()>0:
-                    rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
-                else:
-                    rl_pg_left=torch.tensor(0.0,device=self.device)
-                if rl_mr.sum()>0:
-                    rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
-                else:
-                    rl_pg_right=torch.tensor(0.0,device=self.device)
-                v_loss=((left_val-R)**2+(right_val-R)**2).mean()
-                planner_logprob=F.log_softmax(planner_logits,dim=-1)
-                planner_entropy=(-planner_logprob.exp()*planner_logprob).sum(dim=-1).mean()
-                if option_super.sum().item()>0:
-                    planner_sup=(F.nll_loss(planner_logprob,option_indices,reduction="none")*option_super.squeeze(1)).mean()
-                else:
-                    planner_sup=torch.tensor(0.0,device=self.device)
-                if option_rl.sum().item()>0:
-                    planner_pg=-((planner_logprob.gather(1,option_indices.unsqueeze(1))*(R-planner_value).detach())*option_rl).sum()/option_rl.sum()
-                else:
-                    planner_pg=torch.tensor(0.0,device=self.device)
-                termination_penalty=planner_term.gather(1,option_indices.unsqueeze(1)).mean()
-                contrastive=self._contrastive_loss(h_brain)
-                l2_reg=0.0
-                for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters())+list(self.option_planner.parameters()):
-                    l2_reg=l2_reg+p.pow(2).sum()*1e-6
-                loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent+planner_entropy)+planner_sup+planner_pg+termination_penalty*0.1+contrastive*0.5+l2_reg
+                with amp.autocast(enabled=use_amp):
+                    h_brain=self.neuro_project(h)
+                    sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
+                    planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
+                    with torch.no_grad():
+                        R=torch.tensor(rewards,dtype=torch.float32,device=self.device).unsqueeze(1)
+                    option_indices=torch.tensor(option_targets,dtype=torch.long,device=self.device)
+                    option_super=torch.tensor(option_supervision,dtype=torch.float32,device=self.device).unsqueeze(1)
+                    option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=self.device).unsqueeze(1)
+                    chosen_embeddings=option_embeddings.index_select(0,option_indices)
+                    left_logits,left_val=self.left(sequence,chosen_embeddings)
+                    right_logits,right_val=self.right(sequence,chosen_embeddings)
+                    left_logprob=F.log_softmax(left_logits,dim=-1)
+                    right_logprob=F.log_softmax(right_logits,dim=-1)
+                    left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
+                    right_ent=(-right_logprob.exp()*right_logprob).sum(dim=-1).mean()
+                    tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=self.device)
+                    tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=self.device)
+                    ml=torch.tensor(mask_left,dtype=torch.float32,device=self.device)
+                    mr=torch.tensor(mask_right,dtype=torch.float32,device=self.device)
+                    ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum()>0 else torch.tensor(0.0,device=self.device)
+                    rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum()>0 else torch.tensor(0.0,device=self.device)
+                    adv_left=(R-left_val).detach()
+                    adv_right=(R-right_val).detach()
+                    rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=self.device).unsqueeze(1)
+                    rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=self.device).unsqueeze(1)
+                    if rl_ml.sum()>0:
+                        rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
+                    else:
+                        rl_pg_left=torch.tensor(0.0,device=self.device)
+                    if rl_mr.sum()>0:
+                        rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
+                    else:
+                        rl_pg_right=torch.tensor(0.0,device=self.device)
+                    v_loss=((left_val-R)**2+(right_val-R)**2).mean()
+                    planner_logprob=F.log_softmax(planner_logits,dim=-1)
+                    planner_entropy=(-planner_logprob.exp()*planner_logprob).sum(dim=-1).mean()
+                    if option_super.sum().item()>0:
+                        planner_sup=(F.nll_loss(planner_logprob,option_indices,reduction="none")*option_super.squeeze(1)).mean()
+                    else:
+                        planner_sup=torch.tensor(0.0,device=self.device)
+                    if option_rl.sum().item()>0:
+                        planner_pg=-((planner_logprob.gather(1,option_indices.unsqueeze(1))*(R-planner_value).detach())*option_rl).sum()/option_rl.sum()
+                    else:
+                        planner_pg=torch.tensor(0.0,device=self.device)
+                    termination_penalty=planner_term.gather(1,option_indices.unsqueeze(1)).mean()
+                    contrastive=self._contrastive_loss(h_brain)
+                    l2_reg=0.0
+                    for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters())+list(self.option_planner.parameters()):
+                        l2_reg=l2_reg+p.pow(2).sum()*1e-6
+                    loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent+planner_entropy)+planner_sup+planner_pg+termination_penalty*0.1+contrastive*0.5+l2_reg
                 meta_snapshot=self.meta_controller.capture()
                 self.vision_opt.zero_grad()
                 self.left_opt.zero_grad()
                 self.right_opt.zero_grad()
                 self.neuro_opt.zero_grad()
                 self.option_opt.zero_grad()
-                loss.backward()
-                for opt in [self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]:
+                optimizers=[self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]
+                for opt in optimizers:
                     for g in opt.param_groups:
-                        base_lr=g["lr"]
+                        base_lr=g.get("_base_lr",g["lr"])
+                        g["_base_lr"]=base_lr
                         scale=1.0/(1.0+0.0001*self.global_step)
                         g["lr"]=base_lr*scale
-                    opt.step()
+                if use_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                for opt in optimizers:
+                    if use_amp:
+                        self.scaler.step(opt)
+                    else:
+                        opt.step()
+                    for g in opt.param_groups:
+                        g["lr"]=g["_base_lr"]
+                if use_amp:
+                    self.scaler.update()
                 self.meta_controller.reptile_update(meta_snapshot)
                 self.global_step+=1
                 if effective_steps%10==0:
@@ -1644,6 +1694,21 @@ def ensure_qt_classes():
             self.handle_mode=None
             self.handle_radius=9
             self.setMouseTracking(True)
+        def _apply_label_font(self,qp):
+            text=self.label or ""
+            if text=="":
+                return
+            diameter=float(min(self.width(),self.height()))
+            font=qp.font()
+            size=max(6,int(diameter*0.6))
+            font.setPixelSize(size)
+            metrics=QtGui.QFontMetrics(font)
+            limit=diameter*0.9
+            while size>6 and (metrics.horizontalAdvance(text)>limit or metrics.height()>limit):
+                size-=1
+                font.setPixelSize(size)
+                metrics=QtGui.QFontMetrics(font)
+            qp.setFont(font)
         def _notify_parent_change(self,final=False):
             p=self.parent()
             if hasattr(p,"on_marker_adjusted"):
@@ -1670,9 +1735,7 @@ def ensure_qt_classes():
             r=min(self.width(),self.height())/2
             qp.drawEllipse(QtCore.QPointF(self.width()/2,self.height()/2),r-2,r-2)
             qp.setPen(QtGui.QPen(QtGui.QColor(255,255,255,255),1))
-            font=qp.font()
-            font.setPixelSize(max(8,int(r*0.6)))
-            qp.setFont(font)
+            self._apply_label_font(qp)
             qp.drawText(self.rect(),QtCore.Qt.AlignCenter,self.label)
             if self.selected or self.resizing:
                 qp.setBrush(QtGui.QBrush(QtGui.QColor(255,255,255,200)))
@@ -3149,6 +3212,101 @@ def window_visible(hwnd):
     except Exception as e:
         logger.info("窗口可见区域获取失败:%s",e)
     return True
+class CooldownEstimator:
+    def __init__(self):
+        self.label_to_key={"闪现":"flash","恢复":"heal","普攻":"basic","一技能":"skill1","二技能":"skill2","三技能":"skill3","四技能":"skill4","主动装备":"active_item","回城":"recall","取消施法":"cancel"}
+        self.key_to_label={v:k for k,v in self.label_to_key.items()}
+        self.cooldown_until={k:0.0 for k in self.key_to_label}
+        self.avg_duration={k:self._default_duration(k) for k in self.key_to_label}
+        self.last_use={}
+        self.ready_samples=defaultdict(lambda:deque(maxlen=240))
+        self.cool_samples=defaultdict(lambda:deque(maxlen=240))
+        self.lock=threading.Lock()
+    def _default_duration(self,key):
+        defaults={"flash":110.0,"heal":70.0,"skill1":6.0,"skill2":8.0,"skill3":12.0,"skill4":45.0,"active_item":60.0}
+        return defaults.get(key,1.0)
+    def _stabilizer(self,key):
+        base=self.avg_duration.get(key,self._default_duration(key))
+        return max(0.25,base*0.15)
+    def register_use(self,label,source):
+        key=self.label_to_key.get(label)
+        if key is None:
+            return
+        if key in ["basic","cancel","recall"]:
+            return
+        now=time.time()
+        with self.lock:
+            last=self.last_use.get(key)
+            base=self.avg_duration.get(key,self._default_duration(key))
+            if last:
+                interval=max(0.2,now-last)
+                self.avg_duration[key]=base*0.7+interval*0.3
+            else:
+                self.avg_duration[key]=base
+            factor=0.9 if source=="user" else 1.0
+            duration=self.avg_duration.get(key,base)*factor
+            self.last_use[key]=now
+            self.cooldown_until[key]=max(self.cooldown_until.get(key,0.0),now+duration)
+    def _brightness(self,img,rect,cx,cy,r):
+        if rect[2]-rect[0]<=0 or rect[3]-rect[1]<=0:
+            return None
+        x=int(cx-rect[0])
+        y=int(cy-rect[1])
+        radius=int(max(4,min(r,80)))
+        x0=max(0,x-radius)
+        y0=max(0,y-radius)
+        x1=min(img.width,x+radius)
+        y1=min(img.height,y+radius)
+        if x0>=x1 or y0>=y1:
+            return None
+        region=img.crop((x0,y0,x1,y1)).convert("L")
+        arr=np.array(region,dtype=np.float32)
+        if arr.size==0:
+            return None
+        return float(arr.mean()/255.0)
+    def evaluate(self,img,rect,app_state,model_cd):
+        with self.lock:
+            now=time.time()
+            frame_state={}
+            for label,key in self.label_to_key.items():
+                cx,cy,r=app_state.get_marker_geometry(label)
+                val=self._brightness(img,rect,cx,cy,r)
+                if val is None:
+                    continue
+                ready_hist=self.ready_samples[label]
+                cool_hist=self.cool_samples[label]
+                ready_avg=sum(ready_hist)/len(ready_hist) if ready_hist else val
+                cool_avg=sum(cool_hist)/len(cool_hist) if cool_hist else val
+                threshold=(ready_avg+cool_avg)/2.0
+                if abs(ready_avg-cool_avg)<0.02:
+                    predicted=val<cool_avg if ready_avg>=cool_avg else val>cool_avg
+                else:
+                    predicted=val<threshold if ready_avg>cool_avg else val>threshold
+                timer=now<self.cooldown_until.get(key,0.0)
+                on_cd=predicted or timer
+                frame_state[key]=on_cd
+                if on_cd:
+                    self.cool_samples[label].append(val)
+                    if not timer and key not in ["basic","cancel","recall"]:
+                        self.cooldown_until[key]=now+self._stabilizer(key)
+                else:
+                    self.ready_samples[label].append(val)
+                    if timer and now+0.05<self.cooldown_until.get(key,0.0):
+                        self.cooldown_until[key]=now
+            result={}
+            keys=set(model_cd.keys())|set(self.cooldown_until.keys())
+            for key in keys:
+                timer_flag=now<self.cooldown_until.get(key,0.0)
+                frame_flag=frame_state.get(key)
+                base=model_cd.get(key,False)
+                final=timer_flag or base
+                if frame_flag is not None:
+                    final=frame_flag or timer_flag
+                result[key]=final
+            result["recall"]=False
+            result["basic"]=False
+            result["cancel"]=False
+            return result
 class AppState:
     def __init__(self,file_manager,agent,buffer,hardware_manager):
         self.lock=threading.Lock()
@@ -3162,6 +3320,7 @@ class AppState:
         self.in_recall=False
         self.metrics={"A":0,"B":0,"C":0}
         self.cooldowns={"recall":False,"heal":False,"flash":False,"basic":False,"skill1":False,"skill2":False,"skill3":False,"skill4":False,"active_item":False,"cancel":False}
+        self.cooldown_estimator=CooldownEstimator()
         self.last_user_input=time.time()
         self.user_override=False
         self.intervention_window=0.6
@@ -3330,10 +3489,13 @@ class AppState:
         self.hardware.update_viewport(img.size)
         metrics,hero_dead,in_recall,cooldowns,hid=self.agent.infer_state(img)
         with self.lock:
+            rect=self.window_rect
+        refined=self.cooldown_estimator.evaluate(img,rect,self,cooldowns)
+        with self.lock:
             self.metrics=metrics
             self.hero_dead=hero_dead
             self.in_recall=in_recall
-            self.cooldowns=cooldowns
+            self.cooldowns=refined
             self.current_hidden=hid.clone().detach()
     def update_preview_buffer(self,img):
         rgb=img.convert("RGB")
@@ -3372,9 +3534,17 @@ class AppState:
         with self.lock:
             self.cancel_optimization=False
     def record_ai_action(self,action):
+        self.register_action(action,"ai")
         self.training_controller.record_action(action)
     def consume_ai_action(self):
         return self.training_controller.consume_action()
+    def register_action(self,action,source):
+        if not action:
+            return
+        label=action.get("label")
+        if not label:
+            return
+        self.cooldown_estimator.register_use(label,source)
     def get_marker_geometry(self,label):
         with self.lock:
             rect=self.window_rect
@@ -3631,6 +3801,7 @@ class ScreenshotRecorder(threading.Thread):
                         act=self.input_tracker.pop_action()
                         if act is None:
                             break
+                        self.app_state.register_action(act,"user")
                         actions.append(act)
                     src="user"
                 else:
