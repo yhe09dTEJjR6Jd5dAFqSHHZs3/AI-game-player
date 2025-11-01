@@ -1819,6 +1819,11 @@ def ensure_qt_classes():
             self.sync_timer.timeout.connect(self.sync_with_window)
             self.sync_timer.start(200)
             self.window_visible=True
+        def _ensure_topmost(self):
+            try:
+                win32gui.SetWindowPos(int(self.winId()),win32con.HWND_TOPMOST,0,0,0,0,win32con.SWP_NOMOVE|win32con.SWP_NOSIZE|win32con.SWP_NOACTIVATE)
+            except Exception as e:
+                logger.debug("覆盖层置顶失败:%s",e)
         def mark_dirty(self):
             self.dirty=True
         def consume_dirty(self):
@@ -1922,6 +1927,10 @@ def ensure_qt_classes():
             if desired_visible:
                 if not self.isVisible():
                     self.show()
+                    if self.config_mode:
+                        self._ensure_topmost()
+                elif self.config_mode:
+                    self._ensure_topmost()
             else:
                 if self.isVisible():
                     self.hide()
@@ -1967,6 +1976,16 @@ def ensure_qt_classes():
             if was_visible and not self.isVisible():
                 if self._overlay_visible and (not self.config_mode or self.window_visible):
                     self.show()
+            try:
+                hwnd=int(self.winId())
+                style=win32gui.GetWindowLong(hwnd,win32con.GWL_EXSTYLE)
+                if target:
+                    style|=win32con.WS_EX_TRANSPARENT
+                else:
+                    style&=~win32con.WS_EX_TRANSPARENT
+                win32gui.SetWindowLong(hwnd,win32con.GWL_EXSTYLE,style)
+            except Exception as e:
+                logger.debug("透明状态同步失败:%s",e)
         def set_config_mode(self,enabled):
             self.config_mode=enabled
             self._apply_passthrough(not enabled)
@@ -1975,6 +1994,11 @@ def ensure_qt_classes():
                 for m in self.markers:
                     m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
                 self.last_save_prompt=time.time()
+                self._ensure_topmost()
+                try:
+                    self.raise_()
+                except Exception as e:
+                    logger.debug("覆盖层提升失败:%s",e)
             else:
                 self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
                 for m in self.markers:
@@ -2027,6 +2051,8 @@ def ensure_qt_classes():
             if self._overlay_visible and (not self.config_mode or self.window_visible):
                 if not self.isVisible():
                     self.show()
+                if self.config_mode:
+                    self._ensure_topmost()
             else:
                 if self.isVisible():
                     self.hide()
@@ -3030,7 +3056,7 @@ class TrainingController:
     def get_failed_actions(self):
         with self.lock:
             return list(self.failed_actions)
-    def stop_threads(self):
+    def stop_threads(self,blocking=True):
         with self.lock:
             threads=[self.left_thread,self.right_thread]
             self.left_thread=None
@@ -3038,10 +3064,17 @@ class TrainingController:
         for t in threads:
             if t:
                 t.stop_flag=True
-        for t in threads:
-            if t:
-                t.join(timeout=1.0)
         self.reset_hidden()
+        def join_worker(items):
+            deadline=time.time()+1.0
+            for item in items:
+                if item:
+                    remaining=max(0.0,deadline-time.time())
+                    item.join(timeout=remaining)
+        if blocking:
+            join_worker(threads)
+        else:
+            threading.Thread(target=join_worker,args=(threads,),daemon=True).start()
     def ensure_threads(self):
         need_left=False
         need_right=False
@@ -3252,7 +3285,7 @@ class AppState:
             user_intervened=(time.time()-self.last_user_input)<0.2
             return self.mode==Mode.TRAINING and ((not self.can_record()) or user_intervened)
     def stop_training_threads(self):
-        self.training_controller.stop_threads()
+        self.training_controller.stop_threads(False)
     def enter_learning(self):
         self.stop_training_threads()
         with self.lock:
