@@ -1703,16 +1703,20 @@ def ensure_qt_classes():
                         other.update()
             if hasattr(p,"app_state"):
                 p.app_state.mark_user_input()
-            self.last_pos=event.globalPos()
+            pr=self.parent()
+            self.last_pos=pr.mapFromGlobal(event.globalPos()) if pr else event.globalPos()
             self.update()
         def mouseMoveEvent(self,event):
             if not self.dragging and not self.resizing:
                 self._update_cursor(event.pos())
                 return
-            if not self.last_pos:
-                self.last_pos=event.globalPos()
-            delta=event.globalPos()-self.last_pos
             pr=self.parent()
+            if pr is None:
+                return
+            if not self.last_pos:
+                self.last_pos=pr.mapFromGlobal(event.globalPos())
+            current=pr.mapFromGlobal(event.globalPos())
+            delta=current-self.last_pos
             w=pr.width()
             h=pr.height()
             changed=False
@@ -1724,12 +1728,12 @@ def ensure_qt_classes():
                 changed=delta.x()!=0 or delta.y()!=0
             elif self.resizing:
                 direction=self._handle_direction(self.handle_mode)
-                proj=delta.x()*direction.x()+delta.y()*direction.y()
+                proj=float(delta.x())*direction.x()+float(delta.y())*direction.y()
                 base=self.r_pct*min(w,h)
                 base=max(1.0,base+proj)
                 self.r_pct=clamp(base/float(min(w,h)),0.01,0.5)
                 changed=proj!=0
-            self.last_pos=event.globalPos()
+            self.last_pos=current
             self.update_geometry_from_parent()
             if changed:
                 self.modified=True
