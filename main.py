@@ -1324,12 +1324,13 @@ class RLAgent:
         seq=seq.unsqueeze(0)
         return seq
     def _contrastive_loss(self,features):
+        device=features.device
         if features.size(0)<2:
-            return torch.tensor(0.0,device=self.device)
+            return torch.zeros((),device=device)
         clean=F.normalize(features,dim=-1)
         augmented=F.normalize(clean+torch.randn_like(clean)*0.01,dim=-1)
         logits=clean@augmented.t()/0.1
-        labels=torch.arange(features.size(0),device=self.device)
+        labels=torch.arange(features.size(0),device=device)
         return F.cross_entropy(logits,labels)
     def _map_action_to_option(self,action,A,B,C,hero_dead):
         if action and action.get("hand")=="left":
@@ -1600,11 +1601,13 @@ class RLAgent:
                     h_brain=self.neuro_project(h)
                     sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
                     planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
+                    option_device=option_embeddings.device
+                    sequence=sequence.to(option_device)
                     with torch.no_grad():
-                        R=torch.tensor(rewards,dtype=torch.float32,device=self.device).unsqueeze(1)
-                    option_indices=torch.tensor(option_targets,dtype=torch.long,device=self.device)
-                    option_super=torch.tensor(option_supervision,dtype=torch.float32,device=self.device).unsqueeze(1)
-                    option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=self.device).unsqueeze(1)
+                        R=torch.tensor(rewards,dtype=torch.float32,device=option_device).unsqueeze(1)
+                    option_indices=torch.tensor(option_targets,dtype=torch.long,device=option_device)
+                    option_super=torch.tensor(option_supervision,dtype=torch.float32,device=option_device).unsqueeze(1)
+                    option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=option_device).unsqueeze(1)
                     chosen_embeddings=option_embeddings.index_select(0,option_indices)
                     left_logits,left_val=self.left(sequence,chosen_embeddings)
                     right_logits,right_val=self.right(sequence,chosen_embeddings)
@@ -1612,38 +1615,38 @@ class RLAgent:
                     right_logprob=F.log_softmax(right_logits,dim=-1)
                     left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
                     right_ent=(-right_logprob.exp()*right_logprob).sum(dim=-1).mean()
-                    tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=self.device)
-                    tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=self.device)
-                    ml=torch.tensor(mask_left,dtype=torch.float32,device=self.device)
-                    mr=torch.tensor(mask_right,dtype=torch.float32,device=self.device)
-                    ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum()>0 else torch.tensor(0.0,device=self.device)
-                    rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum()>0 else torch.tensor(0.0,device=self.device)
+                    tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=option_device)
+                    tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=option_device)
+                    ml=torch.tensor(mask_left,dtype=torch.float32,device=option_device)
+                    mr=torch.tensor(mask_right,dtype=torch.float32,device=option_device)
+                    ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum().item()>0 else torch.zeros((),device=option_device)
+                    rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum().item()>0 else torch.zeros((),device=option_device)
                     adv_left=(R-left_val).detach()
                     adv_right=(R-right_val).detach()
-                    rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=self.device).unsqueeze(1)
-                    rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=self.device).unsqueeze(1)
-                    if rl_ml.sum()>0:
+                    rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=option_device).unsqueeze(1)
+                    rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=option_device).unsqueeze(1)
+                    if rl_ml.sum().item()>0:
                         rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
                     else:
-                        rl_pg_left=torch.tensor(0.0,device=self.device)
-                    if rl_mr.sum()>0:
+                        rl_pg_left=torch.zeros((),device=option_device)
+                    if rl_mr.sum().item()>0:
                         rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
                     else:
-                        rl_pg_right=torch.tensor(0.0,device=self.device)
+                        rl_pg_right=torch.zeros((),device=option_device)
                     v_loss=((left_val-R)**2+(right_val-R)**2).mean()
                     planner_logprob=F.log_softmax(planner_logits,dim=-1)
                     planner_entropy=(-planner_logprob.exp()*planner_logprob).sum(dim=-1).mean()
                     if option_super.sum().item()>0:
                         planner_sup=(F.nll_loss(planner_logprob,option_indices,reduction="none")*option_super.squeeze(1)).mean()
                     else:
-                        planner_sup=torch.tensor(0.0,device=self.device)
+                        planner_sup=torch.zeros((),device=option_device)
                     if option_rl.sum().item()>0:
                         planner_pg=-((planner_logprob.gather(1,option_indices.unsqueeze(1))*(R-planner_value).detach())*option_rl).sum()/option_rl.sum()
                     else:
-                        planner_pg=torch.tensor(0.0,device=self.device)
+                        planner_pg=torch.zeros((),device=option_device)
                     termination_penalty=planner_term.gather(1,option_indices.unsqueeze(1)).mean()
                     contrastive=self._contrastive_loss(h_brain)
-                    l2_reg=0.0
+                    l2_reg=torch.zeros((),device=option_device)
                     for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters())+list(self.option_planner.parameters()):
                         l2_reg=l2_reg+p.pow(2).sum()*1e-6
                     loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent+planner_entropy)+planner_sup+planner_pg+termination_penalty*0.1+contrastive*0.5+l2_reg
