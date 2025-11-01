@@ -1452,12 +1452,32 @@ class RLAgent:
             rlogits=self._mask_right_logits(rlogits,new_option,cooldowns,hero_dead,in_recall)
             lprob=F.softmax(llogits/temperature,dim=-1)
             rprob=F.softmax(rlogits/temperature,dim=-1)
-            top_left=torch.topk(lprob,2)
-            left_choice_weights=top_left.values/torch.clamp(top_left.values.sum(),min=1e-6)
-            laction=int(top_left.indices[torch.multinomial(left_choice_weights,1).item()])
-            top_right=torch.topk(rprob,3)
-            right_choice_weights=top_right.values/torch.clamp(top_right.values.sum(),min=1e-6)
-            raction=int(top_right.indices[torch.multinomial(right_choice_weights,1).item()])
+            k_left=max(1,min(2,lprob.size(-1)))
+            top_left=torch.topk(lprob,k=k_left,dim=-1)
+            left_values=top_left.values.reshape(-1)
+            left_indices=top_left.indices.reshape(-1)
+            left_sum=left_values.sum()
+            if left_sum.item()<=0 or not torch.isfinite(left_values).all().item():
+                left_pick=0
+            elif left_values.size(0)==1:
+                left_pick=0
+            else:
+                left_weights=left_values/left_sum
+                left_pick=torch.multinomial(left_weights,1).item()
+            laction=int(left_indices[left_pick].item())
+            k_right=max(1,min(3,rprob.size(-1)))
+            top_right=torch.topk(rprob,k=k_right,dim=-1)
+            right_values=top_right.values.reshape(-1)
+            right_indices=top_right.indices.reshape(-1)
+            right_sum=right_values.sum()
+            if right_sum.item()<=0 or not torch.isfinite(right_values).all().item():
+                right_pick=0
+            elif right_values.size(0)==1:
+                right_pick=0
+            else:
+                right_weights=right_values/right_sum
+                right_pick=torch.multinomial(right_weights,1).item()
+            raction=int(right_indices[right_pick].item())
             return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,None,None
     def neuro_project(self,h_batch):
         with self.device_lock:
