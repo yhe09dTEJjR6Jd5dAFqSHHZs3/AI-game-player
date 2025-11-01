@@ -1801,33 +1801,24 @@ def ensure_qt_classes():
                 else:
                     self.setCursor(QtCore.Qt.ArrowCursor)
     class _OverlayWindow(QtWidgets.QWidget):
-        def __init__(self,app_state):
-            super(_OverlayWindow,self).__init__(None,QtCore.Qt.WindowStaysOnTopHint|QtCore.Qt.FramelessWindowHint|QtCore.Qt.Tool)
-            self.setAttribute(QtCore.Qt.WA_TranslucentBackground,True)
+        def __init__(self,app_state,parent=None):
+            super(_OverlayWindow,self).__init__(parent)
             self.app_state=app_state
-            global OVERLAY_HANDLES
-            OVERLAY_HANDLES.add(int(self.winId()))
             self.markers=[]
             self.selected_marker=None
             self.config_mode=False
-            self._marker_visible_cache={}
             self._overlay_visible=False
+            self._marker_visible_cache={}
             self.undo_stack=deque(maxlen=32)
             self.redo_stack=deque(maxlen=32)
             self.last_save_prompt=time.time()
             self._history_enabled=True
             self.editing_marker=None
             self.dirty=False
-            self.sync_timer=QtCore.QTimer(self)
-            self.sync_timer.timeout.connect(self.sync_with_window)
-            self.sync_timer.start(200)
             self.window_visible=True
-            self._apply_passthrough(True)
-        def _ensure_topmost(self):
-            try:
-                win32gui.SetWindowPos(int(self.winId()),win32con.HWND_TOPMOST,0,0,0,0,win32con.SWP_NOMOVE|win32con.SWP_NOSIZE|win32con.SWP_NOACTIVATE)
-            except Exception as e:
-                logger.debug("覆盖层置顶失败:%s",e)
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground,True)
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
+            self.setMouseTracking(True)
         def mark_dirty(self):
             self.dirty=True
         def consume_dirty(self):
@@ -1926,22 +1917,10 @@ def ensure_qt_classes():
             return QtCore.QSize(400,400)
         def set_overlay_visible(self,visible):
             self._overlay_visible=visible
-            self.sync_with_window()
-            desired_visible=self._overlay_visible and (not self.config_mode or self.window_visible)
-            if desired_visible:
-                if not self.isVisible():
-                    self.show()
-                    if self.config_mode:
-                        self._ensure_topmost()
-                elif self.config_mode:
-                    self._ensure_topmost()
-            else:
-                if self.isVisible():
-                    self.hide()
             self._update_marker_visibility(True)
         def _update_marker_visibility(self,force=False):
+            desired=self.config_mode and self._overlay_visible
             for m in self.markers:
-                desired=self.config_mode and self._overlay_visible and self.window_visible
                 if force or self._marker_visible_cache.get(m)!=desired:
                     if desired:
                         if not m.isVisible():
@@ -1951,114 +1930,12 @@ def ensure_qt_classes():
                             m.hide()
                     self._marker_visible_cache[m]=desired
                 m.update_geometry_from_parent()
-        def _marker_at_global(self,point):
-            for m in self.markers:
-                if not m.isVisible():
-                    continue
-                rect=QtCore.QRect(m.mapToGlobal(QtCore.QPoint(0,0)),m.size())
-                if not rect.contains(point):
-                    continue
-                local=m.mapFromGlobal(point)
-                center=QtCore.QPointF(m.width()/2,m.height()/2)
-                r=min(m.width(),m.height())/2
-                dist=((local.x()-center.x())**2+(local.y()-center.y())**2)**0.5
-                if dist<=r or m._hit_test_handle(QtCore.QPointF(local.x(),local.y())):
-                    return m
-            return None
-        def _apply_passthrough(self,enabled):
-            flags=self.windowFlags()
-            current=bool(flags&QtCore.Qt.WindowTransparentForInput)
-            target=bool(enabled)
-            if target:
-                flags|=QtCore.Qt.WindowTransparentForInput
-            else:
-                flags&=~QtCore.Qt.WindowTransparentForInput
-            if current!=target:
-                was_visible=self.isVisible()
-                self.setWindowFlags(flags)
-                if was_visible and not self.isVisible():
-                    if self._overlay_visible and (not self.config_mode or self.window_visible):
-                        self.show()
-            try:
-                hwnd=int(self.winId())
-                style=win32gui.GetWindowLong(hwnd,win32con.GWL_EXSTYLE)
-                if target:
-                    style|=win32con.WS_EX_TRANSPARENT
-                else:
-                    style&=~win32con.WS_EX_TRANSPARENT
-                win32gui.SetWindowLong(hwnd,win32con.GWL_EXSTYLE,style)
-            except Exception as e:
-                logger.debug("透明状态同步失败:%s",e)
-        def set_config_mode(self,enabled):
-            self.config_mode=enabled
-            self._apply_passthrough(not enabled)
-            if enabled:
-                self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
-                for m in self.markers:
-                    m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,False)
-                self.last_save_prompt=time.time()
-                self._ensure_topmost()
-                try:
-                    self.raise_()
-                except Exception as e:
-                    logger.debug("覆盖层提升失败:%s",e)
-            else:
-                self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
-                for m in self.markers:
-                    m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,True)
-            self._update_marker_visibility(True)
-            self.sync_with_window()
-        def nativeEvent(self,eventType,message):
-            if eventType=="windows_generic_MSG":
-                msg=ctypes.wintypes.MSG.from_address(int(message))
-                if msg.message==0x0084:
-                    if not (self.config_mode and self._overlay_visible and self.window_visible and self.isVisible()):
-                        return True,-1
-                    pt=msg.pt
-                    marker=self._marker_at_global(QtCore.QPoint(pt.x,pt.y))
-                    if marker is not None:
-                        return True,1
-                    return True,-1
-            return super(_OverlayWindow,self).nativeEvent(eventType,message)
         def sync_with_window(self):
-            global OVERLAY_HANDLES
-            OVERLAY_HANDLES.add(int(self.winId()))
-            with self.app_state.lock:
-                hwnd=self.app_state.hwnd
-                rect=self.app_state.window_rect
-            if hwnd is None:
-                if self.isVisible():
-                    self.hide()
-                self.window_visible=False
+            parent=self.parentWidget()
+            if parent is None:
                 return
-            try:
-                rect=get_window_rect(hwnd)
-                with self.app_state.lock:
-                    self.app_state.window_rect=rect
-            except Exception as e:
-                logger.debug("同步窗口失败:%s",e)
-            visible_now=window_visible(hwnd)
-            self.window_visible=visible_now
-            x1,y1,x2,y2=self.app_state.window_rect
-            if x2<=x1 or y2<=y1:
-                if self.isVisible():
-                    self.hide()
-                self._update_marker_visibility(True)
-                return
-            self.setGeometry(x1,y1,x2-x1,y2-y1)
-            if not visible_now:
-                if self.isVisible():
-                    self.hide()
-                self._update_marker_visibility(True)
-                return
-            if self._overlay_visible and (not self.config_mode or self.window_visible):
-                if not self.isVisible():
-                    self.show()
-                if self.config_mode:
-                    self._ensure_topmost()
-            else:
-                if self.isVisible():
-                    self.hide()
+            size=parent.size()
+            self.setGeometry(0,0,size.width(),size.height())
             for m in self.markers:
                 m.update_geometry_from_parent()
         def load_from_config(self,records,spec):
@@ -2161,28 +2038,53 @@ def ensure_qt_classes():
             marker.y_pct=0.5
             marker.r_pct=clamp(float(cfg.get("radius",0.05)),0.01,0.5)
             marker.update_geometry_from_parent()
-            marker.update()
+            marker.show()
             self.mark_dirty()
-            self.app_state.mark_user_input()
             return marker
         def remove_selected_marker(self):
-            if self.selected_marker in self.markers:
-                self._push_history()
-                target=self.selected_marker
-                self.markers.remove(target)
-                if target in self._marker_visible_cache:
-                    self._marker_visible_cache.pop(target,None)
-                target.hide()
-                target.setParent(None)
-                target.deleteLater()
-                self.selected_marker=None
-                self.mark_dirty()
-                self.app_state.mark_user_input()
+            marker=self.selected_marker
+            if not marker:
+                return
+            if MARKER_SPEC.get(marker.label,{}).get("required"):
+                return
+            self._push_history()
+            self.markers=[m for m in self.markers if m is not marker]
+            marker.hide()
+            marker.setParent(None)
+            marker.deleteLater()
+            self.selected_marker=None
+            self.mark_dirty()
+            self.app_state.mark_user_input()
+        def set_selected_marker(self,label):
+            marker=self.find_marker(label)
+            if not marker:
+                return
+            self.selected_marker=marker
+            for m in self.markers:
+                m.selected=(m is marker)
+                m.update()
         def get_marker_data(self):
             out=[]
             for m in self.markers:
                 out.append(MarkerData(m.label,m.x_pct,m.y_pct,m.r_pct,m.color.name(),m.alpha,getattr(m,"placeholder",False)))
             return out
+        def set_config_mode(self,enabled):
+            self.config_mode=enabled
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,not enabled)
+            for m in self.markers:
+                m.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,not enabled)
+            if enabled:
+                self.last_save_prompt=time.time()
+            else:
+                self.selected_marker=None
+                for m in self.markers:
+                    m.selected=False
+                    m.update()
+            self._update_marker_visibility(True)
+        def resizeEvent(self,event):
+            QtWidgets.QWidget.resizeEvent(self,event)
+            for m in self.markers:
+                m.update_geometry_from_parent()
     class _WindowSelectorDialog(QtWidgets.QDialog):
         def __init__(self,parent=None):
             super(_WindowSelectorDialog,self).__init__(parent)
@@ -2251,6 +2153,28 @@ def ensure_qt_classes():
             self.mainLayout.addWidget(self.statusGroup)
             self.progressBar=QtWidgets.QProgressBar()
             self.mainLayout.addWidget(self.progressBar)
+            self.previewGroup=QtWidgets.QGroupBox("窗口预览")
+            self.previewLayout=QtWidgets.QVBoxLayout(self.previewGroup)
+            self.previewFrame=QtWidgets.QWidget()
+            self.previewFrame.setMinimumSize(480,270)
+            self.previewFrame.setSizePolicy(QtWidgets.QSizePolicy.Expanding,QtWidgets.QSizePolicy.Expanding)
+            self.previewFrame.setStyleSheet("background:#101010;border-radius:8px;")
+            self.previewStack=QtWidgets.QStackedLayout(self.previewFrame)
+            self.previewStack.setStackingMode(QtWidgets.QStackedLayout.StackAll)
+            self.previewImage=QtWidgets.QLabel()
+            self.previewImage.setAlignment(QtCore.Qt.AlignCenter)
+            self.previewImage.setScaledContents(True)
+            self.previewImage.setStyleSheet("background:#000000;border-radius:8px;color:#666666;")
+            self.previewImage.setText("等待捕获")
+            self.previewOverlay=OverlayWindow(self.app_state,self.previewFrame)
+            self.previewOverlay.set_overlay_visible(False)
+            self.previewStack.addWidget(self.previewImage)
+            self.previewStack.addWidget(self.previewOverlay)
+            self.previewLayout.addWidget(self.previewFrame)
+            with self.app_state.lock:
+                self.app_state.overlay=self.previewOverlay
+            self.previewBytes=None
+            self.previewPixmap=None
             self.chooseWindowBtn=QtWidgets.QPushButton("选择窗口")
             self.optimizeBtn=QtWidgets.QPushButton("优化")
             self.cancelOptimizeBtn=QtWidgets.QPushButton("取消优化")
@@ -2277,7 +2201,6 @@ def ensure_qt_classes():
             self.controlLayout.addWidget(self.redoBtn,3,1)
             spacer=QtWidgets.QSpacerItem(20,20,QtWidgets.QSizePolicy.Expanding,QtWidgets.QSizePolicy.Minimum)
             self.controlLayout.addItem(spacer,3,2)
-            self.mainLayout.addWidget(self.controlGroup)
             self.markerList=QtWidgets.QListWidget()
             self.markerList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
             self.markerList.setAlternatingRowColors(True)
@@ -2300,7 +2223,16 @@ def ensure_qt_classes():
             self.infoSplitter.addWidget(self.perfGroup)
             self.infoSplitter.setStretchFactor(0,1)
             self.infoSplitter.setStretchFactor(1,2)
-            self.mainLayout.addWidget(self.infoSplitter)
+            self.leftPanel=QtWidgets.QWidget()
+            self.leftLayout=QtWidgets.QVBoxLayout(self.leftPanel)
+            self.leftLayout.addWidget(self.previewGroup,1)
+            self.leftLayout.addWidget(self.controlGroup)
+            self.contentSplitter=QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+            self.contentSplitter.addWidget(self.leftPanel)
+            self.contentSplitter.addWidget(self.infoSplitter)
+            self.contentSplitter.setStretchFactor(0,3)
+            self.contentSplitter.setStretchFactor(1,2)
+            self.mainLayout.addWidget(self.contentSplitter,1)
             self.cancelOptimizeBtn.setEnabled(False)
             self.saveConfigBtn.setEnabled(False)
             self.addMarkerBtn.setEnabled(False)
@@ -2309,7 +2241,6 @@ def ensure_qt_classes():
             self.redoBtn.setEnabled(False)
             self.calibrateBtn.setEnabled(False)
             self.markerListSnapshot=[]
-            self.overlay=None
             self.saving_config=False
             self.chooseWindowBtn.clicked.connect(self.on_choose_window)
             self.optimizeBtn.clicked.connect(self.on_optimize)
@@ -2466,12 +2397,27 @@ def ensure_qt_classes():
                 parts.append("%s(%s)"%(label,"是" if cd.get(key,False) else "否"))
             self.cooldownLabel.setText("冷却:"+" ".join(parts))
             self.chooseWindowBtn.setEnabled(snap["ready"])
+            visible_ready=snap.get("window_visible") and not snap["paused"]
             self.optimizeBtn.setEnabled(snap["mode"]==Mode.LEARNING and snap["ready"] and has_window and not running_opt)
             self.cancelOptimizeBtn.setEnabled(running_opt)
-            self.configBtn.setEnabled(snap["mode"]==Mode.LEARNING and has_window and not running_opt)
+            self.configBtn.setEnabled(snap["mode"]==Mode.LEARNING and has_window and not running_opt and visible_ready)
             self._sync_config_controls()
+            payload=self.app_state.consume_preview_image()
             overlay=self.app_state.overlay
+            if payload:
+                data_bytes,size=payload
+                w,h=size
+                if w>0 and h>0:
+                    image=QtGui.QImage(data_bytes,w,h,3*w,QtGui.QImage.Format_RGB888)
+                    pixmap=QtGui.QPixmap.fromImage(image)
+                    self.previewBytes=data_bytes
+                    self.previewPixmap=pixmap
+                    self.previewImage.setPixmap(pixmap)
             if overlay:
+                want_config=snap["mode"]==Mode.CONFIGURING
+                if overlay.config_mode!=want_config:
+                    overlay.set_config_mode(want_config)
+                overlay.set_overlay_visible(want_config)
                 overlay.sync_with_window()
             self._refresh_marker_list(overlay)
             perf=self.hardware.get_performance_snapshot()
@@ -2572,19 +2518,25 @@ def ensure_qt_classes():
             if self.app_state.optimization_running():
                 self.app_state.request_cancel_optimization()
         def on_configure(self):
-            if self.app_state.mode!=Mode.LEARNING:
+            snap=self.app_state.get_state_snapshot()
+            if snap["mode"]!=Mode.LEARNING:
                 QtWidgets.QMessageBox.information(self,"切换模式","请在学习模式下进行配置")
                 return
+            if not (snap.get("window_visible") and not snap["paused"]):
+                QtWidgets.QMessageBox.warning(self,"窗口不可见","请确保所选窗口可见且完整后再配置")
+                return
             overlay=self.app_state.ensure_overlay_initialized()
+            if overlay is None:
+                QtWidgets.QMessageBox.warning(self,"未就绪","预览尚未准备好")
+                return
             self.app_state.set_mode(Mode.CONFIGURING)
             overlay.set_config_mode(True)
             overlay.set_overlay_visible(True)
-            overlay.raise_()
-            overlay.activateWindow()
             overlay.sync_with_window()
             self._refresh_marker_list(overlay)
             self._update_marker_hint(overlay.selected_marker)
             self._sync_config_controls()
+            self.app_state.mark_user_input()
         def on_save_config(self):
             if self.app_state.mode!=Mode.CONFIGURING:
                 return
@@ -2613,6 +2565,9 @@ def ensure_qt_classes():
                 overlay.redo()
         def on_calibrate(self):
             overlay=self.app_state.ensure_overlay_initialized()
+            if overlay is None:
+                QtWidgets.QMessageBox.warning(self,"未就绪","预览尚未准备好")
+                return
             stats=self.app_state.buffer.get_user_click_stats()
             overlay.apply_calibration(stats)
         def save_markers_to_manager(self,async_mode=False,callback=None):
@@ -2652,6 +2607,9 @@ def ensure_qt_classes():
                 callback(success,message)
         def on_add_marker(self):
             overlay=self.app_state.ensure_overlay_initialized()
+            if overlay is None:
+                QtWidgets.QMessageBox.warning(self,"未就绪","预览尚未准备好")
+                return
             available=overlay.get_missing_labels(self.app_state.marker_spec)
             if not available:
                 QtWidgets.QMessageBox.information(self,"无需添加","所有标志均已存在")
@@ -3188,6 +3146,9 @@ class AppState:
         self.buffer=self.context.buffer
         self.hardware=self.context.hardware
         self.overlay=None
+        self.preview_bytes=None
+        self.preview_size=(0,0)
+        self.preview_changed=False
         self.training_controller=TrainingController(self)
         self.cancel_optimization=False
         self.idle_threshold=10.0
@@ -3311,6 +3272,21 @@ class AppState:
             self.in_recall=in_recall
             self.cooldowns=cooldowns
             self.current_hidden=hid.clone().detach()
+    def update_preview_buffer(self,img):
+        rgb=img.convert("RGB")
+        data_bytes=rgb.tobytes()
+        with self.lock:
+            self.preview_bytes=data_bytes
+            self.preview_size=rgb.size
+            self.preview_changed=True
+    def consume_preview_image(self):
+        with self.lock:
+            if not self.preview_changed:
+                return None
+            data_bytes=self.preview_bytes
+            size=self.preview_size
+            self.preview_changed=False
+        return data_bytes,size
     def get_state_snapshot(self):
         with self.lock:
             try:
@@ -3359,14 +3335,12 @@ class AppState:
         with self.lock:
             overlay=self.overlay
         if overlay is None:
-            overlay=OverlayWindow(self)
-            with self.lock:
-                self.overlay=overlay
+            return None
         markers=self.file_manager.load_markers()
-        self.overlay.load_from_config(markers,self.marker_spec)
-        self.overlay.ensure_required_markers(self.marker_spec)
-        self.overlay.sync_with_window()
-        return self.overlay
+        overlay.load_from_config(markers,self.marker_spec)
+        overlay.ensure_required_markers(self.marker_spec)
+        overlay.sync_with_window()
+        return overlay
     def on_window_selected(self,hwnd,rect,title=None):
         name=title
         if not name:
@@ -3384,8 +3358,9 @@ class AppState:
         self.hardware.update_viewport(rect)
         self.set_visibility_paused(not window_visible(hwnd))
         overlay=self.ensure_overlay_initialized()
-        overlay.set_config_mode(False)
-        overlay.set_overlay_visible(False)
+        if overlay:
+            overlay.set_config_mode(False)
+            overlay.set_overlay_visible(False)
         self.buffer.refresh_paths()
 class InputTracker:
     def __init__(self,app_state):
@@ -3576,6 +3551,17 @@ class ScreenshotRecorder(threading.Thread):
             if img is not None:
                 self.rate_controller.record_latency("screenshot",time.time()-capture_start)
                 self.app_state.update_state_from_frame(img)
+                try:
+                    tw,th=self.rate_controller.suggest_visual_size()
+                except Exception:
+                    tw,th=img.size
+                if tw<=0 or th<=0:
+                    tw,th=img.size
+                try:
+                    preview_img=img.resize((tw,th),ImageModule.BILINEAR) if (tw,th)!=img.size else img.copy()
+                except Exception:
+                    preview_img=img.copy()
+                self.app_state.update_preview_buffer(preview_img)
                 if mode==Mode.LEARNING:
                     actions=[]
                     while True:
