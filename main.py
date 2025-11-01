@@ -3139,6 +3139,8 @@ class AppState:
         self.metrics={"A":0,"B":0,"C":0}
         self.cooldowns={"recall":False,"heal":False,"flash":False,"basic":False,"skill1":False,"skill2":False,"skill3":False,"skill4":False,"active_item":False,"cancel":False}
         self.last_user_input=time.time()
+        self.user_override=False
+        self.intervention_window=0.6
         self.progress=0
         self.context=SubsystemContext(file_manager,agent,buffer,hardware_manager)
         self.file_manager=self.context.file_manager
@@ -3191,10 +3193,16 @@ class AppState:
             self.mode=m
     def can_record(self):
         with self.lock:
-            return self.mode in [Mode.LEARNING,Mode.TRAINING] and self.hwnd is not None and window_visible(self.hwnd) and not self.paused_by_visibility
+            mode=self.mode
+            hwnd=self.hwnd
+            paused=self.paused_by_visibility
+        return mode in [Mode.LEARNING,Mode.TRAINING] and hwnd is not None and window_visible(hwnd) and not paused
     def mark_user_input(self):
+        t=time.time()
         with self.lock:
-            self.last_user_input=time.time()
+            self.last_user_input=t
+            if self.mode==Mode.TRAINING:
+                self.user_override=True
     def set_visibility_paused(self,paused):
         with self.lock:
             if self.paused_by_visibility!=paused:
@@ -3243,24 +3251,55 @@ class AppState:
             return None
     def should_switch_to_training(self):
         with self.lock:
-            return self.mode==Mode.LEARNING and (time.time()-self.last_user_input)>=self.idle_threshold and self.can_record()
+            mode=self.mode
+            idle=time.time()-self.last_user_input
+            hwnd=self.hwnd
+            paused=self.paused_by_visibility
+            override=self.user_override
+        if override:
+            return False
+        if mode!=Mode.LEARNING:
+            return False
+        if idle<self.idle_threshold:
+            return False
+        if hwnd is None or paused:
+            return False
+        return window_visible(hwnd)
     def must_back_to_learning(self):
         with self.lock:
-            user_intervened=(time.time()-self.last_user_input)<0.2
-            return self.mode==Mode.TRAINING and ((not self.can_record()) or user_intervened)
+            mode=self.mode
+            elapsed=time.time()-self.last_user_input
+            hwnd=self.hwnd
+            paused=self.paused_by_visibility
+            override=self.user_override
+        if mode!=Mode.TRAINING:
+            return False
+        if override:
+            return True
+        if elapsed<self.intervention_window:
+            return True
+        if hwnd is None or paused:
+            return True
+        return not window_visible(hwnd)
     def stop_training_threads(self):
         self.training_controller.stop_threads(False)
     def enter_learning(self):
         self.stop_training_threads()
+        t=time.time()
         with self.lock:
             self.mode=Mode.LEARNING
-            self.last_user_input=time.time()
+            self.user_override=False
+            self.last_user_input=t
     def enter_training(self):
+        t=time.time()
         with self.lock:
             if self.mode==Mode.TRAINING:
+                self.user_override=False
+                self.last_user_input=t
                 return
             self.mode=Mode.TRAINING
-            self.last_user_input=time.time()
+            self.user_override=False
+            self.last_user_input=t
         self.training_controller.reset_hidden()
         self.training_controller.ensure_threads()
     def update_state_from_frame(self,img):
