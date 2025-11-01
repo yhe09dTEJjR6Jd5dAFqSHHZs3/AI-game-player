@@ -1216,6 +1216,7 @@ class RLAgent:
     def __init__(self,file_manager,hardware_manager):
         self.hardware=hardware_manager
         self.hardware.refresh(True)
+        self.device_lock=threading.RLock()
         self.device=self.hardware.suggest_device()
         self.vision=VisionModel().to(self.device)
         self.left=TransformerHandPolicy(32,16).to(self.device)
@@ -1286,33 +1287,41 @@ class RLAgent:
         self.cpu_batch=None
         self.batch_capacity=0
         self.batch_shape=None
-    def ensure_device(self):
-        self.hardware.refresh()
-        target=self.hardware.suggest_device()
-        if not self._needs_device_sync(target):
-            return
-        self._move_to_device(target)
-    def preprocess_frame(self,img):
-        self.ensure_device()
+    def _preprocess_frame_locked(self,img):
         w,h=self.hardware.suggest_visual_size()
         img=img.resize((w,h))
         arr=np.array(img).astype(np.float32)/255.0
         arr=np.transpose(arr,(2,0,1))
         t=torch.tensor(arr,dtype=torch.float32).unsqueeze(0).to(self.device)
         return t
+    def _ensure_device_locked(self):
+        self.hardware.refresh()
+        target=self.hardware.suggest_device()
+        if not self._needs_device_sync(target):
+            return
+        self._move_to_device(target)
+    def ensure_device(self):
+        with self.device_lock:
+            self._ensure_device_locked()
+    def preprocess_frame(self,img):
+        with self.device_lock:
+            self._ensure_device_locked()
+            t=self._preprocess_frame_locked(img)
+            return t
     def infer_state(self,img):
-        self.ensure_device()
-        with torch.no_grad():
-            t=self.preprocess_frame(img)
-            metrics,flags,h=self.vision(t)
-            brain_output,self.neuro_state=self.neuro_module(h[0],self.neuro_state)
-            self.state_history.append(brain_output.detach().cpu())
-            metrics=metrics[0].cpu().numpy()
-            flags=flags[0].cpu().numpy()
-            hero_dead=bool(flags[0]>0.5)
-            in_recall=bool(flags[1]>0.5)
-            cooldowns={"recall":False,"heal":bool(flags[2]>0.5),"flash":bool(flags[3]>0.5),"basic":False,"skill1":bool(flags[4]>0.5),"skill2":bool(flags[5]>0.5),"skill3":bool(flags[6]>0.5),"skill4":bool(flags[7]>0.5),"active_item":bool(flags[8]>0.5),"cancel":False}
-            return {"A":int(max(metrics[0],0)),"B":int(max(metrics[1],0)),"C":int(max(metrics[2],0))},hero_dead,in_recall,cooldowns,brain_output.detach().cpu()
+        with self.device_lock:
+            self._ensure_device_locked()
+            with torch.no_grad():
+                t=self._preprocess_frame_locked(img)
+                metrics,flags,h=self.vision(t)
+                brain_output,self.neuro_state=self.neuro_module(h[0],self.neuro_state)
+                self.state_history.append(brain_output.detach().cpu())
+                metrics=metrics[0].cpu().numpy()
+                flags=flags[0].cpu().numpy()
+                hero_dead=bool(flags[0]>0.5)
+                in_recall=bool(flags[1]>0.5)
+                cooldowns={"recall":False,"heal":bool(flags[2]>0.5),"flash":bool(flags[3]>0.5),"basic":False,"skill1":bool(flags[4]>0.5),"skill2":bool(flags[5]>0.5),"skill3":bool(flags[6]>0.5),"skill4":bool(flags[7]>0.5),"active_item":bool(flags[8]>0.5),"cancel":False}
+                return {"A":int(max(metrics[0],0)),"B":int(max(metrics[1],0)),"C":int(max(metrics[2],0))},hero_dead,in_recall,cooldowns,brain_output.detach().cpu()
     def _build_sequence_tensor(self):
         if len(self.state_history)==0:
             return torch.zeros(1,1,32,device=self.device)
@@ -1415,55 +1424,58 @@ class RLAgent:
             return base
         return logits
     def select_actions(self,h_state,left_hidden,right_hidden,cooldowns,mode,hero_dead,in_recall):
-        self.ensure_device()
-        seq=self._build_sequence_tensor()
-        context=self._build_context_features(h_state,cooldowns,mode,hero_dead,in_recall)
-        planner_input=(h_state+context).unsqueeze(0)
-        planner_logits,planner_term,option_embeddings,_=self.option_planner(planner_input)
-        planner_logits=self._apply_option_diversity(planner_logits)
-        temperature=self._update_temperature()
-        option_probs=F.softmax(planner_logits/temperature,dim=-1)
-        terminate=planner_term[0,self.current_option].item()
-        adaptive_term=terminate+float(hero_dead or in_recall)*0.5
-        if adaptive_term>0.6 or random.random()<adaptive_term:
-            topk=torch.topk(option_probs[0],k=min(3,option_probs.size(-1)))
-            choice_weights=topk.values/torch.clamp(topk.values.sum(),min=1e-6)
-            pick=torch.multinomial(choice_weights,1).item()
-            new_option=int(topk.indices[pick].item())
-        else:
-            new_option=self.current_option
-        self.current_option=new_option
-        option_vec=option_embeddings[new_option].unsqueeze(0).to(self.device)
-        self.option_history.append(new_option)
-        llogits,lval=self.left(seq,option_vec)
-        rlogits,rval=self.right(seq,option_vec)
-        llogits=self._mask_left_logits(llogits,hero_dead,in_recall,mode)
-        rlogits=self._mask_right_logits(rlogits,new_option,cooldowns,hero_dead,in_recall)
-        lprob=F.softmax(llogits/temperature,dim=-1)
-        rprob=F.softmax(rlogits/temperature,dim=-1)
-        top_left=torch.topk(lprob,2)
-        left_choice_weights=top_left.values/torch.clamp(top_left.values.sum(),min=1e-6)
-        laction=int(top_left.indices[torch.multinomial(left_choice_weights,1).item()])
-        top_right=torch.topk(rprob,3)
-        right_choice_weights=top_right.values/torch.clamp(top_right.values.sum(),min=1e-6)
-        raction=int(top_right.indices[torch.multinomial(right_choice_weights,1).item()])
-        return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,None,None
+        with self.device_lock:
+            self._ensure_device_locked()
+            seq=self._build_sequence_tensor()
+            context=self._build_context_features(h_state,cooldowns,mode,hero_dead,in_recall)
+            planner_input=(h_state+context).unsqueeze(0)
+            planner_logits,planner_term,option_embeddings,_=self.option_planner(planner_input)
+            planner_logits=self._apply_option_diversity(planner_logits)
+            temperature=self._update_temperature()
+            option_probs=F.softmax(planner_logits/temperature,dim=-1)
+            terminate=planner_term[0,self.current_option].item()
+            adaptive_term=terminate+float(hero_dead or in_recall)*0.5
+            if adaptive_term>0.6 or random.random()<adaptive_term:
+                topk=torch.topk(option_probs[0],k=min(3,option_probs.size(-1)))
+                choice_weights=topk.values/torch.clamp(topk.values.sum(),min=1e-6)
+                pick=torch.multinomial(choice_weights,1).item()
+                new_option=int(topk.indices[pick].item())
+            else:
+                new_option=self.current_option
+            self.current_option=new_option
+            option_vec=option_embeddings[new_option].unsqueeze(0).to(self.device)
+            self.option_history.append(new_option)
+            llogits,lval=self.left(seq,option_vec)
+            rlogits,rval=self.right(seq,option_vec)
+            llogits=self._mask_left_logits(llogits,hero_dead,in_recall,mode)
+            rlogits=self._mask_right_logits(rlogits,new_option,cooldowns,hero_dead,in_recall)
+            lprob=F.softmax(llogits/temperature,dim=-1)
+            rprob=F.softmax(rlogits/temperature,dim=-1)
+            top_left=torch.topk(lprob,2)
+            left_choice_weights=top_left.values/torch.clamp(top_left.values.sum(),min=1e-6)
+            laction=int(top_left.indices[torch.multinomial(left_choice_weights,1).item()])
+            top_right=torch.topk(rprob,3)
+            right_choice_weights=top_right.values/torch.clamp(top_right.values.sum(),min=1e-6)
+            raction=int(top_right.indices[torch.multinomial(right_choice_weights,1).item()])
+            return laction,raction,lprob[0,laction],rprob[0,raction],lval,rval,None,None
     def neuro_project(self,h_batch):
-        self.ensure_device()
-        if h_batch.device!=self.device:
-            h_batch=h_batch.to(self.device)
-        outputs=[]
-        state=torch.zeros(h_batch.size(1),device=self.device,dtype=h_batch.dtype)
-        for i in range(h_batch.size(0)):
-            out,state=self.neuro_module(h_batch[i],state)
-            outputs.append(out.unsqueeze(0))
-        return torch.cat(outputs,dim=0)
+        with self.device_lock:
+            self._ensure_device_locked()
+            if h_batch.device!=self.device:
+                h_batch=h_batch.to(self.device)
+            outputs=[]
+            state=torch.zeros(h_batch.size(1),device=self.device,dtype=h_batch.dtype)
+            for i in range(h_batch.size(0)):
+                out,state=self.neuro_module(h_batch[i],state)
+                outputs.append(out.unsqueeze(0))
+            return torch.cat(outputs,dim=0)
     def reset_neuro_state(self):
-        self.ensure_device()
-        self.neuro_state=torch.zeros(32,device=self.device)
-        self.state_history.clear()
-        self.option_history.clear()
-        self.current_option=0
+        with self.device_lock:
+            self._ensure_device_locked()
+            self.neuro_state=torch.zeros(32,device=self.device)
+            self.state_history.clear()
+            self.option_history.clear()
+            self.current_option=0
     def _ensure_batch_buffers(self,count,shape):
         c=shape[0]
         h=shape[1]
@@ -1566,122 +1578,124 @@ class RLAgent:
                     rl_mask_right.append(right_rl)
                 if not arr_list:
                     continue
-                use_amp=self.scaler.is_enabled() and self.device.type=='cuda'
-                amp_device='cuda' if self.device.type=='cuda' else 'cpu'
-                try:
-                    t_batch=self._batch_from_arrays(arr_list)
-                    with amp.autocast(amp_device,enabled=use_amp):
-                        metrics,flags,h=self.vision(t_batch)
-                except torch.cuda.OutOfMemoryError:
-                    self.hardware.handle_oom(len(arr_list))
-                    self.batch_buffer=None
-                    self.cpu_batch=None
-                    self.batch_capacity=0
-                    self.batch_shape=None
-                    continue
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
+                with self.device_lock:
+                    self._ensure_device_locked()
+                    use_amp=self.scaler.is_enabled() and self.device.type=='cuda'
+                    amp_device='cuda' if self.device.type=='cuda' else 'cpu'
+                    try:
+                        t_batch=self._batch_from_arrays(arr_list)
+                        with amp.autocast(amp_device,enabled=use_amp):
+                            metrics,flags,h=self.vision(t_batch)
+                    except torch.cuda.OutOfMemoryError:
                         self.hardware.handle_oom(len(arr_list))
                         self.batch_buffer=None
                         self.cpu_batch=None
                         self.batch_capacity=0
                         self.batch_shape=None
                         continue
-                    raise
-                except MemoryError:
-                    self.hardware.handle_oom(len(arr_list))
-                    self.batch_buffer=None
-                    self.cpu_batch=None
-                    self.batch_capacity=0
-                    self.batch_shape=None
-                    continue
-                any_step=True
-                effective_steps+=1
-                with amp.autocast(amp_device,enabled=use_amp):
-                    h_brain=self.neuro_project(h)
-                    sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
-                    planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
-                    option_device=option_embeddings.device
-                    sequence=sequence.to(option_device)
-                    with torch.no_grad():
-                        R=torch.tensor(rewards,dtype=torch.float32,device=option_device).unsqueeze(1)
-                    option_indices=torch.tensor(option_targets,dtype=torch.long,device=option_device)
-                    option_super=torch.tensor(option_supervision,dtype=torch.float32,device=option_device).unsqueeze(1)
-                    option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=option_device).unsqueeze(1)
-                    chosen_embeddings=option_embeddings.index_select(0,option_indices)
-                    left_logits,left_val=self.left(sequence,chosen_embeddings)
-                    right_logits,right_val=self.right(sequence,chosen_embeddings)
-                    left_logprob=F.log_softmax(left_logits,dim=-1)
-                    right_logprob=F.log_softmax(right_logits,dim=-1)
-                    left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
-                    right_ent=(-right_logprob.exp()*right_logprob).sum(dim=-1).mean()
-                    tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=option_device)
-                    tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=option_device)
-                    ml=torch.tensor(mask_left,dtype=torch.float32,device=option_device)
-                    mr=torch.tensor(mask_right,dtype=torch.float32,device=option_device)
-                    ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum().item()>0 else torch.zeros((),device=option_device)
-                    rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum().item()>0 else torch.zeros((),device=option_device)
-                    adv_left=(R-left_val).detach()
-                    adv_right=(R-right_val).detach()
-                    rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=option_device).unsqueeze(1)
-                    rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=option_device).unsqueeze(1)
-                    if rl_ml.sum().item()>0:
-                        rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
-                    else:
-                        rl_pg_left=torch.zeros((),device=option_device)
-                    if rl_mr.sum().item()>0:
-                        rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
-                    else:
-                        rl_pg_right=torch.zeros((),device=option_device)
-                    v_loss=((left_val-R)**2+(right_val-R)**2).mean()
-                    planner_logprob=F.log_softmax(planner_logits,dim=-1)
-                    planner_entropy=(-planner_logprob.exp()*planner_logprob).sum(dim=-1).mean()
-                    if option_super.sum().item()>0:
-                        planner_sup=(F.nll_loss(planner_logprob,option_indices,reduction="none")*option_super.squeeze(1)).mean()
-                    else:
-                        planner_sup=torch.zeros((),device=option_device)
-                    if option_rl.sum().item()>0:
-                        planner_pg=-((planner_logprob.gather(1,option_indices.unsqueeze(1))*(R-planner_value).detach())*option_rl).sum()/option_rl.sum()
-                    else:
-                        planner_pg=torch.zeros((),device=option_device)
-                    termination_penalty=planner_term.gather(1,option_indices.unsqueeze(1)).mean()
-                    contrastive=self._contrastive_loss(h_brain)
-                    l2_reg=torch.zeros((),device=option_device)
-                    for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters())+list(self.option_planner.parameters()):
-                        l2_reg=l2_reg+p.pow(2).sum()*1e-6
-                    loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent+planner_entropy)+planner_sup+planner_pg+termination_penalty*0.1+contrastive*0.5+l2_reg
-                meta_snapshot=self.meta_controller.capture()
-                self.vision_opt.zero_grad()
-                self.left_opt.zero_grad()
-                self.right_opt.zero_grad()
-                self.neuro_opt.zero_grad()
-                self.option_opt.zero_grad()
-                optimizers=[self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]
-                for opt in optimizers:
-                    for g in opt.param_groups:
-                        base_lr=g.get("_base_lr",g["lr"])
-                        g["_base_lr"]=base_lr
-                        scale=1.0/(1.0+0.0001*self.global_step)
-                        g["lr"]=base_lr*scale
-                if use_amp:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                for opt in optimizers:
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            self.hardware.handle_oom(len(arr_list))
+                            self.batch_buffer=None
+                            self.cpu_batch=None
+                            self.batch_capacity=0
+                            self.batch_shape=None
+                            continue
+                        raise
+                    except MemoryError:
+                        self.hardware.handle_oom(len(arr_list))
+                        self.batch_buffer=None
+                        self.cpu_batch=None
+                        self.batch_capacity=0
+                        self.batch_shape=None
+                        continue
+                    any_step=True
+                    effective_steps+=1
+                    with amp.autocast(amp_device,enabled=use_amp):
+                        h_brain=self.neuro_project(h)
+                        sequence=torch.stack([h_brain,torch.tanh(h_brain*0.5),torch.sin(h_brain)],dim=1)
+                        planner_logits,planner_term,option_embeddings,planner_value=self.option_planner(h_brain)
+                        option_device=option_embeddings.device
+                        sequence=sequence.to(option_device)
+                        with torch.no_grad():
+                            R=torch.tensor(rewards,dtype=torch.float32,device=option_device).unsqueeze(1)
+                        option_indices=torch.tensor(option_targets,dtype=torch.long,device=option_device)
+                        option_super=torch.tensor(option_supervision,dtype=torch.float32,device=option_device).unsqueeze(1)
+                        option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=option_device).unsqueeze(1)
+                        chosen_embeddings=option_embeddings.index_select(0,option_indices)
+                        left_logits,left_val=self.left(sequence,chosen_embeddings)
+                        right_logits,right_val=self.right(sequence,chosen_embeddings)
+                        left_logprob=F.log_softmax(left_logits,dim=-1)
+                        right_logprob=F.log_softmax(right_logits,dim=-1)
+                        left_ent=(-left_logprob.exp()*left_logprob).sum(dim=-1).mean()
+                        right_ent=(-right_logprob.exp()*right_logprob).sum(dim=-1).mean()
+                        tl=torch.tensor([min(max(t,0),15) for t in targets_left],dtype=torch.long,device=option_device)
+                        tr=torch.tensor([min(max(t,0),31) for t in targets_right],dtype=torch.long,device=option_device)
+                        ml=torch.tensor(mask_left,dtype=torch.float32,device=option_device)
+                        mr=torch.tensor(mask_right,dtype=torch.float32,device=option_device)
+                        ll_sup=(F.nll_loss(left_logprob,tl,reduction="none")*ml).mean() if ml.sum().item()>0 else torch.zeros((),device=option_device)
+                        rl_sup=(F.nll_loss(right_logprob,tr,reduction="none")*mr).mean() if mr.sum().item()>0 else torch.zeros((),device=option_device)
+                        rl_ml=torch.tensor(rl_mask_left,dtype=torch.float32,device=option_device).unsqueeze(1)
+                        rl_mr=torch.tensor(rl_mask_right,dtype=torch.float32,device=option_device).unsqueeze(1)
+                        adv_left=(R-left_val).detach()
+                        adv_right=(R-right_val).detach()
+                        if rl_ml.sum().item()>0:
+                            rl_pg_left=-((left_logprob.gather(1,tl.unsqueeze(1))*adv_left)*rl_ml).sum()/rl_ml.sum()
+                        else:
+                            rl_pg_left=torch.zeros((),device=option_device)
+                        if rl_mr.sum().item()>0:
+                            rl_pg_right=-((right_logprob.gather(1,tr.unsqueeze(1))*adv_right)*rl_mr).sum()/rl_mr.sum()
+                        else:
+                            rl_pg_right=torch.zeros((),device=option_device)
+                        v_loss=((left_val-R)**2+(right_val-R)**2).mean()
+                        planner_logprob=F.log_softmax(planner_logits,dim=-1)
+                        planner_entropy=(-planner_logprob.exp()*planner_logprob).sum(dim=-1).mean()
+                        if option_super.sum().item()>0:
+                            planner_sup=(F.nll_loss(planner_logprob,option_indices,reduction="none")*option_super.squeeze(1)).mean()
+                        else:
+                            planner_sup=torch.zeros((),device=option_device)
+                        if option_rl.sum().item()>0:
+                            planner_pg=-((planner_logprob.gather(1,option_indices.unsqueeze(1))*(R-planner_value).detach())*option_rl).sum()/option_rl.sum()
+                        else:
+                            planner_pg=torch.zeros((),device=option_device)
+                        termination_penalty=planner_term.gather(1,option_indices.unsqueeze(1)).mean()
+                        contrastive=self._contrastive_loss(h_brain)
+                        l2_reg=torch.zeros((),device=option_device)
+                        for p in list(self.vision.parameters())+list(self.left.parameters())+list(self.right.parameters())+list(self.neuro_module.parameters())+list(self.option_planner.parameters()):
+                            l2_reg=l2_reg+p.pow(2).sum()*1e-6
+                        loss=ll_sup+rl_sup+rl_pg_left+rl_pg_right+self.value_coef*v_loss-self.entropy_coef*(left_ent+right_ent+planner_entropy)+planner_sup+planner_pg+termination_penalty*0.1+contrastive*0.5+l2_reg
+                    meta_snapshot=self.meta_controller.capture()
+                    self.vision_opt.zero_grad()
+                    self.left_opt.zero_grad()
+                    self.right_opt.zero_grad()
+                    self.neuro_opt.zero_grad()
+                    self.option_opt.zero_grad()
+                    optimizers=[self.vision_opt,self.left_opt,self.right_opt,self.neuro_opt,self.option_opt]
+                    for opt in optimizers:
+                        for g in opt.param_groups:
+                            base_lr=g.get("_base_lr",g["lr"])
+                            g["_base_lr"]=base_lr
+                            scale=1.0/(1.0+0.0001*self.global_step)
+                            g["lr"]=base_lr*scale
                     if use_amp:
-                        self.scaler.step(opt)
+                        self.scaler.scale(loss).backward()
                     else:
-                        opt.step()
-                    for g in opt.param_groups:
-                        g["lr"]=g["_base_lr"]
-                if use_amp:
-                    self.scaler.update()
-                self.meta_controller.reptile_update(meta_snapshot)
-                self.global_step+=1
-                if effective_steps%10==0:
-                    markers_updater()
-                if markers_persist and effective_steps%50==0:
-                    markers_persist()
+                        loss.backward()
+                    for opt in optimizers:
+                        if use_amp:
+                            self.scaler.step(opt)
+                        else:
+                            opt.step()
+                        for g in opt.param_groups:
+                            g["lr"]=g["_base_lr"]
+                    if use_amp:
+                        self.scaler.update()
+                    self.meta_controller.reptile_update(meta_snapshot)
+                    self.global_step+=1
+                    if effective_steps%10==0:
+                        markers_updater()
+                    if markers_persist and effective_steps%50==0:
+                        markers_persist()
             progress_set(int(100.0*(it+1)/max_iters))
             if not any_step:
                 break
