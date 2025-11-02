@@ -1248,6 +1248,8 @@ class RLAgent:
         self.policy_temperature=1.2
         self.min_temperature=0.25
         self.temperature_decay=0.9995
+        self.reward_baseline=0.0
+        self.reward_var=1.0
         self.hierarchical_prior={"left":{"default":["移动轮盘"]},"right":{"burst":["普攻","一技能","二技能","三技能","四技能"],"mobility":["闪现"],"sustain":["恢复","回城"],"utility":["主动装备","数据A","数据B","数据C"],"cancel":["取消施法"]}}
     def compute_reward(self,A,B,C):
         return self.reward_model.compute((A,B,C))
@@ -1564,6 +1566,7 @@ class RLAgent:
                 targets_left=[]
                 targets_right=[]
                 rewards=[]
+                norm_rewards=[]
                 mask_left=[]
                 mask_right=[]
                 rl_mask_left=[]
@@ -1581,7 +1584,10 @@ class RLAgent:
                     C=float(rec["metrics"]["C"])
                     rew=self.compute_reward(A,B,C)
                     rewards.append(rew)
-                    quality=0.5*(math.tanh(clamp(rew/10.0,-6.0,6.0))+1.0)
+                    variance=max(self.reward_var,1e-6)
+                    norm_rew=(rew-self.reward_baseline)/math.sqrt(variance)
+                    norm_rewards.append(norm_rew)
+                    quality=0.5*(math.tanh(clamp(norm_rew,-3.0,3.0))+1.0)
                     act=rec["action"]
                     left_target=0
                     right_target=0
@@ -1615,6 +1621,10 @@ class RLAgent:
                     rl_mask_right.append(right_rl)
                 if not arr_list:
                     continue
+                avg_reward=sum(rewards)/len(rewards)
+                var_reward=sum((r-avg_reward)**2 for r in rewards)/len(rewards)
+                self.reward_baseline=self.reward_baseline*0.9+avg_reward*0.1
+                self.reward_var=self.reward_var*0.9+max(var_reward,1e-6)*0.1
                 with self.device_lock:
                     self._ensure_device_locked()
                     use_amp=self.scaler.is_enabled() and self.device.type=='cuda'
@@ -1655,7 +1665,7 @@ class RLAgent:
                         option_device=option_embeddings.device
                         sequence=sequence.to(option_device)
                         with torch.no_grad():
-                            R=torch.tensor(rewards,dtype=torch.float32,device=option_device).unsqueeze(1)
+                            R=torch.tensor(norm_rewards,dtype=torch.float32,device=option_device).unsqueeze(1)
                         option_indices=torch.tensor(option_targets,dtype=torch.long,device=option_device)
                         option_super=torch.tensor(option_supervision,dtype=torch.float32,device=option_device).unsqueeze(1)
                         option_rl=torch.tensor(option_rl_flags,dtype=torch.float32,device=option_device).unsqueeze(1)
@@ -2857,10 +2867,11 @@ class HardwareAdaptiveRate:
         self.snapshot_lock=threading.Lock()
         self.snapshot={"cpu":0.0,"mem":0.5,"gpu":0.5,"gpu_util":0.0,"time":0.0}
         self.monitor_stop=False
-        self.monitor_interval=0.75
+        self.monitor_interval=0.35
         self._ema_cpu=None
         self._ema_mem=None
         self._ema_gpu=None
+        self._ema_gpu_util=None
         self._ema_alpha=0.2
         self.cpu_target=0.85
         self.mem_target=0.15
@@ -2880,17 +2891,51 @@ class HardwareAdaptiveRate:
         self.effective_batch=None
         self.effective_parallel=None
         self.viewport_size=(336,336)
+        self._nvml_cache={}
         self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
         self.monitor_thread.start()
+    def _query_gpu_telemetry(self,idx):
+        now=time.time()
+        cache=self._nvml_cache.get(idx)
+        if cache and now-cache["time"]<0.4:
+            return cache["util"],cache["used"],cache["total"]
+        util=None
+        used=None
+        total=None
+        try:
+            cmd=["nvidia-smi","--query-gpu=utilization.gpu,memory.used,memory.total","--format=csv,noheader,nounits","-i",str(idx)]
+            output=subprocess.check_output(cmd,stderr=subprocess.STDOUT,timeout=0.6).decode(errors="ignore").strip().splitlines()
+            if output:
+                parts=[p.strip() for p in output[0].split(",")]
+                if len(parts)>=3:
+                    util=float(parts[0])
+                    used=float(parts[1])
+                    total=float(parts[2])
+        except Exception:
+            pass
+        if util is None:
+            try:
+                util=torch.cuda.utilization(idx)
+            except Exception:
+                util=None
+        if util is not None:
+            util=float(clamp(util,0.0,100.0))
+        if used is not None and total:
+            self._nvml_cache[idx]={"time":now,"util":util if util is not None else 0.0,"used":float(used),"total":float(total)}
+        elif util is not None:
+            self._nvml_cache[idx]={"time":now,"util":util,"used":0.0,"total":0.0}
+        return util,used,total
     def _collect_snapshot(self):
         try:
             cpu=psutil.cpu_percent(interval=None)
+            if cpu<=0:
+                cpu=psutil.cpu_percent(interval=0.05)
         except Exception as e:
             logger.error("获取CPU负载失败:%s",e)
             cpu=100.0
         try:
             vm=psutil.virtual_memory()
-            mem_free=vm.available/float(vm.total if vm.total>0 else 1)
+            mem_free=max(0.0,min(1.0,1.0-float(vm.percent)/100.0))
         except Exception as e:
             logger.error("获取内存信息失败:%s",e)
             mem_free=0.0
@@ -2898,42 +2943,61 @@ class HardwareAdaptiveRate:
         gpu_util=0.0
         if torch.cuda.is_available():
             try:
-                props=torch.cuda.get_device_properties(0)
-                total=float(props.total_memory)
-                allocated=float(torch.cuda.memory_allocated(0))
-                reserved=float(torch.cuda.memory_reserved(0))
-                used=max(allocated,reserved)
-                gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
+                idx=torch.cuda.current_device()
+            except Exception:
+                idx=0
+            util=None
+            used_nvml=None
+            total_nvml=None
+            try:
+                util,used_nvml,total_nvml=self._query_gpu_telemetry(idx)
+            except Exception:
+                util=None
+                used_nvml=None
+                total_nvml=None
+            mem_ratio=None
+            if used_nvml is not None and total_nvml and total_nvml>0:
+                free_ratio=1.0-float(used_nvml)/float(total_nvml)
+                mem_ratio=max(0.0,min(1.0,free_ratio))
+            try:
+                free,total_mem=torch.cuda.mem_get_info(idx)
+                if total_mem>0:
+                    gpu_free=max(0.0,min(1.0,float(free)/float(total_mem)))
+            except Exception:
                 try:
-                    util=torch.cuda.utilization(0)
-                except Exception:
-                    try:
-                        util=torch.cuda.utilization()
-                    except Exception:
-                        util=None
-                if util is None:
-                    gpu_util=float(clamp((1.0-gpu_free)*100.0,0.0,100.0))
-                else:
-                    gpu_util=float(clamp(util,0.0,100.0))
-            except Exception as e:
-                logger.warning("获取GPU信息失败:%s",e)
-                gpu_free=0.5
+                    props=torch.cuda.get_device_properties(idx)
+                    total=float(props.total_memory)
+                    allocated=float(torch.cuda.memory_allocated(idx))
+                    reserved=float(torch.cuda.memory_reserved(idx))
+                    used=max(allocated,reserved)
+                    gpu_free=max(0.0,min(1.0,(total-used)/total if total>0 else 0.5))
+                except Exception as e:
+                    logger.warning("获取GPU信息失败:%s",e)
+                    gpu_free=0.5
+            if mem_ratio is not None:
+                gpu_free=mem_ratio
+            if util is None:
+                gpu_util=float(clamp((1.0-gpu_free)*100.0,0.0,100.0))
+            else:
+                gpu_util=float(clamp(util,0.0,100.0))
         return {"cpu":cpu,"mem":mem_free,"gpu":gpu_free,"gpu_util":gpu_util,"time":time.time()}
     def _apply_snapshot(self,snap):
         if self._ema_cpu is None:
             self._ema_cpu=snap["cpu"]
             self._ema_mem=snap["mem"]
             self._ema_gpu=snap["gpu"]
+            self._ema_gpu_util=snap.get("gpu_util",0.0)
         else:
             alpha=self._ema_alpha
             self._ema_cpu=self._ema_cpu+(snap["cpu"]-self._ema_cpu)*alpha
             self._ema_mem=self._ema_mem+(snap["mem"]-self._ema_mem)*alpha
             self._ema_gpu=self._ema_gpu+(snap["gpu"]-self._ema_gpu)*alpha
+            self._ema_gpu_util=self._ema_gpu_util+(snap.get("gpu_util",0.0)-self._ema_gpu_util)*alpha
         with self.snapshot_lock:
             self.snapshot["cpu"]=self._ema_cpu
             self.snapshot["mem"]=self._ema_mem
             self.snapshot["gpu"]=self._ema_gpu
-            self.snapshot["gpu_util"]=snap.get("gpu_util",0.0)
+            self.snapshot["gpu_util"]=self._ema_gpu_util
             self.snapshot["time"]=snap["time"]
     def _discover_devices(self):
         pool=[{"device":torch.device("cpu"),"index":None}]
@@ -2996,10 +3060,11 @@ class HardwareAdaptiveRate:
     def refresh(self,force=False):
         now=time.time()
         with self.lock:
+            min_gap=max(0.1,self.monitor_interval*0.25)
             if force:
                 snap=self._collect_snapshot()
                 self._apply_snapshot(snap)
-            elif now-self.last_refresh<self.monitor_interval*0.5:
+            elif now-self.last_refresh<min_gap:
                 return
             with self.snapshot_lock:
                 cpu=self.snapshot["cpu"]
