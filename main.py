@@ -338,7 +338,120 @@ def build_right_decode_table(mapping):
     return table
 RIGHT_ACTION_MAPPING=build_right_mapping()
 RIGHT_ACTION_TABLE=build_right_decode_table(RIGHT_ACTION_MAPPING)
-MARKER_SPEC={"移动轮盘":{"color":(255,0,0),"radius":0.14,"alpha":0.5,"required":False,"pos":(0.2,0.78)},"回城":{"color":(255,165,0),"radius":0.08,"alpha":0.5,"required":False,"pos":(0.88,0.82)},"恢复":{"color":(0,255,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.74,0.82)},"闪现":{"color":(255,255,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.62,0.82)},"普攻":{"color":(0,0,255),"radius":0.07,"alpha":0.5,"required":False,"pos":(0.86,0.68)},"一技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.74,0.64)},"二技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.88,0.56)},"三技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.66,0.52)},"四技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.94,0.48)},"取消施法":{"color":(0,0,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.5,0.5)},"主动装备":{"color":(128,0,128),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.7,0.75)},"数据A":{"color":(200,200,0),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.1,0.1)},"数据B":{"color":(0,200,200),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.2,0.1)},"数据C":{"color":(200,0,200),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.3,0.1)}}
+MARKER_SPEC={"移动轮盘":{"color":(255,0,0),"radius":0.14,"alpha":0.5,"required":False,"pos":(0.2,0.78)},"回城":{"color":(255,165,0),"radius":0.08,"alpha":0.5,"required":False,"pos":(0.88,0.82)},"恢复":{"color":(0,255,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.74,0.82)},"闪现":{"color":(255,255,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.62,0.82)},"普攻":{"color":(0,0,255),"radius":0.07,"alpha":0.5,"required":False,"pos":(0.86,0.68)},"一技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.74,0.64)},"二技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.88,0.56)},"三技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.66,0.52)},"四技能":{"color":(75,0,130),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.94,0.48)},"取消施法":{"color":(0,0,0),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.5,0.5)},"主动装备":{"color":(128,0,128),"radius":0.06,"alpha":0.5,"required":False,"pos":(0.7,0.75)},"数据A":{"color":(255,255,255),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.1,0.1)},"数据B":{"color":(255,255,255),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.2,0.1)},"数据C":{"color":(255,255,255),"radius":0.05,"alpha":0.5,"required":False,"pos":(0.3,0.1)}}
+MARKER_ORDER=list(MARKER_SPEC.keys())
+def sanitize_marker_layout(layout):
+    mapping={}
+    items=[]
+    if isinstance(layout,dict):
+        items=list(layout.items())
+    elif isinstance(layout,list):
+        items=list(layout)
+    elif layout:
+        items=[layout]
+    for item in items:
+        label=None
+        x=None
+        y=None
+        r=None
+        if isinstance(item,tuple) and len(item)>=2 and not isinstance(item[0],dict):
+            label=item[0]
+            value=item[1]
+            if isinstance(value,dict):
+                x=value.get("x_pct")
+                y=value.get("y_pct")
+                r=value.get("r_pct")
+        elif isinstance(item,dict):
+            label=item.get("label")
+            x=item.get("x_pct")
+            y=item.get("y_pct")
+            r=item.get("r_pct")
+        if not label:
+            continue
+        spec=MARKER_SPEC.get(label,{})
+        pos=spec.get("pos",(0.5,0.5))
+        radius=spec.get("radius",0.05)
+        xp=clamp(float(x) if x is not None else float(pos[0]),0.0,1.0)
+        yp=clamp(float(y) if y is not None else float(pos[1]),0.0,1.0)
+        rp=clamp(float(r) if r is not None else float(radius),0.01,0.5)
+        mapping[label]=(xp,yp,rp)
+    for label in MARKER_ORDER:
+        if label not in mapping:
+            spec=MARKER_SPEC.get(label,{})
+            pos=spec.get("pos",(0.5,0.5))
+            radius=spec.get("radius",0.05)
+            mapping[label]=(clamp(float(pos[0]),0.0,1.0),clamp(float(pos[1]),0.0,1.0),clamp(float(radius),0.01,0.5))
+    ordered=[]
+    for label in MARKER_ORDER:
+        xp,yp,rp=mapping[label]
+        ordered.append((label,xp,yp,rp))
+    return ordered
+def serialize_marker_layout(ordered):
+    data=[]
+    for label,xp,yp,rp in ordered:
+        data.append({"label":label,"x_pct":xp,"y_pct":yp,"r_pct":rp})
+    return data
+def build_multires_sample(img,target_size,layout):
+    ordered=sanitize_marker_layout(layout)
+    w=max(1,int(target_size[0]))
+    h=max(1,int(target_size[1]))
+    try:
+        base=img.resize((w,h),ImageModule.BILINEAR)
+    except Exception:
+        base=img.resize((w,h))
+    base_arr=np.asarray(base,dtype=np.float32)/255.0
+    if base_arr.ndim==2:
+        base_arr=np.stack([base_arr]*3,axis=-1)
+    base_arr=np.transpose(base_arr,(2,0,1))
+    orig=np.asarray(img.convert("RGB"),dtype=np.uint8)
+    oh=orig.shape[0]
+    ow=orig.shape[1]
+    min_side=max(1,min(ow,oh))
+    expand=1.2
+    patches=[]
+    for label,xp,yp,rp in ordered:
+        cx=int(round(xp*(ow-1)))
+        cy=int(round(yp*(oh-1)))
+        radius=max(1,int(round(rp*min_side)))
+        pad=max(radius,int(round(radius*expand)))
+        left=max(0,cx-pad)
+        right=min(ow,cx+pad)
+        top=max(0,cy-pad)
+        bottom=min(oh,cy+pad)
+        if right<=left or bottom<=top:
+            patch=np.zeros((3,1,1),dtype=np.float32)
+        else:
+            patch=orig[top:bottom,left:right].astype(np.float32)/255.0
+            patch=np.transpose(patch,(2,0,1))
+        patches.append(patch)
+    return {"base":base_arr,"patches":patches,"order":ordered}
+def collate_multires_samples(samples,device):
+    batch=len(samples)
+    base_shape=samples[0]["base"].shape
+    base_tensor=torch.empty((batch,base_shape[0],base_shape[1],base_shape[2]),dtype=torch.float32,device=device)
+    num_markers=len(samples[0]["patches"])
+    max_h=1
+    max_w=1
+    for sample in samples:
+        for patch in sample["patches"]:
+            if patch.size==0:
+                continue
+            max_h=max(max_h,patch.shape[1])
+            max_w=max(max_w,patch.shape[2])
+    patch_tensor=torch.zeros((batch,num_markers,3,max_h,max_w),dtype=torch.float32,device=device)
+    mask_tensor=torch.zeros((batch,num_markers,1,max_h,max_w),dtype=torch.float32,device=device)
+    for idx,sample in enumerate(samples):
+        base_tensor[idx]=torch.from_numpy(sample["base"]).to(device=device)
+        for j,patch in enumerate(sample["patches"]):
+            if patch.size==0:
+                continue
+            c=patch.shape[0]
+            h=patch.shape[1]
+            w=patch.shape[2]
+            tensor=torch.from_numpy(patch).to(device=device)
+            patch_tensor[idx,j,:c,:h,:w]=tensor
+            mask_tensor[idx,j,0,:h,:w]=1.0
+    return {"base":base_tensor,"patch":patch_tensor,"mask":mask_tensor,"order":samples[0]["order"]}
 OVERLAY_HANDLES=set()
 def verify_dependencies():
     return dependency_manager.verify()
@@ -875,7 +988,7 @@ class ExperienceBuffer:
             self._refresh_paths_locked()
     def _refresh_paths_locked(self):
         self.meta_log=os.path.join(self.manager.experience_dir,"exp.jsonl")
-    def add(self,frame_img,action,source,metrics,hero_dead,cooldowns,window_rect):
+    def add(self,frame_img,action,source,metrics,hero_dead,cooldowns,window_rect,marker_layout):
         ts=time.time()
         fname=os.path.join(self.manager.experience_dir,str(int(ts*1000))+".png")
         rel_frame=None
@@ -884,7 +997,8 @@ class ExperienceBuffer:
             rel_frame=self.manager.to_relative(fname)
         except (OSError,ValueError) as e:
             logger.error("保存帧失败:%s",e)
-        rec={"t":ts,"frame":rel_frame,"action":action,"source":source,"metrics":metrics,"hero_dead":hero_dead,"cooldowns":cooldowns,"rect":window_rect}
+        layout=serialize_marker_layout(sanitize_marker_layout(marker_layout))
+        rec={"t":ts,"frame":rel_frame,"action":action,"source":source,"metrics":metrics,"hero_dead":hero_dead,"cooldowns":cooldowns,"rect":window_rect,"markers":layout}
         with self.lock:
             self.data.append(rec)
             if len(self.data)>self.capacity:
@@ -973,24 +1087,22 @@ class ExperienceBuffer:
                     results[idx]=cached
                     self.frame_cache.move_to_end(key)
                 else:
-                    missing.append((idx,key,frame))
+                    missing.append((idx,key,frame,rec.get("markers")))
         if not missing:
             return results
         load_queue=queue.Queue()
         def loader(entry):
-            idx,key,frame=entry
-            arr=None
+            idx,key,frame,layout=entry
+            sample=None
             abs_path=self.manager.to_absolute(frame)
             try:
                 with ImageModule.open(abs_path) as img:
                     img=img.convert("RGB")
-                    img=img.resize((w,h))
-                    arr=np.asarray(img,dtype=np.float32)/255.0
-                arr=np.transpose(arr,(2,0,1))
+                    sample=build_multires_sample(img,(w,h),layout)
             except (OSError,ValueError,TypeError) as e:
                 logger.warning("加载经验帧失败:%s",e)
-                arr=None
-            load_queue.put((idx,key,arr))
+                sample=None
+            load_queue.put((idx,key,sample))
         workers=min(len(missing),max(1,os.cpu_count() or 1))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for entry in missing:
@@ -999,10 +1111,10 @@ class ExperienceBuffer:
         for _ in missing:
             loaded.append(load_queue.get())
         with self.cache_lock:
-            for idx,key,arr in loaded:
-                if arr is not None:
-                    results[idx]=arr
-                    self.frame_cache[key]=arr
+            for idx,key,sample in loaded:
+                if sample is not None:
+                    results[idx]=sample
+                    self.frame_cache[key]=sample
             while len(self.frame_cache)>self.cache_capacity:
                 self.frame_cache.popitem(last=False)
         duration=time.time()-t0
@@ -1122,11 +1234,23 @@ class VisionModel(nn.Module):
         self.attn=nn.MultiheadAttention(64,4,batch_first=True)
         self.attn_norm=nn.LayerNorm(64)
         self.pool=nn.AdaptiveAvgPool2d((30,30))
-        self.fc_state=nn.Linear(64*30*30,32)
+        self.base_fc=nn.Linear(64*30*30,128)
+        self.patch_conv1=nn.Conv2d(3,16,3,2,1)
+        self.patch_conv2=nn.Conv2d(16,32,3,2,1)
+        self.patch_conv3=nn.Conv2d(32,64,3,2,1)
+        self.patch_pool=nn.AdaptiveAvgPool2d((16,16))
+        self.patch_proj=nn.Linear(64*16*16,128)
+        self.patch_attn=nn.MultiheadAttention(128,4,batch_first=True)
+        self.patch_norm=nn.LayerNorm(128)
+        self.merge_fc=nn.Linear(256,128)
+        self.fc_state=nn.Linear(128,32)
         self.fc_metrics=nn.Linear(32,3)
         self.fc_flags=nn.Linear(32,10)
-    def forward(self,x):
-        x=F.relu(self.conv1(x))
+    def forward(self,inputs):
+        base=inputs["base"]
+        patches=inputs["patch"]
+        mask=inputs["mask"]
+        x=F.relu(self.conv1(base))
         x=F.relu(self.conv2(x))
         x=F.relu(self.conv3(x))
         x=self.attn_pool(x)
@@ -1140,7 +1264,25 @@ class VisionModel(nn.Module):
         x=seq.transpose(1,2).reshape(b,c,h,w)
         x=self.pool(x)
         x=x.reshape(x.size(0),-1)
-        h=F.relu(self.fc_state(x))
+        base_vec=F.relu(self.base_fc(x))
+        B=patches.size(0)
+        M=patches.size(1)
+        patch_in=patches.view(B*M,patches.size(2),patches.size(3),patches.size(4))
+        patch_feat=F.relu(self.patch_conv1(patch_in))
+        patch_feat=F.relu(self.patch_conv2(patch_feat))
+        patch_feat=F.relu(self.patch_conv3(patch_feat))
+        patch_feat=self.patch_pool(patch_feat)
+        patch_feat=patch_feat.view(B,M,-1)
+        patch_feat=F.relu(self.patch_proj(patch_feat))
+        attn_patch,_=self.patch_attn(patch_feat,patch_feat,patch_feat,need_weights=False)
+        patch_feat=self.patch_norm(patch_feat+attn_patch)
+        mask_scores=mask.view(B,M,-1).sum(dim=2).clamp(min=1.0)
+        denom=mask_scores.max(dim=1,keepdim=True)[0].clamp(min=1.0)
+        weights=(mask_scores/denom).unsqueeze(-1)
+        patch_vec=(patch_feat*weights).sum(dim=1)/weights.sum(dim=1).clamp(min=1.0)
+        merged=torch.cat([base_vec,patch_vec],dim=1)
+        merged=F.relu(self.merge_fc(merged))
+        h=F.relu(self.fc_state(merged))
         metrics=F.relu(self.fc_metrics(h))
         flags=torch.sigmoid(self.fc_flags(h))
         return metrics,flags,h
@@ -1322,10 +1464,7 @@ class RLAgent:
         self.option_history=deque(maxlen=128)
         self.current_option=0
         self.meta_controller=MetaLearner([self.vision,self.left,self.right,self.neuro_module,self.option_planner],0.05)
-        self.batch_buffer=None
-        self.cpu_batch=None
-        self.batch_capacity=0
-        self.batch_shape=None
+        self.marker_layout=self._default_marker_layout()
         self.scaler=amp.GradScaler('cuda',enabled=torch.cuda.is_available())
         self.policy_temperature=1.2
         self.min_temperature=0.25
@@ -1368,17 +1507,21 @@ class RLAgent:
         self.neuro_state=self.neuro_state.to(target)
         self.device=target
         self.scaler=amp.GradScaler('cuda',enabled=(self.device.type=='cuda' and torch.cuda.is_available()))
-        self.batch_buffer=None
-        self.cpu_batch=None
-        self.batch_capacity=0
-        self.batch_shape=None
+    def _default_marker_layout(self):
+        try:
+            markers=self.file_manager.load_markers()
+        except Exception:
+            markers=None
+        return sanitize_marker_layout(markers)
+    def set_marker_layout(self,layout):
+        sanitized=sanitize_marker_layout(layout)
+        with self.device_lock:
+            self.marker_layout=sanitized
     def _preprocess_frame_locked(self,img):
         w,h=self.hardware.suggest_visual_size()
-        img=img.resize((w,h))
-        arr=np.array(img).astype(np.float32)/255.0
-        arr=np.transpose(arr,(2,0,1))
-        t=torch.tensor(arr,dtype=torch.float32).unsqueeze(0).to(self.device)
-        return t
+        sample=build_multires_sample(img,(w,h),self.marker_layout)
+        tensors=collate_multires_samples([sample],self.device)
+        return tensors
     def _ensure_device_locked(self):
         self.hardware.refresh()
         target=self.hardware.suggest_device()
@@ -1388,13 +1531,17 @@ class RLAgent:
     def ensure_device(self):
         with self.device_lock:
             self._ensure_device_locked()
-    def preprocess_frame(self,img):
+    def preprocess_frame(self,img,layout=None):
         with self.device_lock:
+            if layout is not None:
+                self.marker_layout=sanitize_marker_layout(layout)
             self._ensure_device_locked()
             t=self._preprocess_frame_locked(img)
             return t
-    def infer_state(self,img):
+    def infer_state(self,img,layout=None):
         with self.device_lock:
+            if layout is not None:
+                self.marker_layout=sanitize_marker_layout(layout)
             self._ensure_device_locked()
             with torch.no_grad():
                 t=self._preprocess_frame_locked(img)
@@ -1581,36 +1728,8 @@ class RLAgent:
             self.state_history.clear()
             self.option_history.clear()
             self.current_option=0
-    def _ensure_batch_buffers(self,count,shape):
-        c=shape[0]
-        h=shape[1]
-        w=shape[2]
-        target=(c,h,w)
-        if self.batch_shape!=target:
-            self.batch_shape=target
-            self.batch_capacity=0
-            self.batch_buffer=None
-            self.cpu_batch=None
-        capacity=self.batch_capacity
-        if self.batch_buffer is None or self.cpu_batch is None or capacity<count:
-            new_cap=max(count,capacity*2 if capacity>0 else count)
-            if self.device.type=='cuda':
-                cpu_tensor=torch.empty((new_cap,c,h,w),dtype=torch.float32).pin_memory()
-            else:
-                cpu_tensor=torch.empty((new_cap,c,h,w),dtype=torch.float32)
-            gpu_tensor=torch.empty((new_cap,c,h,w),dtype=torch.float32,device=self.device)
-            self.cpu_batch=cpu_tensor
-            self.batch_buffer=gpu_tensor
-            self.batch_capacity=new_cap
-    def _batch_from_arrays(self,arr_list):
-        count=len(arr_list)
-        shape=arr_list[0].shape
-        self._ensure_batch_buffers(count,shape)
-        for idx,arr in enumerate(arr_list):
-            self.cpu_batch[idx].copy_(torch.from_numpy(arr))
-        view=self.batch_buffer[:count]
-        view.copy_(self.cpu_batch[:count],non_blocking=(self.device.type=='cuda'))
-        return view
+    def _collate_batch(self,sample_list):
+        return collate_multires_samples(sample_list,self.device)
     def optimize_from_buffer(self,buffer,progress_get_cancel,progress_set,markers_updater,markers_persist,max_iters=1000):
         if not buffer.has_data():
             progress_set(0)
@@ -1647,7 +1766,7 @@ class RLAgent:
                 if not batch:
                     continue
                 size=self.hardware.suggest_visual_size()
-                arrays=buffer.get_frame_arrays(batch,size)
+                samples=buffer.get_frame_arrays(batch,size)
                 targets_left=[]
                 targets_right=[]
                 rewards=[]
@@ -1659,11 +1778,11 @@ class RLAgent:
                 option_targets=[]
                 option_supervision=[]
                 option_rl_flags=[]
-                arr_list=[]
-                for rec,arr in zip(batch,arrays):
-                    if arr is None:
+                sample_list=[]
+                for rec,sample in zip(batch,samples):
+                    if sample is None:
                         continue
-                    arr_list.append(arr)
+                    sample_list.append(sample)
                     A=float(rec["metrics"]["A"])
                     B=float(rec["metrics"]["B"])
                     C=float(rec["metrics"]["C"])
@@ -1704,7 +1823,7 @@ class RLAgent:
                     mask_right.append(right_super)
                     rl_mask_left.append(left_rl)
                     rl_mask_right.append(right_rl)
-                if not arr_list:
+                if not sample_list:
                     continue
                 avg_reward=sum(rewards)/len(rewards)
                 var_reward=sum((r-avg_reward)**2 for r in rewards)/len(rewards)
@@ -1715,31 +1834,19 @@ class RLAgent:
                     use_amp=self.scaler.is_enabled() and self.device.type=='cuda'
                     amp_device='cuda' if self.device.type=='cuda' else 'cpu'
                     try:
-                        t_batch=self._batch_from_arrays(arr_list)
+                        batch_inputs=self._collate_batch(sample_list)
                         with amp.autocast(amp_device,enabled=use_amp):
-                            metrics,flags,h=self.vision(t_batch)
+                            metrics,flags,h=self.vision(batch_inputs)
                     except torch.cuda.OutOfMemoryError:
-                        self.hardware.handle_oom(len(arr_list))
-                        self.batch_buffer=None
-                        self.cpu_batch=None
-                        self.batch_capacity=0
-                        self.batch_shape=None
+                        self.hardware.handle_oom(len(sample_list))
                         continue
                     except RuntimeError as e:
                         if "out of memory" in str(e).lower():
-                            self.hardware.handle_oom(len(arr_list))
-                            self.batch_buffer=None
-                            self.cpu_batch=None
-                            self.batch_capacity=0
-                            self.batch_shape=None
+                            self.hardware.handle_oom(len(sample_list))
                             continue
                         raise
                     except MemoryError:
-                        self.hardware.handle_oom(len(arr_list))
-                        self.batch_buffer=None
-                        self.cpu_batch=None
-                        self.batch_capacity=0
-                        self.batch_shape=None
+                        self.hardware.handle_oom(len(sample_list))
                         continue
                     any_step=True
                     effective_steps+=1
@@ -3806,7 +3913,8 @@ class AppState:
         self.training_controller.ensure_threads()
     def update_state_from_frame(self,img):
         self.hardware.update_viewport(img.size)
-        metrics,hero_dead,in_recall,cooldowns,hid=self.agent.infer_state(img)
+        layout=self.get_marker_layout_snapshot()
+        metrics,hero_dead,in_recall,cooldowns,hid=self.agent.infer_state(img,layout)
         with self.lock:
             rect=self.window_rect
         refined=self.cooldown_estimator.evaluate(img,rect,self,cooldowns)
@@ -3823,6 +3931,18 @@ class AppState:
             self.preview_bytes=data_bytes
             self.preview_size=rgb.size
             self.preview_changed=True
+    def get_marker_layout_snapshot(self):
+        with self.lock:
+            overlay=self.overlay
+        layout=[]
+        if overlay:
+            for m in overlay.markers:
+                layout.append({"label":m.label,"x_pct":clamp(float(m.x_pct),0.0,1.0),"y_pct":clamp(float(m.y_pct),0.0,1.0),"r_pct":clamp(float(m.r_pct),0.01,0.5)})
+        if not layout:
+            for label,cfg in self.marker_spec.items():
+                pos=cfg.get("pos",(0.5,0.5))
+                layout.append({"label":label,"x_pct":clamp(float(pos[0]),0.0,1.0),"y_pct":clamp(float(pos[1]),0.0,1.0),"r_pct":clamp(float(cfg.get("radius",0.05)),0.01,0.5)})
+        return layout
     def consume_preview_image(self):
         with self.lock:
             if not self.preview_changed:
@@ -4104,6 +4224,7 @@ class ScreenshotRecorder(threading.Thread):
             if img is not None:
                 self.rate_controller.record_latency("screenshot",time.time()-capture_start)
                 self.app_state.update_state_from_frame(img)
+                layout=self.app_state.get_marker_layout_snapshot()
                 try:
                     tw,th=self.rate_controller.suggest_visual_size()
                 except Exception:
@@ -4136,7 +4257,7 @@ class ScreenshotRecorder(threading.Thread):
                     if not actions:
                         actions=[None]
                     for act in actions:
-                        self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect)
+                        self.buffer.add(img,act,src,self.app_state.metrics,self.app_state.hero_dead,self.app_state.cooldowns,rect,layout)
                 else:
                     while self.input_tracker.pop_action() is not None:
                         pass
