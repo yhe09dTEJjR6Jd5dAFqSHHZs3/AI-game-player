@@ -838,6 +838,9 @@ class ExperienceBuffer:
                     f.write(json.dumps(rec)+"\n")
         except OSError as e:
             logger.error("重写经验失败:%s",e)
+    def has_data(self):
+        with self.lock:
+            return len(self.data)>0
     def on_aaa_moved(self,old_base,new_base):
         with self.lock:
             self._refresh_paths_locked()
@@ -1537,6 +1540,9 @@ class RLAgent:
         view.copy_(self.cpu_batch[:count],non_blocking=(self.device.type=='cuda'))
         return view
     def optimize_from_buffer(self,buffer,progress_get_cancel,progress_set,markers_updater,markers_persist,max_iters=1000):
+        if not buffer.has_data():
+            progress_set(0)
+            return {"status":"empty","steps":0}
         cancelled=False
         effective_steps=0
         for it in range(max_iters):
@@ -1750,17 +1756,26 @@ class RLAgent:
                         markers_updater()
                     if markers_persist and effective_steps%50==0:
                         markers_persist()
-            progress_set(int(100.0*(it+1)/max_iters))
-            if not any_step:
+            if any_step:
+                ratio=min(1.0,effective_steps/float(max_iters))
+                progress_set(int(max(1,min(99,round(ratio*100)))))
+            else:
+                if effective_steps==0:
+                    progress_set(0)
                 break
         if cancelled:
             progress_set(0)
+            status="cancelled"
+        elif effective_steps==0:
+            progress_set(0)
+            status="empty"
         else:
             progress_set(100)
             self.file_manager.save_models(self.vision,self.left,self.right,self.neuro_module,self.option_planner)
+            status="completed"
         if markers_persist:
             markers_persist()
-        return not cancelled
+        return {"status":status,"steps":effective_steps}
 MarkerWidget=None
 OverlayWindow=None
 WindowSelectorDialog=None
@@ -2301,10 +2316,42 @@ def ensure_qt_classes():
             return item.data(QtCore.Qt.UserRole)
     class _MainWindow(QtWidgets.QMainWindow):
         saveFinished=QtCore.pyqtSignal(object)
+        class AAAMoveThread(QtCore.QThread):
+            progress=QtCore.pyqtSignal(str)
+            finished=QtCore.pyqtSignal(str,str,list)
+            def __init__(self,file_manager,target):
+                super().__init__()
+                self.file_manager=file_manager
+                self.target=target
+            def run(self):
+                events=[]
+                def progress_cb(stage,detail):
+                    text=stage
+                    if detail is not None:
+                        try:
+                            info=json.dumps(detail,ensure_ascii=False)
+                        except TypeError:
+                            info=str(detail)
+                        if info:
+                            text=text+":"+info
+                    events.append(text)
+                    self.progress.emit(text)
+                try:
+                    old_base,new_base=self.file_manager.move_dir(self.target,progress_cb)
+                except Exception as e:
+                    text="error:"+str(e)
+                    events.append(text)
+                    self.progress.emit(text)
+                    old_base=self.file_manager.base_path
+                    new_base=old_base
+                self.finished.emit(old_base,new_base,events)
         def __init__(self,app_state,hardware):
             super(_MainWindow,self).__init__()
             self.app_state=app_state
             self.hardware=hardware
+            self.statusBarWidget=QtWidgets.QStatusBar()
+            self.setStatusBar(self.statusBarWidget)
+            self.move_task=None
             self.setWindowTitle("AAA AI Game Player")
             self.rootWidget=QtWidgets.QWidget(self)
             self.setCentralWidget(self.rootWidget)
@@ -2540,6 +2587,8 @@ def ensure_qt_classes():
             if opt_status:
                 if opt_status=="completed":
                     QtWidgets.QMessageBox.information(self,"优化完成","经验优化已完成，已保存最新模型")
+                elif opt_status=="empty":
+                    QtWidgets.QMessageBox.information(self,"优化未执行","经验池为空，未进行优化")
                 else:
                     QtWidgets.QMessageBox.warning(self,"优化已取消","优化过程已取消，进度已重置")
                 self.app_state.enter_learning()
@@ -2800,6 +2849,19 @@ def ensure_qt_classes():
             callback,success,message=payload
             if callback:
                 callback(success,message)
+        def _on_move_progress(self,msg):
+            self.statusBarWidget.showMessage("AAA目录迁移:"+msg,5000)
+        def _on_move_finished(self,old_base,new_base,events):
+            self.moveAAABtn.setEnabled(True)
+            self.statusBarWidget.clearMessage()
+            summary=";".join(events) if events else "AAA目录已迁移"
+            if new_base!=old_base:
+                self.app_state.buffer.on_aaa_moved(old_base,new_base)
+                self.app_state.ensure_overlay_initialized()
+                QtWidgets.QMessageBox.information(self,"完成",summary)
+            else:
+                QtWidgets.QMessageBox.warning(self,"迁移未完成",summary)
+            self.move_task=None
         def on_add_marker(self):
             overlay=self.app_state.ensure_overlay_initialized()
             if overlay is None:
@@ -2834,24 +2896,18 @@ def ensure_qt_classes():
                 overlay.remove_selected_marker()
                 self._refresh_marker_list(overlay)
         def on_move_aaa(self):
+            if self.move_task and self.move_task.isRunning():
+                QtWidgets.QMessageBox.information(self,"进行中","AAA目录迁移正在进行，请稍候")
+                return
             d=QtWidgets.QFileDialog.getExistingDirectory(self,"选择新位置")
             if d:
-                events=[]
-                def progress(stage,detail):
-                    try:
-                        info=json.dumps(detail,ensure_ascii=False) if detail is not None else ""
-                    except TypeError:
-                        info=str(detail)
-                    events.append(stage+(":"+info if info else ""))
-                old_base,new_base=self.app_state.file_manager.move_dir(d,progress)
-                if new_base!=old_base:
-                    self.app_state.buffer.on_aaa_moved(old_base,new_base)
-                    self.app_state.ensure_overlay_initialized()
-                summary=";".join(events) if events else "AAA目录已迁移"
-                if new_base==old_base:
-                    QtWidgets.QMessageBox.warning(self,"迁移未完成",summary)
-                else:
-                    QtWidgets.QMessageBox.information(self,"完成",summary)
+                self.moveAAABtn.setEnabled(False)
+                self.statusBarWidget.showMessage("AAA目录迁移准备中",2000)
+                task=_MainWindow.AAAMoveThread(self.app_state.file_manager,d)
+                self.move_task=task
+                task.progress.connect(self._on_move_progress)
+                task.finished.connect(self._on_move_finished)
+                task.start()
     MarkerWidget=_MarkerWidget
     OverlayWindow=_OverlayWindow
     WindowSelectorDialog=_WindowSelectorDialog
@@ -4198,14 +4254,17 @@ class OptimizationThread(threading.Thread):
             if ov:
                 self.app_state.file_manager.save_markers(ov.get_marker_data(),self.app_state.window_rect)
         opt_start=time.time()
-        completed=self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,persist_markers,1000)
+        result=self.app_state.agent.optimize_from_buffer(self.app_state.buffer,get_cancel,set_progress,update_markers,persist_markers,1000)
         self.app_state.hardware.record_latency("optimize",time.time()-opt_start)
         self.app_state.clear_cancel_request()
-        if completed:
+        if isinstance(result,dict):
+            status=result.get("status","cancelled")
+        else:
+            status="completed" if result else "cancelled"
+        if status=="completed":
             self.app_state.set_progress(100)
         else:
             self.app_state.set_progress(0)
-        status="completed" if completed else "cancelled"
         self.app_state.finish_optimization(status)
 class InitializationThread(threading.Thread):
     def __init__(self,app_state):
