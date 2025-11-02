@@ -795,6 +795,8 @@ class ExperienceBuffer:
         self.cache_capacity=256
         self.read_history=deque(maxlen=240)
         self.write_history=deque(maxlen=240)
+        self.metric_ema={"A":0.0,"B":0.0,"C":0.0}
+        self.metric_beta=0.9
         self.refresh_paths()
     def refresh_paths(self):
         with self.lock:
@@ -816,6 +818,14 @@ class ExperienceBuffer:
             if len(self.data)>self.capacity:
                 self.data.pop(0)
             self.write_history.append({"timestamp":ts,"source":source,"frame":bool(rel_frame)})
+            metrics=rec.get("metrics") or {}
+            A=float(metrics.get("A",0))
+            B=float(metrics.get("B",0))
+            C=float(metrics.get("C",0))
+            beta=self.metric_beta
+            self.metric_ema["A"]=beta*self.metric_ema["A"]+(1-beta)*A
+            self.metric_ema["B"]=beta*self.metric_ema["B"]+(1-beta)*B
+            self.metric_ema["C"]=beta*self.metric_ema["C"]+(1-beta)*C
         try:
             with open(self.meta_log,"a",encoding="utf-8") as f:
                 f.write(json.dumps(rec)+"\n")
@@ -929,17 +939,14 @@ class ExperienceBuffer:
         A=float(metrics.get("A",0))
         B=float(metrics.get("B",0))
         C=float(metrics.get("C",0))
-        source=rec.get("source")
-        cooldowns=rec.get("cooldowns") or {}
-        penalty=sum(0.05 for v in cooldowns.values() if v)
-        base=1.0+2.2*A-1.5*B+1.1*C-penalty
-        if source=="user":
-            base+=0.6
-        elif source=="ai":
-            base+=0.2
-        action=rec.get("action")
-        if action and action.get("label") in ["数据A","数据B","数据C"]:
-            base+=0.3
+        emaA=self.metric_ema["A"]
+        emaB=self.metric_ema["B"]
+        emaC=self.metric_ema["C"]
+        total=max(emaA+emaB+emaC,1e-6)
+        weightA=1.6+(emaA/total)
+        weightB=1.2+(emaB/total)
+        weightC=0.8+(emaC/total)
+        base=1.0+3.0*weightA*A-2.5*weightB*B+1.7*weightC*C
         return max(base,0.01)
     def sample(self,batch_size=32):
         with self.lock:
@@ -2412,6 +2419,7 @@ def ensure_qt_classes():
             self.contentSplitter.setStretchFactor(0,3)
             self.contentSplitter.setStretchFactor(1,2)
             self.mainLayout.addWidget(self.contentSplitter,1)
+            self.chooseWindowBtn.setEnabled(False)
             self.cancelOptimizeBtn.setEnabled(False)
             self.saveConfigBtn.setEnabled(False)
             self.addMarkerBtn.setEnabled(False)
