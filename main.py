@@ -14,7 +14,7 @@ def _pip(x,base_dir):
 home=os.path.expanduser("~");desk=os.path.join(home,"Desktop");base_dir=os.path.join(desk,"GameAI");os.makedirs(base_dir,exist_ok=True)
 for p in ["psutil","pillow","numpy","opencv-python","mss","pynput","pyautogui","torch","torchvision","GPUtil","pynvml","pygetwindow","screeninfo"]:
     _pip(p,base_dir)
-import psutil,pyautogui,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,GPUtil,cv2,numpy as np,mss
+import psutil,pyautogui,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,torchvision.models as models,GPUtil,cv2,numpy as np,mss
 from pynvml import nvmlInit,nvmlDeviceGetHandleByIndex,nvmlDeviceGetUtilizationRates,nvmlDeviceGetMemoryInfo,nvmlDeviceGetCount
 from pynput import mouse,keyboard
 from PIL import Image,ImageTk
@@ -72,26 +72,26 @@ def _now():
     return time.time()
 class Replay:
     def __init__(self,cap=50000,seq=4):
-        self.cap=cap;self.seq=seq;self.buf=[];self.src=[]
-    def push(self,frame,act,source):
+        self.cap=cap;self.seq=seq;self.buf=[];self.src=[];self.rewards=[]
+    def push(self,frame,act,source,reward=0.0):
         if len(self.buf)>=self.cap:
-            self.buf.pop(0);self.src.pop(0)
-        self.buf.append((frame,act,_now()));self.src.append(source)
+            self.buf.pop(0);self.src.pop(0);self.rewards.pop(0)
+        self.buf.append((frame,act,_now()));self.src.append(int(source));self.rewards.append(float(reward))
     def can_sample(self,batch):
         return len(self.buf)>self.seq+batch
     def sample(self,batch):
         idx=[];mx=len(self.buf)-self.seq-1
         for _ in range(batch):
             idx.append(random.randint(0,mx))
-        seqs=[];acts=[];rewards=[];masks=[]
+        seqs=[];acts=[];rewards=[];masks=[];sources=[]
         for k in idx:
             fr=[self.buf[k+i][0] for i in range(self.seq)]
             ac=self.buf[k+self.seq-1][1]
             pre=self.buf[k+self.seq-2][0];post=self.buf[k+self.seq-1][0]
             pre=cv2.Canny(pre,32,128);post=cv2.Canny(post,32,128)
-            r=float(np.mean(np.abs(post.astype(np.float32)-pre.astype(np.float32)))/255.0)
-            seqs.append(np.stack(fr,0));acts.append(np.array(ac,dtype=np.float32));rewards.append(r);masks.append(1.0)
-        return np.stack(seqs,0),np.stack(acts,0),np.array(rewards,dtype=np.float32),np.array(masks,dtype=np.float32)
+            r=float(np.mean(np.abs(post.astype(np.float32)-pre.astype(np.float32)))/255.0)+self.rewards[k+self.seq-1]
+            seqs.append(np.stack(fr,0));acts.append(np.array(ac,dtype=np.float32));rewards.append(r);masks.append(1.0);sources.append(self.src[k+self.seq-1])
+        return np.stack(seqs,0),np.stack(acts,0),np.array(rewards,dtype=np.float32),np.array(masks,dtype=np.float32),np.array(sources,dtype=np.float32)
 class BrainInspired(nn.Module):
     def __init__(self,dim):
         super().__init__();self.w=nn.Parameter(torch.randn(dim,dim)*0.02);self.register_buffer("trace",torch.zeros(dim,dim))
@@ -104,6 +104,110 @@ class Net(nn.Module):
         super().__init__();self.seq=seq;self.enc=nn.Sequential(nn.Conv2d(3*seq,32,5,2,2),nn.ReLU(),nn.BatchNorm2d(32),nn.Conv2d(32,64,3,2,1),nn.ReLU(),nn.Dropout2d(0.1),nn.Conv2d(64,128,3,2,1),nn.ReLU(),nn.Dropout2d(0.1));self.pool=nn.AdaptiveAvgPool2d((8,8));self.proj=nn.Linear(128*64,256);self.attn=nn.MultiheadAttention(256,4,batch_first=True);self.lstm=nn.LSTM(256,256,batch_first=True);self.brain=BrainInspired(256);self.pi=nn.Linear(256,3);self.v=nn.Linear(256,1)
     def forward(self,x):
         b,t,c,h,w=x.shape;z=self.enc(x.reshape(b,c*t,h,w));z=self.pool(z).flatten(1);z=self.proj(z);z=z.view(b,1,256).repeat(1,t,1);z,_=self.attn(z,z,z,need_weights=False);z,_=self.lstm(z);z=self.brain(z[:,-1]);p=self.pi(z);v=self.v(z).squeeze(-1);dx=torch.tanh(p[:,0]);dy=torch.tanh(p[:,1]);cl=torch.sigmoid(p[:,2]);return torch.stack([dx,dy,cl],1),v
+class KnowledgeBase:
+    def __init__(self,seq):
+        self.seq=seq;self.lock=threading.Lock();self.buttons=[];self.max_buttons=128;self.goal_feat=None;self.goal_strength=0.15;self.prev_feat=None;self.dim=512;self.encoder=self._build_encoder()
+    def _build_encoder(self):
+        try:
+            enc=models.resnet18()
+            if os.path.exists(pre_path):
+                state=torch.load(pre_path,map_location="cpu")
+                enc.load_state_dict(state,strict=False)
+            enc.fc=nn.Identity();enc.to(device);enc.eval();return enc
+        except:
+            net=nn.Sequential(nn.Conv2d(3,16,3,2,1),nn.ReLU(),nn.Conv2d(16,32,3,2,1),nn.ReLU(),nn.AdaptiveAvgPool2d((1,1)),nn.Flatten(),nn.Linear(32,self.dim));net.to(device);return net
+    def _prep(self,img):
+        t=torch.from_numpy(img.astype(np.float32)/255.0);t=t.permute(2,0,1).unsqueeze(0);t=F.interpolate(t,size=(224,224),mode="bilinear",align_corners=False);return t
+    def _encode(self,img):
+        try:
+            with torch.no_grad():
+                feat=self.encoder(self._prep(img).to(device))
+            return feat.detach().cpu().numpy()[0]
+        except:
+            return np.zeros(self.dim,dtype=np.float32)
+    def _norm(self,v):
+        return max(float(np.linalg.norm(v)),1e-6)
+    def _store_button(self,feat,pos):
+        best=-1.0;idx=-1
+        for i,btn in enumerate(self.buttons):
+            sim=float(np.dot(btn["feat"],feat)/(self._norm(btn["feat"])*self._norm(feat)))
+            if sim>best:
+                best=sim;idx=i
+        if idx>=0 and best>0.8:
+            btn=self.buttons[idx];cnt=btn["count"]+1;btn["feat"]=(btn["feat"]*btn["count"]+feat)/max(cnt,1);px=0.7*btn["pos"][0]+0.3*pos[0];py=0.7*btn["pos"][1]+0.3*pos[1];btn["pos"]=(float(_clamp(px,0.0,1.0)),float(_clamp(py,0.0,1.0)));btn["count"]=cnt
+        else:
+            if len(self.buttons)>=self.max_buttons:
+                self.buttons.pop(0)
+            self.buttons.append({"feat":feat,"pos":(float(_clamp(pos[0],0.0,1.0)),float(_clamp(pos[1],0.0,1.0))),"count":1})
+    def _crop(self,frame,rect,pos):
+        if frame is None or rect is None:
+            return None
+        x1,y1,x2,y2=rect;w=max(1,x2-x1);h=max(1,y2-y1);px=int(x1+pos[0]*w);py=int(y1+pos[1]*h);sz=max(10,int(min(w,h)*0.12));lx=int(_clamp(px-sz,x1,x2-1));rx=int(_clamp(px+sz,x1+1,x2));ly=int(_clamp(py-sz,y1,y2-1));ry=int(_clamp(py+sz,y1+1,y2))
+        if rx<=lx or ry<=ly:
+            return None
+        sub=frame[ly-y1:ry-y1,lx-x1:rx-x1]
+        if sub.size==0:
+            return None
+        return cv2.cvtColor(sub,cv2.COLOR_BGR2RGB)
+    def _button_similarity(self,feat):
+        if feat is None or not self.buttons:
+            return 0.0
+        best=0.0
+        for btn in self.buttons:
+            sim=float(np.dot(btn["feat"],feat)/(self._norm(btn["feat"])*self._norm(feat)))
+            if sim>best:
+                best=sim
+        return max(0.0,best)
+    def _goal_alignment(self,feat):
+        if self.goal_feat is None:
+            return 0.0
+        return float(np.dot(self.goal_feat,feat)/(self._norm(self.goal_feat)*self._norm(feat)))
+    def update(self,frames,rect,action,pos,source):
+        if not frames:
+            return 0.0
+        frame=frames[-1];reward=0.0
+        with self.lock:
+            patch=None;feat_patch=None
+            if pos is not None:
+                patch=self._crop(frame,rect,pos)
+                if patch is not None:
+                    feat_patch=self._encode(patch)
+            frame_feat=self._encode(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+            if feat_patch is not None and action[2]>0.5 and source==1:
+                self._store_button(feat_patch,pos)
+            if self.goal_feat is None:
+                self.goal_feat=frame_feat.copy()
+            else:
+                mix=0.15 if source==1 else 0.05;self.goal_feat=self.goal_feat*(1-mix)+frame_feat*mix;self.goal_strength=float(_clamp(self.goal_strength+(0.03 if source==1 else -0.01),0.05,1.0))
+            if len(frames)>1:
+                diff=float(np.mean(np.abs(frames[-1].astype(np.float32)-frames[0].astype(np.float32)))/255.0);reward+=diff
+            if feat_patch is not None:
+                reward+=max(0.0,self._button_similarity(feat_patch)-0.5)
+            reward+=max(0.0,self.goal_strength*self._goal_alignment(frame_feat))
+            if self.prev_feat is not None:
+                drift=self._norm(frame_feat-self.prev_feat);reward+=max(0.0,drift*0.01)
+            self.prev_feat=frame_feat
+        return reward
+    def suggest(self,frame,rect):
+        with self.lock:
+            if frame is None or not self.buttons:
+                return None
+            best=-1.0;pos=None
+            for btn in self.buttons:
+                patch=self._crop(frame,rect,btn["pos"])
+                if patch is None:
+                    continue
+                feat=self._encode(patch);sim=self._button_similarity(feat)
+                if sim>best:
+                    best=sim;pos=btn["pos"]
+            if pos is None or best<0.6:
+                return None
+            dx=float(_clamp(pos[0]*2.0-1.0,-1.0,1.0));dy=float(_clamp(pos[1]*2.0-1.0,-1.0,1.0));click=float(_clamp(best,0.0,1.0));return [dx,dy,click]
+    def goal_score(self,frame):
+        with self.lock:
+            if frame is None:
+                return 0.0
+            feat=self._encode(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB));return max(0.0,self._goal_alignment(feat))
 def _to_tensor(frames):
     x=torch.from_numpy(frames.astype(np.float32)/255.0);x=x.permute(0,1,4,2,3).contiguous();return x
 class Agent:
@@ -129,9 +233,9 @@ class Agent:
                 cur_batch=batch;cur_delay=0.0
             if not replay.can_sample(cur_batch):
                 time.sleep(0.05);continue
-            s,a,r,m=replay.sample(cur_batch);x=_to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device);self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
+            s,a,r,m,src=replay.sample(cur_batch);x=_to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device);src_w=torch.from_numpy(1.0+src*0.5).to(device);self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
             with ctx:
-                pi,v=self.net(x);bcl=F.smooth_l1_loss(pi,t);adv=(rew-v.detach());pl=-torch.mean(-0.5*((pi-t)**2).sum(1)*adv);vl=F.mse_loss(v,rew);hl=self.net.brain.hebbian_loss(1e-3);loss=bcl+pl+0.5*vl+hl
+                pi,v=self.net(x);diff=F.smooth_l1_loss(pi,t,reduction="none").sum(1);bcl=torch.mean(diff*src_w);adv=(rew-v.detach());pl=-torch.mean(-0.5*((pi-t)**2).sum(1)*adv*src_w);vl=torch.mean(((v-rew)**2)*src_w);hl=self.net.brain.hebbian_loss(1e-3);loss=bcl+pl+0.5*vl+hl
             self.opt.zero_grad()
             if scaler:
                 scaler.scale(loss).backward();scaler.unscale_(self.opt);torch.nn.utils.clip_grad_norm_(self.net.parameters(),1.0);scaler.step(self.opt);scaler.update()
@@ -169,7 +273,7 @@ class App:
         self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10)
         self.plabel=tk.Label(self.bottom,textvariable=self.pct_var);self.plabel.pack(side="right",padx=5)
         self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
-        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.seq=4;self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0
+        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.frame_seq_raw=[];self.seq=4;self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.last_user_norm=[0.5,0.5];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0;self.knowledge=KnowledgeBase(self.seq)
         try:
             if os.path.exists(model_path):
                 self.agent.net.load_state_dict(torch.load(model_path,map_location=device))
@@ -217,7 +321,7 @@ class App:
         return img
     def resource_loop(self):
         while not self.stop_all:
-            c,m,g,vr=_sys_usage();self.cpu=c;self.mem=m;self.gpu=g;self.vram=vr;M=max(c,m,g,vr)/100.0;self.capture_hz=int(_clamp(round(100*(1.0-M)),1,100));
+            c,m,g,vr=_sys_usage();self.cpu=c;self.mem=m;self.gpu=g;self.vram=vr;M=max(c,m,g,vr)/100.0;self.capture_hz=int(_clamp(round(100*(1.0-M)),1,100))
             with self.control_lock:
                 if M>=0.95:
                     self.train_control.update({"paused":True,"delay":0.25,"batch":16,"loops":40});self.ai_interval=0.12
@@ -243,11 +347,16 @@ class App:
                 return
             x1,y1,x2,y2=self.rect
             if x1<=x<=x2 and y1<=y<=y2:
-                cx=(x1+x2)/2.0;cy=(y1+y2)/2.0;hw=max(1,(x2-x1)/2.0);hh=max(1,(y2-y1)/2.0);dx=float(_clamp((x-cx)/hw,-1.0,1.0));dy=float(_clamp((y-cy)/hh,-1.0,1.0))
+                cx=(x1+x2)/2.0;cy=(y1+y2)/2.0;hw=max(1,(x2-x1)/2.0);hh=max(1,(y2-y1)/2.0);dx=float(_clamp((x-cx)/hw,-1.0,1.0));dy=float(_clamp((y-cy)/hh,-1.0,1.0));nx=float(_clamp((x-x1)/max(1,x2-x1),0.0,1.0));ny=float(_clamp((y-y1)/max(1,y2-y1),0.0,1.0))
                 with self.action_lock:
-                    self.last_user_action=[dx,dy,clicked]
+                    self.last_user_action=[dx,dy,clicked];self.last_user_norm=[nx,ny]
         except:
             pass
+    def get_user_norm(self):
+        with self.action_lock:
+            return tuple(self.last_user_norm)
+    def action_to_norm(self,action):
+        return (float(_clamp(action[0]*0.5+0.5,0.0,1.0)),float(_clamp(action[1]*0.5+0.5,0.0,1.0)))
     def on_key_press(self,k):
         self.last_any_time=_now()
         try:
@@ -298,13 +407,13 @@ class App:
                     img=self.grab_frame(rect);self.last_frame=img
                     if not self.optimizing and self.mode in ["learn","train"]:
                         if len(self.frame_seq)>=self.seq:
-                            self.frame_seq.pop(0)
-                        self.frame_seq.append(cv2.resize(img,(160,120)))
+                            self.frame_seq.pop(0);self.frame_seq_raw.pop(0)
+                        self.frame_seq_raw.append(img.copy());self.frame_seq.append(cv2.resize(img,(160,120)))
                         if len(self.frame_seq)==self.seq:
                             if self.mode=="learn":
-                                act=self.read_user_action();self.exp.push(self.frame_seq[-1],act,"user")
+                                act=self.read_user_action();pos=self.get_user_norm();reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,1);self.exp.push(self.frame_seq[-1],act,1,reward)
                             elif self.mode=="train":
-                                act=self.ai_action_and_apply();self.exp.push(self.frame_seq[-1],act,"ai")
+                                act=self.ai_action_and_apply();pos=self.action_to_norm(act);reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,0);self.exp.push(self.frame_seq[-1],act,0,reward)
                     if not self.optimizing and self.mode=="learn" and (_now()-self.last_any_time)>self.inactive_seconds and (self.visible and self.complete):
                         self.mode="train";self.start_ai_thread()
                 except:
@@ -316,14 +425,24 @@ class App:
         try:
             with self.action_lock:
                 dx,dy,cl=self.last_user_action
-            a=0.2;self.action_ema=[a*dx+(1-a)*self.action_ema[0],a*dy+(1-a)*self.action_ema[1],max(cl,self.action_ema[2]*0.8)]
-            return [float(_clamp(self.action_ema[0],-1,1)),float(_clamp(self.action_ema[1],-1,1)),float(_clamp(self.action_ema[2],0,1))]
+            a=0.2;self.action_ema=[a*dx+(1-a)*self.action_ema[0],a*dy+(1-a)*self.action_ema[1],max(cl,self.action_ema[2]*0.8)];return [float(_clamp(self.action_ema[0],-1,1)),float(_clamp(self.action_ema[1],-1,1)),float(_clamp(self.action_ema[2],0,1))]
         except:
             return [0.0,0.0,0.0]
     def ai_action_and_apply(self):
         if len(self.frame_seq)<self.seq:
             return [0.0,0.0,0.0]
         a=self.agent.act(np.stack(self.frame_seq,0))
+        try:
+            suggest=self.knowledge.suggest(self.frame_seq_raw[-1] if self.frame_seq_raw else None,self.rect)
+        except:
+            suggest=None
+        if suggest:
+            a=0.6*a+0.4*np.array(suggest,dtype=np.float32)
+        if self.frame_seq_raw:
+            try:
+                goal_boost=self.knowledge.goal_score(self.frame_seq_raw[-1]);a[2]=float(_clamp(a[2]+goal_boost*0.2,0.0,1.0))
+            except:
+                pass
         if self.mode!="train":
             return a.tolist()
         if not (self.visible and self.complete):
