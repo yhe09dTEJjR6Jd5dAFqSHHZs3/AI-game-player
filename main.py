@@ -21,6 +21,7 @@ from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass,field
 from ctypes import wintypes
+from urllib.parse import urljoin
 import torch
 from torch import amp
 import torch.nn as nn
@@ -30,7 +31,7 @@ import numpy as np
 from collections import deque,OrderedDict,defaultdict
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logger=logging.getLogger("aaa_runtime")
-REQUIRED_MODULES=["psutil","pyautogui","pynput","PIL","numpy","torch","PyQt5"]
+REQUIRED_MODULES=["psutil","pyautogui","pynput","PIL","numpy","torch","PyQt5","requests"]
 class ModuleMissingError(ImportError):
     def __init__(self,name,detail):
         super().__init__(detail)
@@ -268,6 +269,7 @@ psutil=LazyModule("psutil")
 pyautogui=LazyModule("pyautogui")
 mouse=LazyModule("pynput.mouse")
 keyboard=LazyModule("pynput.keyboard")
+requests=LazyModule("requests")
 win32gui=LazyModule("win32gui")
 win32con=LazyModule("win32con")
 win32api=LazyModule("win32api")
@@ -285,6 +287,7 @@ class Mode(Enum):
 def clamp(v,a,b):
     return max(a,min(b,v))
 RIGHT_ACTION_LABELS=["回城","恢复","闪现","普攻","一技能","二技能","三技能","四技能","取消施法","主动装备","数据A","数据B","数据C"]
+HERO_SKILLS={"一技能","二技能","三技能","四技能"}
 def build_right_mapping():
     mapping={}
     offset=0
@@ -394,6 +397,7 @@ class AAAFileManager:
         self.option_model_path=None
         self.model_status={}
         self.model_version=MODEL_SCHEMA_VERSION
+        self.model_sources=[]
         self.ensure_structure()
     def _marker_template(self,label):
         spec=MARKER_SPEC.get(label,MARKER_SPEC.get("普攻"))
@@ -472,11 +476,49 @@ class AAAFileManager:
                 except Exception as e:
                     logger.debug("参数重置失败:%s",e)
         module.apply(initializer)
+    def _download_model_file(self,name,path,sources=None):
+        candidates=list(sources if sources is not None else self.model_sources)
+        if not candidates:
+            return False
+        filename=os.path.basename(path)
+        for base in candidates:
+            try:
+                url=urljoin(base.rstrip("/")+"/",filename)
+            except Exception as e:
+                logger.warning("模型地址解析失败:%s:%s",base,e)
+                continue
+            try:
+                resp=requests.get(url,timeout=15,stream=True)
+            except Exception as e:
+                logger.warning("模型下载失败:%s:%s",url,e)
+                continue
+            if resp.status_code!=200:
+                logger.warning("模型下载状态码异常:%s:%s",url,resp.status_code)
+                continue
+            temp_path=path+".download"
+            try:
+                with open(temp_path,"wb") as f:
+                    for chunk in resp.iter_content(65536):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                os.replace(temp_path,path)
+                logger.info("模型下载完成:%s",url)
+                return True
+            except OSError as e:
+                logger.warning("模型写入失败:%s:%s",path,e)
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+        return False
     def _load_model_file(self,path,module,name):
-        if not os.path.exists(path):
-            self._reset_module_parameters(module)
-            self._record_model_status(name,False,"缺少模型文件")
-            return
+        if not os.path.exists(path) or os.path.getsize(path)==0:
+            if not self._download_model_file(name,path):
+                self._reset_module_parameters(module)
+                self._record_model_status(name,False,"缺少模型文件")
+                return
         try:
             payload=torch.load(path,map_location="cpu")
             if isinstance(payload,dict) and "state" in payload and "version" in payload:
@@ -548,6 +590,7 @@ class AAAFileManager:
         with self.lock:
             return dict(self.model_status)
     def ensure_structure(self):
+        downloads=[]
         with self.lock:
             if not os.path.exists(self.base_path):
                 os.makedirs(self.base_path,exist_ok=True)
@@ -561,25 +604,36 @@ class AAAFileManager:
             self.neuro_model_path=os.path.join(self.base_path,"neuro_module.pt")
             self.option_model_path=os.path.join(self.base_path,"option_planner.pt")
             self.init_status_path=os.path.join(self.base_path,"init_status.json")
-            if not os.path.exists(self.config_path):
-                default_cfg={"markers":[],"aaa_path":self.base_path,"version":CONFIG_VERSION}
-                with open(self.config_path,"w",encoding="utf-8") as f:
-                    json.dump(default_cfg,f)
-            if not os.path.exists(self.vision_model_path):
-                torch.save({"version":self.model_version,"state":{}},self.vision_model_path)
-                self._record_model_status("vision",False,"等待训练")
-            if not os.path.exists(self.left_model_path):
-                torch.save({"version":self.model_version,"state":{}},self.left_model_path)
-                self._record_model_status("left",False,"等待训练")
-            if not os.path.exists(self.right_model_path):
-                torch.save({"version":self.model_version,"state":{}},self.right_model_path)
-                self._record_model_status("right",False,"等待训练")
-            if not os.path.exists(self.neuro_model_path):
-                torch.save({"version":self.model_version,"state":{}},self.neuro_model_path)
-                self._record_model_status("neuro",False,"等待训练")
-            if not os.path.exists(self.option_model_path):
-                torch.save({"version":self.model_version,"state":{}},self.option_model_path)
-                self._record_model_status("planner",False,"等待训练")
+            cfg=None
+            if os.path.exists(self.config_path):
+                try:
+                    with open(self.config_path,"r",encoding="utf-8") as f:
+                        cfg=json.load(f)
+                except (json.JSONDecodeError,OSError) as e:
+                    logger.warning("配置读取失败:%s",e)
+                    cfg={"markers":[],"aaa_path":self.base_path,"version":CONFIG_VERSION,"model_sources":[]}
+            if cfg is None:
+                cfg={"markers":[],"aaa_path":self.base_path,"version":CONFIG_VERSION,"model_sources":[]}
+            if not isinstance(cfg.get("model_sources"),list):
+                cfg["model_sources"]=[]
+            self.model_sources=list(cfg.get("model_sources",[]))
+            cfg["aaa_path"]=self.base_path
+            cfg["version"]=CONFIG_VERSION
+            cfg["model_sources"]=list(self.model_sources)
+            with open(self.config_path,"w",encoding="utf-8") as f:
+                json.dump(cfg,f)
+            sources=list(self.model_sources)
+            for name,path in [("vision",self.vision_model_path),("left",self.left_model_path),("right",self.right_model_path),("neuro",self.neuro_model_path),("planner",self.option_model_path)]:
+                if not os.path.exists(path) or os.path.getsize(path)==0:
+                    downloads.append((name,path,sources))
+        for name,path,sources in downloads:
+            if self._download_model_file(name,path,sources):
+                with self.lock:
+                    self._record_model_status(name,False,"待加载")
+                continue
+            torch.save({"version":self.model_version,"state":{}},path)
+            with self.lock:
+                self._record_model_status(name,False,"等待训练")
     def _precheck_move(self,old_base,new_parent):
         if not new_parent:
             raise self.PrecheckError("目标路径为空",logging.INFO)
@@ -709,9 +763,14 @@ class AAAFileManager:
                 with open(self.config_path,"r",encoding="utf-8") as f:
                     cfg=json.load(f)
             else:
-                cfg={"markers":[],"version":CONFIG_VERSION}
-            if cfg.get("version")!=CONFIG_VERSION:
-                cfg["version"]=CONFIG_VERSION
+                cfg={"markers":[],"version":CONFIG_VERSION,"model_sources":list(self.model_sources)}
+            sources=cfg.get("model_sources")
+            if isinstance(sources,list):
+                self.model_sources=list(sources)
+            else:
+                self.model_sources=[]
+            cfg["model_sources"]=list(self.model_sources)
+            cfg["version"]=CONFIG_VERSION
             cfg["aaa_path"]=self.base_path
             with open(self.config_path,"w",encoding="utf-8") as f:
                 json.dump(cfg,f)
@@ -721,11 +780,17 @@ class AAAFileManager:
                 with open(self.config_path,"r",encoding="utf-8") as f:
                     cfg=json.load(f)
             else:
-                cfg={"aaa_path":self.base_path,"version":CONFIG_VERSION}
+                cfg={"aaa_path":self.base_path,"version":CONFIG_VERSION,"model_sources":list(self.model_sources)}
+            sources=cfg.get("model_sources")
+            if isinstance(sources,list):
+                self.model_sources=list(sources)
+            else:
+                self.model_sources=[]
             rect=window_rect if window_rect else (0,0,1,1)
             normalized=self.validate_markers(markers,rect)
             cfg["markers"]=[m.to_dict() for m in normalized]
             cfg["version"]=CONFIG_VERSION
+            cfg["model_sources"]=list(self.model_sources)
             with open(self.config_path,"w",encoding="utf-8") as f:
                 json.dump(cfg,f)
     def load_markers(self):
@@ -735,10 +800,17 @@ class AAAFileManager:
                 with open(self.config_path,"r",encoding="utf-8") as f:
                     cfg=json.load(f)
                     markers=cfg.get("markers",[])
+                    sources=cfg.get("model_sources")
+                    if isinstance(sources,list):
+                        self.model_sources=list(sources)
+                    else:
+                        self.model_sources=[]
+                        cfg["model_sources"]=list(self.model_sources)
                     if cfg.get("version")!=CONFIG_VERSION:
                         normalized=self.validate_markers(markers,(0,0,1,1))
                         cfg["markers"]=[m.to_dict() for m in normalized]
                         cfg["version"]=CONFIG_VERSION
+                        cfg["model_sources"]=list(self.model_sources)
                         with open(self.config_path,"w",encoding="utf-8") as wf:
                             json.dump(cfg,wf)
                         markers=[m.to_dict() for m in normalized]
@@ -3491,11 +3563,10 @@ class CooldownEstimator:
         y1=min(img.height,y+radius)
         if x0>=x1 or y0>=y1:
             return None
-        region=img.crop((x0,y0,x1,y1)).convert("L")
-        arr=np.array(region,dtype=np.float32)
-        if arr.size==0:
+        region=np.array(img.crop((x0,y0,x1,y1)),dtype=np.float32)
+        if region.size==0:
             return None
-        return float(arr.mean()/255.0)
+        return float(region.mean()/255.0)
     def evaluate(self,img,rect,app_state,model_cd):
         with self.lock:
             now=time.time()
@@ -4109,13 +4180,13 @@ class LeftHandThread(threading.Thread):
             laction=int(command.get("action",0))
             center_x,center_y,r=self.app_state.get_marker_geometry("移动轮盘")
             angle=(laction/16.0)*2*math.pi
-            dx=math.cos(angle)*r
-            dy=math.sin(angle)*r
-            end_x=center_x+dx
-            end_y=center_y+dy
+            exit_radius=r*1.08
+            extend_radius=r*1.25
+            first_x=center_x+math.cos(angle)*exit_radius
+            first_y=center_y+math.sin(angle)*exit_radius
+            second_x=center_x+math.cos(angle)*extend_radius
+            second_y=center_y+math.sin(angle)*extend_radius
             path=[(center_x,center_y)]
-            straight_x=end_x
-            straight_y=end_y
             direction=1 if float(h_state.mean().item())>=0 else -1
             arc_span=(0.35+0.05*((laction%8)+1))*math.pi
             arc_steps=12
@@ -4127,12 +4198,14 @@ class LeftHandThread(threading.Thread):
             try:
                 pyautogui.moveTo(center_x,center_y)
                 pyautogui.mouseDown()
-                pyautogui.dragTo(straight_x,straight_y,duration=drag_duration,button='left',mouseDownUp=False)
-                path.append((straight_x,straight_y))
+                pyautogui.dragTo(first_x,first_y,duration=drag_duration,button='left',mouseDownUp=False)
+                path.append((first_x,first_y))
+                pyautogui.dragTo(second_x,second_y,duration=drag_duration*0.6,button='left',mouseDownUp=False)
+                path.append((second_x,second_y))
                 for step in range(1,arc_steps+1):
                     theta=angle+direction*arc_span*step/arc_steps
-                    px=center_x+math.cos(theta)*r
-                    py=center_y+math.sin(theta)*r
+                    px=center_x+math.cos(theta)*extend_radius
+                    py=center_y+math.sin(theta)*extend_radius
                     pyautogui.dragTo(px,py,duration=arc_duration,button='left',mouseDownUp=False)
                     path.append((px,py))
                 pyautogui.mouseUp()
@@ -4206,14 +4279,26 @@ class RightHandThread(threading.Thread):
                         pyautogui.mouseDown()
                         pyautogui.dragTo(end_x,end_y,duration=drag_duration,button='left')
                         pyautogui.mouseUp()
+                        action_type="drag"
+                    elif label in HERO_SKILLS and local==0:
+                        pyautogui.moveTo(cx,cy)
+                        pyautogui.click()
+                        action_type="click"
                     else:
-                        end_x=cx+math.cos(angle)*r
-                        end_y=cy+math.sin(angle)*r
+                        exit_radius=r*1.08
+                        extend_radius=r*1.25
+                        exit_x=cx+math.cos(angle)*exit_radius
+                        exit_y=cy+math.sin(angle)*exit_radius
+                        final_x=cx+math.cos(angle)*extend_radius
+                        final_y=cy+math.sin(angle)*extend_radius
                         pyautogui.moveTo(cx,cy)
                         pyautogui.mouseDown()
-                        pyautogui.dragTo(end_x,end_y,duration=drag_duration,button='left')
+                        pyautogui.dragTo(exit_x,exit_y,duration=drag_duration,button='left',mouseDownUp=False)
+                        pyautogui.dragTo(final_x,final_y,duration=drag_duration*0.6,button='left',mouseDownUp=False)
                         pyautogui.mouseUp()
-                    action_type="drag"
+                        end_x=final_x
+                        end_y=final_y
+                        action_type="drag"
                 elif label in ["回城","恢复","普攻","主动装备","数据A","数据B","数据C"]:
                     pyautogui.moveTo(cx,cy)
                     pyautogui.click()
