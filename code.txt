@@ -3,7 +3,10 @@ def i(p):
     try:
         importlib.import_module(p)
     except:
-        subprocess.call([sys.executable,"-m","pip","install","--upgrade",p])
+        try:
+            subprocess.check_call([sys.executable,"-m","pip","install","--upgrade",p])
+        except:
+            pass
 for p in ["psutil","pillow","numpy","opencv-python","mss","pynput","pyautogui","torch","torchvision","GPUtil","pynvml","pygetwindow","screeninfo"]:
     i(p)
 import psutil,pyautogui,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,GPUtil,cv2,numpy as np,mss
@@ -15,17 +18,10 @@ from tkinter import ttk,messagebox
 import pygetwindow as gw
 from screeninfo import get_monitors
 torch.set_num_threads(max(1,(os.cpu_count() or 4)-1))
-home=os.path.expanduser("~")
-desk=os.path.join(home,"Desktop")
-base_dir=os.path.join(desk,"GameAI")
-os.makedirs(base_dir,exist_ok=True)
-model_path=os.path.join(base_dir,"model.pt")
-exp_dir=os.path.join(base_dir,"exp")
-os.makedirs(exp_dir,exist_ok=True)
+home=os.path.expanduser("~");desk=os.path.join(home,"Desktop");base_dir=os.path.join(desk,"GameAI");os.makedirs(base_dir,exist_ok=True);model_path=os.path.join(base_dir,"model.pt");exp_dir=os.path.join(base_dir,"exp");os.makedirs(exp_dir,exist_ok=True)
 device="cuda" if torch.cuda.is_available() else "cpu"
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
-pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth"
-pre_path=os.path.join(base_dir,"resnet18.pth")
+pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(base_dir,"resnet18.pth")
 try:
     if not os.path.exists(pre_path):
         state=torch.hub.load_state_dict_from_url(pre_url,model_dir=base_dir,progress=False)
@@ -42,8 +38,11 @@ except:
 def gpu_load():
     try:
         if gpu_count<1:
-            return 0.0,0.0
-        h=nvmlDeviceGetHandleByIndex(0);u=nvmlDeviceGetUtilizationRates(h);m=nvmlDeviceGetMemoryInfo(h);g=float(u.gpu);v=float(m.used*100.0/max(m.total,1));return g,v
+            gpus=GPUtil.getGPUs()
+            if not gpus:
+                return 0.0,0.0
+            g=gpus[0];return float(g.load*100.0),float(g.memoryUtil*100.0)
+        h=nvmlDeviceGetHandleByIndex(0);u=nvmlDeviceGetUtilizationRates(h);m=nvmlDeviceGetMemoryInfo(h);return float(u.gpu),float(m.used*100.0/max(m.total,1))
     except:
         try:
             gpus=GPUtil.getGPUs()
@@ -82,14 +81,14 @@ class Replay:
         return np.stack(seqs,0),np.stack(acts,0),np.array(rewards,dtype=np.float32),np.array(masks,dtype=np.float32)
 class BrainInspired(nn.Module):
     def __init__(self,dim):
-        super().__init__();self.w=nn.Parameter(torch.randn(dim,dim)*0.02);self.trace=torch.zeros(dim,dim)
+        super().__init__();self.w=nn.Parameter(torch.randn(dim,dim)*0.02);self.register_buffer("trace",torch.zeros(dim,dim))
     def forward(self,x):
         y=x@self.w;self.last=(x.detach(),y.detach());return y
     def hebbian_loss(self,lam=1e-3):
-        x,y=self.last;corr=(x.T@y)/(x.shape[0]+1e-6);self.trace=self.trace.to(x).mul_(0.95).add_(0.05*corr);return lam*torch.mean(self.trace**2)
+        x,y=self.last;corr=(x.T@y)/(x.shape[0]+1e-6);self.trace=self.trace.mul(0.95).add_(0.05*corr);return lam*torch.mean(self.trace**2)
 class Net(nn.Module):
     def __init__(self,seq=4):
-        super().__init__();self.seq=seq;self.enc=nn.Sequential(nn.Conv2d(3*seq,32,5,2,2),nn.ReLU(),nn.BatchNorm2d(32),nn.Conv2d(32,64,3,2,1),nn.ReLU(),nn.Dropout2d(0.1),nn.Conv2d(64,128,3,2,1),nn.ReLU(),nn.Dropout2d(0.1));self.pool=nn.AdaptiveAvgPool2d((8,8));self.proj=nn.Linear(128*8*8,256);self.attn=nn.MultiheadAttention(256,4,batch_first=True);self.lstm=nn.LSTM(256,256,batch_first=True);self.brain=BrainInspired(256);self.pi=nn.Linear(256,3);self.v=nn.Linear(256,1)
+        super().__init__();self.seq=seq;self.enc=nn.Sequential(nn.Conv2d(3*seq,32,5,2,2),nn.ReLU(),nn.BatchNorm2d(32),nn.Conv2d(32,64,3,2,1),nn.ReLU(),nn.Dropout2d(0.1),nn.Conv2d(64,128,3,2,1),nn.ReLU(),nn.Dropout2d(0.1));self.pool=nn.AdaptiveAvgPool2d((8,8));self.proj=nn.Linear(128*64,256);self.attn=nn.MultiheadAttention(256,4,batch_first=True);self.lstm=nn.LSTM(256,256,batch_first=True);self.brain=BrainInspired(256);self.pi=nn.Linear(256,3);self.v=nn.Linear(256,1)
     def forward(self,x):
         b,t,c,h,w=x.shape;z=self.enc(x.reshape(b,c*t,h,w));z=self.pool(z).flatten(1);z=self.proj(z);z=z.view(b,1,256).repeat(1,t,1);z,_=self.attn(z,z,z,need_weights=False);z,_=self.lstm(z);z=self.brain(z[:,-1]);p=self.pi(z);v=self.v(z).squeeze(-1);dx=torch.tanh(p[:,0]);dy=torch.tanh(p[:,1]);cl=torch.sigmoid(p[:,2]);return torch.stack([dx,dy,cl],1),v
 def to_tensor(frames):
@@ -103,14 +102,13 @@ class Agent:
             x=to_tensor(frames[None]).to(device);a,_=self.net(x);a=a[0].detach().cpu().numpy()
         return a
     def train_step(self,replay,batches=50,batch=32,stop_flag=None,progress_cb=None):
-        total=len(range(batches));done=0;policy_loss=0;value_loss=0;reg_loss=0
+        total=batches;done=0;policy_loss=0;value_loss=0;reg_loss=0
         for i in range(batches):
             if stop_flag and stop_flag.is_set():
                 break
             if not replay.can_sample(batch):
                 time.sleep(0.05);continue
-            s,a,r,m=replay.sample(batch);x=to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device)
-            self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
+            s,a,r,m=replay.sample(batch);x=to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device);self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
             with ctx:
                 pi,v=self.net(x);bcl=F.smooth_l1_loss(pi,t);adv=(rew-v.detach());pl=-torch.mean(-0.5*((pi-t)**2).sum(1)*adv);vl=F.mse_loss(v,rew);hl=self.net.brain.hebbian_loss(1e-3);loss=bcl+pl+0.5*vl+hl
             self.opt.zero_grad()
@@ -132,17 +130,19 @@ class App:
         self.sel_var=tk.StringVar();self.vis_var=tk.StringVar(value="False");self.cpu_var=tk.StringVar(value="0%");self.mem_var=tk.StringVar(value="0%");self.gpu_var=tk.StringVar(value="0%");self.vram_var=tk.StringVar(value="0%");self.mode_var=tk.StringVar(value="等待选择窗口")
         self.top=tk.Frame(self.root);self.top.pack(fill="x");self.cmb=ttk.Combobox(self.top,textvariable=self.sel_var,state="readonly",width=60);self.cmb.pack(side="left",padx=5,pady=5);self.btn_refresh=tk.Button(self.top,text="刷新窗口列表",command=self.refresh_windows);self.btn_refresh.pack(side="left",padx=5);self.btn_select=tk.Button(self.top,text="选择窗口",command=self.select_window);self.btn_select.pack(side="left",padx=5);self.lbl_name=tk.Label(self.top,text="窗口名称:");self.lbl_name.pack(side="left",padx=10);self.lbl_vis=tk.Label(self.top,text="可见完整:");self.lbl_vis.pack(side="left",padx=10);self.lbl_mode=tk.Label(self.top,textvariable=self.mode_var);self.lbl_mode.pack(side="left",padx=10)
         self.canvas=tk.Canvas(self.root,width=800,height=450,bg="black");self.canvas.pack(padx=10,pady=10)
-        self.bottom=tk.Frame(self.root);self.bottom.pack(fill="x");self.lbl_cpu=tk.Label(self.bottom,textvariable=self.cpu_var);self.lbl_cpu.pack(side="left",padx=10);self.lbl_mem=tk.Label(self.bottom,textvariable=self.mem_var);self.lbl_mem.pack(side="left",padx=10);self.lbl_gpu=tk.Label(self.bottom,textvariable=self.gpu_var);self.lbl_gpu.pack(side="left",padx=10);self.lbl_vram=tk.Label(self.bottom,textvariable=self.vram_var);self.lbl_vram.pack(side="left",padx=10);self.btn_sleep=tk.Button(self.bottom,text="Sleep",state="disabled",command=self.sleep);self.btn_sleep.pack(side="right",padx=10);self.btn_up=tk.Button(self.bottom,text="Get Up",state="disabled",command=self.get_up);self.btn_up.pack(side="right",padx=10);self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10);self.pval=tk.StringVar(value="0%");self.plabel=tk.Label(self.bottom,textvariable=self.pval);self.plabel.pack(side="right",padx=5);self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
-        self.img_ref=None;self.selected=None;self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=now();self.last_any_time=now();self.inactive_seconds=10.0;self.frames_q=queue.Queue(maxsize=2);self.last_frame=None;self.seq=4;self.frame_seq=[];self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock()
+        self.bottom=tk.Frame(self.root);self.bottom.pack(fill="x");self.lbl_cpu=tk.Label(self.bottom,textvariable=self.cpu_var);self.lbl_cpu.pack(side="left",padx=10);self.lbl_mem=tk.Label(self.bottom,textvariable=self.mem_var);self.lbl_mem.pack(side="left",padx=10);self.lbl_gpu=tk.Label(self.bottom,textvariable=self.gpu_var);self.lbl_gpu.pack(side="left",padx=10);self.lbl_vram=tk.Label(self.bottom,textvariable=self.vram_var);self.lbl_vram.pack(side="left",padx=10);self.btn_sleep=tk.Button(self.bottom,text="Sleep",state="disabled",command=self.sleep);self.btn_sleep.pack(side="right",padx=10);self.btn_up=tk.Button(self.bottom,text="Get Up",state="disabled",command=self.get_up);self.btn_up.pack(side="right",padx=10);self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10);self.pval=tk.StringVar(value="0%");self.plabel=tk.Label(self.bottom,textvariable=self.pval);self.plabel.pack(side="right",padx=5)
+        self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
+        self.img_ref=None;self.selected=None;self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=now();self.last_any_time=now();self.inactive_seconds=10.0;self.frame_seq=[];self.seq=4;self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock()
         try:
             if os.path.exists(model_path):
                 self.agent.net.load_state_dict(torch.load(model_path,map_location=device))
         except:
             pass
-        self.refresh_windows();self.resource_thread=threading.Thread(target=self.resource_loop,daemon=True);self.resource_thread.start();self.capture_thread=threading.Thread(target=self.capture_loop,daemon=True);self.capture_thread.start();self.ui_thread=threading.Thread(target=self.ui_loop,daemon=True);self.ui_thread.start();self.k_listener=keyboard.Listener(on_press=self.on_key_press);self.k_listener.start();self.m_listener=mouse.Listener(on_move=self.on_mouse,on_click=self.on_mouse,on_scroll=self.on_mouse);self.m_listener.start();self.root.bind("<Escape>",lambda e:self.quit())
+        self.refresh_windows();threading.Thread(target=self.resource_loop,daemon=True).start();threading.Thread(target=self.capture_loop,daemon=True).start();threading.Thread(target=self.ui_loop,daemon=True).start()
+        self.k_listener=keyboard.Listener(on_press=self.on_key_press);self.k_listener.start();self.m_listener=mouse.Listener(on_move=self.on_mouse,on_click=self.on_mouse,on_scroll=self.on_mouse);self.m_listener.start();self.root.bind("<Escape>",lambda e:self.quit())
     def list_windows(self):
         try:
-            wins=[w for w in gw.getAllWindows() if w.title and w.isVisible];return [f"{w.title} | {w._hWnd}" for w in wins]
+            wins=[w for w in gw.getAllWindows() if w.title];return [f"{w.title} | {getattr(w,'_hWnd',0)}" for w in wins]
         except:
             return []
     def refresh_windows(self):
@@ -151,18 +151,24 @@ class App:
         s=self.sel_var.get()
         if "|" not in s:
             return
-        title,hwnd=s.split("|",1);self.selected=int(hwnd.strip());self.lbl_name.config(text=f"窗口名称:{title.strip()}");self.mode="learn";self.mode_var.set("学习模式");self.btn_sleep.config(state="normal");self.btn_up.config(state="disabled");self.last_user_time=now()
+        title,hwnd=s.split("|",1);self.selected=int(hwnd.strip()) if hwnd.strip().isdigit() else None;self.lbl_name.config(text=f"窗口名称:{title.strip()}");self.mode="learn";self.mode_var.set("学习模式");self.btn_sleep.config(state="normal");self.btn_up.config(state="disabled");self.last_user_time=now()
     def check_visible_complete(self):
         try:
-            w=gw.Window(self.selected);vis=w.isVisible;minimized=w.isMinimized
+            if not self.selected:
+                return False,False,(0,0,0,0)
+            w=None
+            for cand in gw.getAllWindows():
+                if getattr(cand,"_hWnd",None)==self.selected:
+                    w=cand;break
+            if w is None:
+                return False,False,(0,0,0,0)
+            vis=getattr(w,"isVisible",True);minimized=getattr(w,"isMinimized",False)
             if minimized:
                 return False,False,(0,0,0,0)
-            r=w.box;mons=get_monitors()
-            if mons:
-                mx=min(m.x for m in mons);my=min(m.y for m in mons);mw=max(m.x+m.width for m in mons);mh=max(m.y+m.height for m in mons)
-            else:
-                scr=pyautogui.size();mx=0;my=0;mw=scr.width;mh=scr.height
-            comp=(r.left>=mx and r.top>=my and r.right<=mw and r.bottom<=mh and w.isActive);return bool(vis),bool(comp),(r.left,r.top,r.right,r.bottom)
+            bx=w.box;left,top,width,height=bx.left,bx.top,bx.width,bx.height;right=left+width;bottom=top+height
+            mons=get_monitors();mx=min(m.x for m in mons) if mons else 0;my=min(m.y for m in mons) if mons else 0;mw=max((m.x+m.width) for m in mons) if mons else pyautogui.size().width;mh=max((m.y+m.height) for m in mons) if mons else pyautogui.size().height
+            comp=(left>=mx and top>=my and right<=mw and bottom<=mh and getattr(w,"isActive",True))
+            return bool(vis),bool(comp),(left,top,right,bottom)
         except:
             return False,False,(0,0,0,0)
     def grab_frame(self,rect):
@@ -172,14 +178,20 @@ class App:
         return img
     def resource_loop(self):
         while not self.stop_all:
-            c,m,g,vr=sys_usage();self.cpu_var.set(f"CPU:{c:.0f}%");self.mem_var.set(f"内存:{m:.0f}%");self.gpu_var.set(f"GPU:{g:.0f}%");self.vram_var.set(f"显存:{vr:.0f}%");M=max(c,m,g,vr)/100.0;freq=clamp(int(100*(1.0-M)),1,100);self.capture_hz=freq;time.sleep(0.5)
-    def on_mouse(self,*args,**kwargs):
+            c,m,g,vr=sys_usage();self.cpu_var.set(f"CPU:{c:.0f}%");self.mem_var.set(f"内存:{m:.0f}%");self.gpu_var.set(f"GPU:{g:.0f}%");self.vram_var.set(f"显存:{vr:.0f}%");M=max(c,m,g,vr)/100.0;freq=int(clamp(round(100*(1.0-M)),1,100));self.capture_hz=freq;time.sleep(0.5)
+    def on_mouse(self,*args):
         self.last_user_time=now();self.last_any_time=now()
         try:
             if not (self.selected and self.visible and self.complete and self.rect):
                 return
-            x=args[0] if len(args)>0 else None;y=args[1] if len(args)>1 else None;clicked=1.0 if (len(args)>=4 and bool(args[3])==True) else 0.0
-            if x is None or y is None:
+            if len(args)==2:
+                x,y=args
+                clicked=0.0
+            elif len(args)==4:
+                x,y=args[0],args[1];clicked=1.0 if args[3] else 0.0
+            elif len(args)==4:
+                x,y=args[0],args[1];clicked=0.0
+            else:
                 return
             x1,y1,x2,y2=self.rect
             if x1<=x<=x2 and y1<=y<=y2:
@@ -219,7 +231,7 @@ class App:
     def capture_loop(self):
         while not self.stop_all:
             if self.selected:
-                vis,comp,rect=self.check_visible_complete();self.visible,self.complete,self.rect=vis,comp,rect;self.vis_var.set(str(vis and comp));self.lbl_vis.config(text=f"可见完整:{str(vis and comp)}")
+                vis,comp,rect=self.check_visible_complete();self.visible,self.complete,self.rect=vis,comp,rect;self.lbl_vis.config(text=f"可见完整:{str(vis and comp)}")
                 if not (vis and comp):
                     if self.mode!="opt":
                         self.mode="learn";self.mode_var.set("学习模式")
@@ -238,7 +250,7 @@ class App:
                                 act=self.ai_action_and_apply();self.exp.push(self.frame_seq[-1],act,"ai")
                     if not self.optimizing and self.mode=="learn" and (now()-self.last_any_time)>self.inactive_seconds:
                         self.mode="train";self.mode_var.set("训练模式");self.start_ai_thread()
-                except Exception as e:
+                except:
                     pass
                 time.sleep(t)
             else:
@@ -268,7 +280,7 @@ class App:
             pass
         return a.tolist()
     def start_ai_thread(self):
-        if self.ai_acting:
+        if getattr(self,"ai_acting",False):
             return
         self.ai_acting=True
         def run():
@@ -283,7 +295,7 @@ class App:
     def ui_loop(self):
         while not self.stop_all:
             try:
-                if self.last_frame is not None:
+                if getattr(self,"last_frame",None) is not None:
                     img=cv2.cvtColor(self.last_frame,cv2.COLOR_BGR2RGB);h,w,_=img.shape;scale=min(800/w,450/h);im=cv2.resize(img,(int(w*scale),int(h*scale)));im=Image.fromarray(im);self.img_ref=ImageTk.PhotoImage(im);self.canvas.delete("all");self.canvas.create_image(400,225,image=self.img_ref)
             except:
                 pass
@@ -299,4 +311,3 @@ class App:
         self.root.mainloop()
 if __name__=="__main__":
     App().run()
-
