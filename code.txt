@@ -1,4 +1,4 @@
-import sys,subprocess,importlib,os,threading,time,queue,math,random,ctypes,platform,shutil,urllib.request,contextlib
+import sys,subprocess,importlib,os,threading,time,queue,math,random,ctypes,platform,shutil,urllib.request,contextlib,warnings
 def i(p):
     try:
         importlib.import_module(p)
@@ -17,7 +17,19 @@ import tkinter as tk
 from tkinter import ttk,messagebox
 import pygetwindow as gw
 from screeninfo import get_monitors
-torch.set_num_threads(max(1,(os.cpu_count() or 4)-1))
+try:
+    torch.set_num_threads(max(1,(os.cpu_count() or 4)-1))
+except:
+    pass
+try:
+    torch.set_float32_matmul_precision("high")
+except:
+    pass
+if torch.cuda.is_available():
+    try:
+        torch.backends.cudnn.benchmark=True
+    except:
+        pass
 home=os.path.expanduser("~");desk=os.path.join(home,"Desktop");base_dir=os.path.join(desk,"GameAI");os.makedirs(base_dir,exist_ok=True);model_path=os.path.join(base_dir,"model.pt");exp_dir=os.path.join(base_dir,"exp");os.makedirs(exp_dir,exist_ok=True)
 device="cuda" if torch.cuda.is_available() else "cpu"
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
@@ -128,9 +140,23 @@ class App:
     def __init__(self):
         self.root=tk.Tk();self.root.title("GameAI");self.root.protocol("WM_DELETE_WINDOW",self.quit);self.root.geometry("1000x720")
         self.sel_var=tk.StringVar();self.vis_var=tk.StringVar(value="False");self.cpu_var=tk.StringVar(value="0%");self.mem_var=tk.StringVar(value="0%");self.gpu_var=tk.StringVar(value="0%");self.vram_var=tk.StringVar(value="0%");self.mode_var=tk.StringVar(value="等待选择窗口")
-        self.top=tk.Frame(self.root);self.top.pack(fill="x");self.cmb=ttk.Combobox(self.top,textvariable=self.sel_var,state="readonly",width=60);self.cmb.pack(side="left",padx=5,pady=5);self.btn_refresh=tk.Button(self.top,text="刷新窗口列表",command=self.refresh_windows);self.btn_refresh.pack(side="left",padx=5);self.btn_select=tk.Button(self.top,text="选择窗口",command=self.select_window);self.btn_select.pack(side="left",padx=5);self.lbl_name=tk.Label(self.top,text="窗口名称:");self.lbl_name.pack(side="left",padx=10);self.lbl_vis=tk.Label(self.top,text="可见完整:");self.lbl_vis.pack(side="left",padx=10);self.lbl_mode=tk.Label(self.top,textvariable=self.mode_var);self.lbl_mode.pack(side="left",padx=10)
+        self.top=tk.Frame(self.root);self.top.pack(fill="x")
+        self.cmb=ttk.Combobox(self.top,textvariable=self.sel_var,state="readonly",width=60);self.cmb.pack(side="left",padx=5,pady=5)
+        self.btn_refresh=tk.Button(self.top,text="刷新窗口列表",command=self.refresh_windows);self.btn_refresh.pack(side="left",padx=5)
+        self.btn_select=tk.Button(self.top,text="选择窗口",command=self.select_window);self.btn_select.pack(side="left",padx=5)
+        self.lbl_name=tk.Label(self.top,text="窗口名称:");self.lbl_name.pack(side="left",padx=10)
+        self.lbl_vis=tk.Label(self.top,text="可见完整:");self.lbl_vis.pack(side="left",padx=10)
+        self.lbl_mode=tk.Label(self.top,textvariable=self.mode_var);self.lbl_mode.pack(side="left",padx=10)
         self.canvas=tk.Canvas(self.root,width=800,height=450,bg="black");self.canvas.pack(padx=10,pady=10)
-        self.bottom=tk.Frame(self.root);self.bottom.pack(fill="x");self.lbl_cpu=tk.Label(self.bottom,textvariable=self.cpu_var);self.lbl_cpu.pack(side="left",padx=10);self.lbl_mem=tk.Label(self.bottom,textvariable=self.mem_var);self.lbl_mem.pack(side="left",padx=10);self.lbl_gpu=tk.Label(self.bottom,textvariable=self.gpu_var);self.lbl_gpu.pack(side="left",padx=10);self.lbl_vram=tk.Label(self.bottom,textvariable=self.vram_var);self.lbl_vram.pack(side="left",padx=10);self.btn_sleep=tk.Button(self.bottom,text="Sleep",state="disabled",command=self.sleep);self.btn_sleep.pack(side="right",padx=10);self.btn_up=tk.Button(self.bottom,text="Get Up",state="disabled",command=self.get_up);self.btn_up.pack(side="right",padx=10);self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10);self.pval=tk.StringVar(value="0%");self.plabel=tk.Label(self.bottom,textvariable=self.pval);self.plabel.pack(side="right",padx=5)
+        self.bottom=tk.Frame(self.root);self.bottom.pack(fill="x")
+        self.lbl_cpu=tk.Label(self.bottom,textvariable=self.cpu_var);self.lbl_cpu.pack(side="left",padx=10)
+        self.lbl_mem=tk.Label(self.bottom,textvariable=self.mem_var);self.lbl_mem.pack(side="left",padx=10)
+        self.lbl_gpu=tk.Label(self.bottom,textvariable=self.gpu_var);self.lbl_gpu.pack(side="left",padx=10)
+        self.lbl_vram=tk.Label(self.bottom,textvariable=self.vram_var);self.lbl_vram.pack(side="left",padx=10)
+        self.btn_sleep=tk.Button(self.bottom,text="Sleep",state="disabled",command=self.sleep);self.btn_sleep.pack(side="right",padx=10)
+        self.btn_up=tk.Button(self.bottom,text="Get Up",state="disabled",command=self.get_up);self.btn_up.pack(side="right",padx=10)
+        self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10)
+        self.pval=tk.StringVar(value="0%");self.plabel=tk.Label(self.bottom,textvariable=self.pval);self.plabel.pack(side="right",padx=5)
         self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
         self.img_ref=None;self.selected=None;self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=now();self.last_any_time=now();self.inactive_seconds=10.0;self.frame_seq=[];self.seq=4;self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock()
         try:
@@ -185,12 +211,9 @@ class App:
             if not (self.selected and self.visible and self.complete and self.rect):
                 return
             if len(args)==2:
-                x,y=args
-                clicked=0.0
+                x,y=args;clicked=0.0
             elif len(args)==4:
-                x,y=args[0],args[1];clicked=1.0 if args[3] else 0.0
-            elif len(args)==4:
-                x,y=args[0],args[1];clicked=0.0
+                x,y=args[0],args[1];clicked=1.0 if isinstance(args[2],mouse.Button) and bool(args[3]) else 0.0
             else:
                 return
             x1,y1,x2,y2=self.rect
