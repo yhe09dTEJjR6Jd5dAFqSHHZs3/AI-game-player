@@ -114,14 +114,22 @@ class Agent:
         with ctx:
             x=_to_tensor(frames[None]).to(device);a,_=self.net(x);a=a[0].detach().cpu().numpy()
         return a
-    def train_step(self,replay,batches=50,batch=32,stop_flag=None,progress_sink=None):
+    def train_step(self,replay,batches=50,batch=32,stop_flag=None,progress_sink=None,control=None):
         total=batches;done=0;policy_loss=0;value_loss=0;reg_loss=0
-        for _ in range(batches):
+        while done<total:
             if stop_flag and stop_flag.is_set():
                 break
-            if not replay.can_sample(batch):
+            cfg=control() if control else {}
+            if cfg:
+                total=max(total,int(cfg.get("loops",total)))
+                if cfg.get("paused"):
+                    time.sleep(max(cfg.get("delay",0.1),0.05));continue
+                cur_batch=int(_clamp(cfg.get("batch",batch),1,256));cur_delay=max(cfg.get("delay",0.0),0.0)
+            else:
+                cur_batch=batch;cur_delay=0.0
+            if not replay.can_sample(cur_batch):
                 time.sleep(0.05);continue
-            s,a,r,m=replay.sample(batch);x=_to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device);self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
+            s,a,r,m=replay.sample(cur_batch);x=_to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device);self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
             with ctx:
                 pi,v=self.net(x);bcl=F.smooth_l1_loss(pi,t);adv=(rew-v.detach());pl=-torch.mean(-0.5*((pi-t)**2).sum(1)*adv);vl=F.mse_loss(v,rew);hl=self.net.brain.hebbian_loss(1e-3);loss=bcl+pl+0.5*vl+hl
             self.opt.zero_grad()
@@ -132,6 +140,8 @@ class Agent:
             self.sched.step((bcl+vl).item());policy_loss+=pl.item();value_loss+=vl.item();reg_loss+=hl.item();done+=1
             if progress_sink:
                 progress_sink(int(done*100/max(total,1)))
+            if cur_delay>0:
+                time.sleep(cur_delay)
         self.last_losses=(policy_loss/max(done,1),value_loss/max(done,1),reg_loss/max(done,1))
         try:
             torch.save(self.net.state_dict(),model_path)
@@ -159,7 +169,7 @@ class App:
         self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10)
         self.plabel=tk.Label(self.bottom,textvariable=self.pct_var);self.plabel.pack(side="right",padx=5)
         self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
-        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.seq=4;self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0
+        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.seq=4;self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0
         try:
             if os.path.exists(model_path):
                 self.agent.net.load_state_dict(torch.load(model_path,map_location=device))
@@ -207,7 +217,19 @@ class App:
         return img
     def resource_loop(self):
         while not self.stop_all:
-            c,m,g,vr=_sys_usage();self.cpu=c;self.mem=m;self.gpu=g;self.vram=vr;M=max(c,m,g,vr)/100.0;self.capture_hz=int(_clamp(round(100*(1.0-M)),1,100));time.sleep(0.5)
+            c,m,g,vr=_sys_usage();self.cpu=c;self.mem=m;self.gpu=g;self.vram=vr;M=max(c,m,g,vr)/100.0;self.capture_hz=int(_clamp(round(100*(1.0-M)),1,100));
+            with self.control_lock:
+                if M>=0.95:
+                    self.train_control.update({"paused":True,"delay":0.25,"batch":16,"loops":40});self.ai_interval=0.12
+                elif M>=0.85:
+                    self.train_control.update({"paused":False,"delay":0.12,"batch":24,"loops":60});self.ai_interval=0.09
+                elif M<=0.35:
+                    self.train_control.update({"paused":False,"delay":0.0,"batch":56,"loops":120});self.ai_interval=0.04
+                elif M<=0.6:
+                    self.train_control.update({"paused":False,"delay":0.04,"batch":40,"loops":100});self.ai_interval=0.05
+                else:
+                    self.train_control.update({"paused":False,"delay":0.07,"batch":32,"loops":80});self.ai_interval=0.06
+            time.sleep(0.5)
     def on_mouse(self,*args):
         self.last_user_time=_now();self.last_any_time=_now()
         try:
@@ -243,11 +265,14 @@ class App:
         if not self.optimizing:
             return
         self.opt_stop.set();self.progress_val=0;self.btn_up.config(state="disabled");self.btn_sleep.config(state="normal");self.mode="learn";self.mode_var.set("学习模式");self.optimizing=False
+    def get_train_control(self):
+        with self.control_lock:
+            return dict(self.train_control)
     def optimize_thread(self):
-        steps=80
+        cfg=self.get_train_control();steps=cfg.get("loops",80);base_batch=cfg.get("batch",32)
         def sink(p):
             self.progress_val=p
-        self.agent.train_step(self.exp,batches=steps,batch=32,stop_flag=self.opt_stop,progress_sink=sink)
+        self.agent.train_step(self.exp,batches=steps,batch=base_batch,stop_flag=self.opt_stop,progress_sink=sink,control=lambda:self.get_train_control())
         if not self.opt_stop.is_set():
             self.root.after(0,self.opt_done_dialog)
         else:
@@ -321,7 +346,7 @@ class App:
                     time.sleep(0.1);continue
                 if len(self.frame_seq)==self.seq:
                     self.ai_action_and_apply()
-                time.sleep(0.06)
+                time.sleep(max(0.01,self.ai_interval))
             self.ai_acting=False
         threading.Thread(target=run,daemon=True).start()
     def ui_tick(self):
