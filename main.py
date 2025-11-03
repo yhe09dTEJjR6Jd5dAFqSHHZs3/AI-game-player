@@ -106,7 +106,7 @@ class Net(nn.Module):
         b,t,c,h,w=x.shape;z=self.enc(x.reshape(b,c*t,h,w));z=self.pool(z).flatten(1);z=self.proj(z);z=z.view(b,1,256).repeat(1,t,1);z,_=self.attn(z,z,z,need_weights=False);z,_=self.lstm(z);z=self.brain(z[:,-1]);p=self.pi(z);v=self.v(z).squeeze(-1);dx=torch.tanh(p[:,0]);dy=torch.tanh(p[:,1]);cl=torch.sigmoid(p[:,2]);return torch.stack([dx,dy,cl],1),v
 class KnowledgeBase:
     def __init__(self,seq):
-        self.seq=seq;self.lock=threading.Lock();self.buttons=[];self.max_buttons=128;self.goal_feat=None;self.goal_strength=0.15;self.prev_feat=None;self.dim=512;self.encoder=self._build_encoder()
+        self.seq=seq;self.lock=threading.Lock();self.buttons=[];self.max_buttons=128;self.goal_feat=None;self.goal_strength=0.15;self.prev_feat=None;self.dim=512;self.encoder=self._build_encoder();self.prev_regions={"score":None,"health":None,"message":None};self.state_model={};self.state_counts={};self.transition_counts={};self.last_state=None;self.event_stats={"score_up":0,"score_down":0,"health_up":0,"health_down":0,"victory":0,"defeat":0,"message":0};self.action_rules={k:{} for k in self.event_stats};self.event_values={"score_up":1.0,"score_down":-0.5,"health_up":0.6,"health_down":-1.2,"victory":6.0,"defeat":-6.0,"message":0.4};self.event_history=[];self.max_event_history=800
     def _build_encoder(self):
         try:
             enc=models.resnet18()
@@ -149,6 +149,47 @@ class KnowledgeBase:
         if sub.size==0:
             return None
         return cv2.cvtColor(sub,cv2.COLOR_BGR2RGB)
+    def _region(self,frame,rect,center,size):
+        if frame is None:
+            return None
+        if rect is None:
+            h,w=frame.shape[:2];x1,y1,ww,hh=0,0,w,h
+        else:
+            x1,y1,x2,y2=rect;ww=max(1,x2-x1);hh=max(1,y2-y1)
+        cx=float(_clamp(center[0],0.0,1.0));cy=float(_clamp(center[1],0.0,1.0));bw=float(_clamp(size[0],0.0,1.0));bh=float(_clamp(size[1],0.0,1.0));px=int(x1+cx*ww);py=int(y1+cy*hh);hx=max(2,int(bw*ww*0.5));hy=max(2,int(bh*hh*0.5));lx=int(_clamp(px-hx,x1,x1+ww-1));rx=int(_clamp(px+hx,x1+1,x1+ww));ly=int(_clamp(py-hy,y1,y1+hh-1));ry=int(_clamp(py+hy,y1+1,y1+hh))
+        if rx<=lx or ry<=ly:
+            return None
+        sub=frame[ly-y1:ry-y1,lx-x1:rx-x1]
+        if sub.size==0:
+            return None
+        return sub
+    def _signature(self,patch,shape=(16,16)):
+        if patch is None:
+            return None
+        gray=cv2.cvtColor(patch,cv2.COLOR_BGR2GRAY)
+        sig=cv2.resize(gray,shape,interpolation=cv2.INTER_AREA).astype(np.float32)/255.0
+        return sig.flatten()
+    def _signature_delta(self,a,b):
+        if a is None or b is None:
+            return 0.0
+        n=min(len(a),len(b))
+        if n==0:
+            return 0.0
+        return float(np.linalg.norm(a[:n]-b[:n])/np.sqrt(n))
+    def _extract_regions(self,frame,rect):
+        reg={}
+        for name,center,size in [("score",(0.2,0.08),(0.4,0.2)),("health",(0.2,0.9),(0.45,0.2)),("message",(0.5,0.5),(0.6,0.35))]:
+            patch=self._region(frame,rect,center,size)
+            if patch is None:
+                reg[name]={"sig":None,"mean":0.0,"edges":0.0,"contrast":0.0}
+            else:
+                sig=self._signature(patch)
+                arr=patch.astype(np.float32)/255.0
+                mean=float(np.mean(arr))
+                edges=float(np.mean(cv2.Canny(cv2.cvtColor(patch,cv2.COLOR_BGR2GRAY),32,128))/255.0)
+                contrast=float(np.std(arr))
+                reg[name]={"sig":sig,"mean":mean,"edges":edges,"contrast":contrast}
+        return reg
     def _button_similarity(self,feat):
         if feat is None or not self.buttons:
             return 0.0
@@ -162,6 +203,65 @@ class KnowledgeBase:
         if self.goal_feat is None:
             return 0.0
         return float(np.dot(self.goal_feat,feat)/(self._norm(self.goal_feat)*self._norm(feat)))
+    def _bucket(self,val,levels):
+        v=float(val)
+        if np.isnan(v):
+            v=0.0
+        v=_clamp(v,0.0,1.0)
+        return int(_clamp(int(v*levels),0,levels-1)) if levels>1 else 0
+    def _make_state(self,frame_feat,regions):
+        score_lvl=self._bucket(regions["score"]["mean"],8)
+        health_lvl=self._bucket(regions["health"]["mean"],8)
+        msg_lvl=1 if regions["message"]["edges"]>0.25 else 0
+        contrast_lvl=1 if regions["message"]["contrast"]>0.2 else 0
+        align=float(_clamp((self._goal_alignment(frame_feat)+1.0)*0.5,0.0,1.0))
+        align_lvl=self._bucket(align,6)
+        return (score_lvl,health_lvl,msg_lvl,contrast_lvl,align_lvl)
+    def _register_transition(self,prev_state,state):
+        key=(prev_state,state)
+        self.transition_counts[key]=self.transition_counts.get(key,0)+1
+    def _action_key(self,action):
+        if action is None:
+            return "none"
+        try:
+            dx=int(round(float(_clamp(action[0],-1.0,1.0))*5))
+            dy=int(round(float(_clamp(action[1],-1.0,1.0))*5))
+            cl=int(float(action[2])>0.5)
+        except:
+            dx=dy=0;cl=0
+        return f"{dx}:{dy}:{cl}"
+    def _log_event(self,event,intensity,state,action_key,source):
+        val=float(self.event_values.get(event,0.0))*float(intensity)
+        self.event_stats[event]=self.event_stats.get(event,0)+1
+        if state not in self.state_model:
+            self.state_model[state]=0.0
+        self.state_model[state]+=val
+        if action_key not in self.action_rules[event]:
+            self.action_rules[event][action_key]=0.0
+        weight=1.0+0.5*source
+        self.action_rules[event][action_key]+=val*weight
+        self.event_history.append((event,_now(),val,state,action_key,source))
+        if len(self.event_history)>self.max_event_history:
+            self.event_history.pop(0)
+    def _rule_action_hint(self,state):
+        best=None;best_score=-1e9
+        for event,acts in self.action_rules.items():
+            if self.event_values.get(event,0.0)<=0:
+                continue
+            for key,val in acts.items():
+                score=val
+                if state in self.state_model:
+                    score*=1.0+max(0.0,self.state_model[state])
+                if score>best_score:
+                    best_score=score;best=key
+        if best is None:
+            return None
+        try:
+            dx,dy,cl=best.split(":")
+            dx=float(_clamp(int(dx)/5.0,-1.0,1.0));dy=float(_clamp(int(dy)/5.0,-1.0,1.0));cl=float(int(cl))
+            return [dx,dy,cl]
+        except:
+            return None
     def update(self,frames,rect,action,pos,source):
         if not frames:
             return 0.0
@@ -172,13 +272,44 @@ class KnowledgeBase:
                 patch=self._crop(frame,rect,pos)
                 if patch is not None:
                     feat_patch=self._encode(patch)
-            frame_feat=self._encode(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
-            if feat_patch is not None and action[2]>0.5 and source==1:
-                self._store_button(feat_patch,pos)
+            rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+            frame_feat=self._encode(rgb)
+            regions=self._extract_regions(frame,rect)
+            state=self._make_state(frame_feat,regions)
             if self.goal_feat is None:
                 self.goal_feat=frame_feat.copy()
             else:
-                mix=0.15 if source==1 else 0.05;self.goal_feat=self.goal_feat*(1-mix)+frame_feat*mix;self.goal_strength=float(_clamp(self.goal_strength+(0.03 if source==1 else -0.01),0.05,1.0))
+                mix=0.2 if source==1 else 0.08;self.goal_feat=self.goal_feat*(1-mix)+frame_feat*mix;self.goal_strength=float(_clamp(self.goal_strength+(0.04 if source==1 else -0.015),0.05,1.0))
+            if feat_patch is not None and action[2]>0.5 and source==1:
+                self._store_button(feat_patch,pos)
+            events=[]
+            for key in ["score","health","message"]:
+                prev=self.prev_regions.get(key)
+                cur=regions[key]
+                if prev is None or prev["sig"] is None or cur["sig"] is None:
+                    continue
+                delta=self._signature_delta(prev["sig"],cur["sig"])
+                if key=="score" and delta>0.12:
+                    diff=cur["mean"]-prev["mean"]
+                    if diff>0.015:
+                        events.append(("score_up",diff))
+                    elif diff<-0.02:
+                        events.append(("score_down",-diff))
+                elif key=="health" and delta>0.1:
+                    diff=cur["mean"]-prev["mean"]
+                    if diff>0.02:
+                        events.append(("health_up",diff))
+                    elif diff<-0.015:
+                        events.append(("health_down",-diff))
+                elif key=="message":
+                    if cur["edges"]>0.35 and cur["contrast"]>0.25 and (prev["edges"]<0.25 or cur["mean"]>prev["mean"]+0.1):
+                        events.append(("victory",cur["edges"]))
+                    elif prev["edges"]>0.3 and cur["edges"]<0.18 and prev["mean"]>cur["mean"]+0.1:
+                        events.append(("defeat",prev["edges"]))
+                    elif delta>0.18:
+                        events.append(("message",delta))
+            for name,cur in regions.items():
+                self.prev_regions[name]={"sig":cur["sig"],"mean":cur["mean"],"edges":cur["edges"],"contrast":cur["contrast"]}
             if len(frames)>1:
                 diff=float(np.mean(np.abs(frames[-1].astype(np.float32)-frames[0].astype(np.float32)))/255.0);reward+=diff
             if feat_patch is not None:
@@ -186,20 +317,37 @@ class KnowledgeBase:
             reward+=max(0.0,self.goal_strength*self._goal_alignment(frame_feat))
             if self.prev_feat is not None:
                 drift=self._norm(frame_feat-self.prev_feat);reward+=max(0.0,drift*0.01)
+            action_key=self._action_key(action)
+            if self.last_state is not None:
+                self._register_transition(self.last_state,state)
+            self.state_counts[state]=self.state_counts.get(state,0)+1
+            self.last_state=state
+            for ev,val in events:
+                self._log_event(ev,val,state,action_key,source)
+                reward+=self.event_values.get(ev,0.0)*val
+                if ev=="victory":
+                    self.goal_strength=float(_clamp(self.goal_strength+0.1,0.05,1.0))
+                if ev=="defeat":
+                    self.goal_strength=float(_clamp(self.goal_strength-0.1,0.05,1.0))
+            reward+=self.state_model.get(state,0.0)*0.05
             self.prev_feat=frame_feat
         return reward
     def suggest(self,frame,rect):
         with self.lock:
-            if frame is None or not self.buttons:
+            if frame is None:
                 return None
             best=-1.0;pos=None
-            for btn in self.buttons:
-                patch=self._crop(frame,rect,btn["pos"])
-                if patch is None:
-                    continue
-                feat=self._encode(patch);sim=self._button_similarity(feat)
-                if sim>best:
-                    best=sim;pos=btn["pos"]
+            if self.buttons:
+                for btn in self.buttons:
+                    patch=self._crop(frame,rect,btn["pos"])
+                    if patch is None:
+                        continue
+                    feat=self._encode(patch);sim=self._button_similarity(feat)
+                    if sim>best:
+                        best=sim;pos=btn["pos"]
+            rule=self._rule_action_hint(self.last_state) if self.last_state is not None else None
+            if rule is not None and (pos is None or best<0.65):
+                return rule
             if pos is None or best<0.6:
                 return None
             dx=float(_clamp(pos[0]*2.0-1.0,-1.0,1.0));dy=float(_clamp(pos[1]*2.0-1.0,-1.0,1.0));click=float(_clamp(best,0.0,1.0));return [dx,dy,click]
@@ -207,7 +355,13 @@ class KnowledgeBase:
         with self.lock:
             if frame is None:
                 return 0.0
-            feat=self._encode(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB));return max(0.0,self._goal_alignment(feat))
+            rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+            feat=self._encode(rgb)
+            regions=self._extract_regions(frame,None)
+            state=self._make_state(feat,regions)
+            state_value=self.state_model.get(state,0.0)
+            align=max(0.0,self._goal_alignment(feat))
+            return float(state_value*0.6+align*0.4)
 def _to_tensor(frames):
     x=torch.from_numpy(frames.astype(np.float32)/255.0);x=x.permute(0,1,4,2,3).contiguous();return x
 class Agent:
