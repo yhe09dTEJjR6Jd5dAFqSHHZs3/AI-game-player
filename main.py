@@ -11,10 +11,10 @@ def _pip(x,base_dir):
             subprocess.check_call([sys.executable,"-m","pip","install","--upgrade","--no-input","--timeout","30",x])
         except:
             pass
-home=os.path.expanduser("~");desk=os.path.join(home,"Desktop");base_dir=os.path.join(desk,"GameAI");os.makedirs(base_dir,exist_ok=True)
-for p in ["psutil","pillow","numpy","opencv-python","mss","pynput","pyautogui","torch","torchvision","GPUtil","pynvml","pygetwindow","screeninfo"]:
+home=os.path.expanduser("~");desk=os.path.join(home,"Desktop");base_dir=os.path.join(desk,"GameAI");models_dir=os.path.join(base_dir,"models");os.makedirs(base_dir,exist_ok=True);os.makedirs(models_dir,exist_ok=True)
+for p in ["psutil","pillow","numpy","opencv-python","mss","pynput","pyautogui","torch","torchvision","GPUtil","pynvml","pygetwindow","screeninfo","requests"]:
     _pip(p,base_dir)
-import psutil,pyautogui,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,torchvision.models as models,GPUtil,cv2,numpy as np,mss
+import psutil,pyautogui,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,torchvision.models as models,GPUtil,cv2,numpy as np,mss,requests
 from pynvml import nvmlInit,nvmlDeviceGetHandleByIndex,nvmlDeviceGetUtilizationRates,nvmlDeviceGetMemoryInfo,nvmlDeviceGetCount
 from pynput import mouse,keyboard
 from PIL import Image,ImageTk
@@ -36,14 +36,9 @@ try:
 except:
     pass
 device="cuda" if torch.cuda.is_available() else "cpu"
-model_dir=base_dir;model_path=os.path.join(model_dir,"model.pt");exp_dir=os.path.join(model_dir,"exp");os.makedirs(exp_dir,exist_ok=True)
+model_path=os.path.join(models_dir,"model.pt");exp_dir=os.path.join(base_dir,"exp");os.makedirs(exp_dir,exist_ok=True)
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
-pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(model_dir,"resnet18.pth")
-try:
-    if not os.path.exists(pre_path):
-        state=torch.hub.load_state_dict_from_url(pre_url,model_dir=model_dir,progress=False);torch.save(state,pre_path)
-except:
-    pass
+pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(models_dir,"resnet18.pth")
 try:
     nvmlInit();_gpu_count=nvmlDeviceGetCount()
 except:
@@ -104,6 +99,46 @@ class Net(nn.Module):
         super().__init__();self.seq=seq;self.enc=nn.Sequential(nn.Conv2d(3*seq,32,5,2,2),nn.ReLU(),nn.BatchNorm2d(32),nn.Conv2d(32,64,3,2,1),nn.ReLU(),nn.Dropout2d(0.1),nn.Conv2d(64,128,3,2,1),nn.ReLU(),nn.Dropout2d(0.1));self.pool=nn.AdaptiveAvgPool2d((8,8));self.proj=nn.Linear(128*64,256);self.attn=nn.MultiheadAttention(256,4,batch_first=True);self.lstm=nn.LSTM(256,256,batch_first=True);self.brain=BrainInspired(256);self.pi=nn.Linear(256,3);self.v=nn.Linear(256,1)
     def forward(self,x):
         b,t,c,h,w=x.shape;z=self.enc(x.reshape(b,c*t,h,w));z=self.pool(z).flatten(1);z=self.proj(z);z=z.view(b,1,256).repeat(1,t,1);z,_=self.attn(z,z,z,need_weights=False);z,_=self.lstm(z);z=self.brain(z[:,-1]);p=self.pi(z);v=self.v(z).squeeze(-1);dx=torch.tanh(p[:,0]);dy=torch.tanh(p[:,1]);cl=torch.sigmoid(p[:,2]);return torch.stack([dx,dy,cl],1),v
+def _download_file(url,path,timeout=45):
+    try:
+        with requests.get(url,timeout=timeout,stream=True) as r:
+            r.raise_for_status()
+            with open(path,"wb") as f:
+                for chunk in r.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+        return True
+    except:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+        return False
+def _generate_local_model(path,seq):
+    try:
+        net=Net(seq)
+        torch.save(net.state_dict(),path)
+        return True
+    except:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+        return False
+def _generate_resnet_local(path):
+    try:
+        state=models.resnet18().state_dict()
+        torch.save(state,path)
+        return True
+    except:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+        return False
 class KnowledgeBase:
     def __init__(self,seq):
         self.seq=seq;self.lock=threading.Lock();self.buttons=[];self.max_buttons=128;self.goal_feat=None;self.goal_strength=0.15;self.prev_feat=None;self.dim=512;self.encoder=self._build_encoder();self.prev_regions={"score":None,"health":None,"message":None};self.state_model={};self.state_counts={};self.transition_counts={};self.last_state=None;self.event_stats={"score_up":0,"score_down":0,"health_up":0,"health_down":0,"victory":0,"defeat":0,"message":0};self.action_rules={k:{} for k in self.event_stats};self.event_values={"score_up":1.0,"score_down":-0.5,"health_up":0.6,"health_down":-1.2,"victory":6.0,"defeat":-6.0,"message":0.4};self.event_history=[];self.max_event_history=800
@@ -427,14 +462,64 @@ class App:
         self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10)
         self.plabel=tk.Label(self.bottom,textvariable=self.pct_var);self.plabel.pack(side="right",padx=5)
         self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
-        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.frame_seq_raw=[];self.seq=4;self.exp=Replay(30000,self.seq);self.agent=Agent(self.seq,1e-3);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.last_user_norm=[0.5,0.5];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0;self.knowledge=KnowledgeBase(self.seq)
+        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.frame_seq_raw=[];self.seq=4;self.exp=Replay(30000,self.seq);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.last_user_norm=[0.5,0.5];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0
+        self.ensure_models()
+        self.agent=Agent(self.seq,1e-3)
+        if not os.path.exists(model_path):
+            _generate_local_model(model_path,self.seq)
         try:
-            if os.path.exists(model_path):
-                self.agent.net.load_state_dict(torch.load(model_path,map_location=device))
+            self.agent.net.load_state_dict(torch.load(model_path,map_location=device))
         except:
-            pass
+            _generate_local_model(model_path,self.seq)
+            try:
+                self.agent.net.load_state_dict(torch.load(model_path,map_location=device))
+            except:
+                pass
+        self.knowledge=KnowledgeBase(self.seq)
         self.refresh_windows();threading.Thread(target=self.resource_loop,daemon=True).start();threading.Thread(target=self.capture_loop,daemon=True).start()
         self.k_listener=keyboard.Listener(on_press=self.on_key_press);self.k_listener.start();self.m_listener=mouse.Listener(on_move=self.on_mouse,on_click=self.on_mouse,on_scroll=self.on_mouse);self.m_listener.start();self.root.bind("<Escape>",lambda e:self.quit());self.ui_tick()
+    def ensure_models(self):
+        specs=[{"name":"resnet18.pth","path":pre_path,"url":pre_url,"desc":"视觉特征模型","local":lambda:_generate_resnet_local(pre_path)},{"name":"model.pt","path":model_path,"url":None,"desc":"策略模型","local":lambda:_generate_local_model(model_path,self.seq)}]
+        for spec in specs:
+            if os.path.exists(spec["path"]):
+                continue
+            if spec["url"] and self.try_download_model(spec["url"],spec["path"]):
+                continue
+            while not os.path.exists(spec["path"]):
+                choice=self.prompt_model_decision(spec["name"],spec["desc"],bool(spec["url"])) if spec["url"] or not os.path.exists(spec["path"]) else "local"
+                if choice=="retry" and spec["url"]:
+                    if self.try_download_model(spec["url"],spec["path"]):
+                        break
+                else:
+                    if spec["local"] and spec["local"]():
+                        break
+    def try_download_model(self,url,path):
+        try:
+            if url==pre_url:
+                state=torch.hub.load_state_dict_from_url(url,map_location="cpu",progress=False,model_dir=models_dir)
+                torch.save(state,path)
+                return True
+        except:
+            pass
+        return _download_file(url,path,45)
+    def prompt_model_decision(self,name,desc,allow_retry=True):
+        choice=tk.StringVar(value="retry" if allow_retry else "local")
+        win=tk.Toplevel(self.root);win.title("模型获取");win.geometry("360x200")
+        tk.Label(win,text=f"{desc}{name}缺失或下载失败，请选择操作").pack(pady=20)
+        def decide(val):
+            choice.set(val)
+            try:
+                win.destroy()
+            except:
+                pass
+        btn_retry=tk.Button(win,text="重试下载",state="normal" if allow_retry else "disabled",command=lambda:decide("retry"))
+        btn_retry.pack(pady=5)
+        tk.Button(win,text="本地生成",command=lambda:decide("local")).pack(pady=5)
+        win.transient(self.root)
+        win.grab_set()
+        self.root.update_idletasks()
+        self.root.wait_variable(choice)
+        return choice.get()
     def list_windows(self):
         try:
             wins=[w for w in gw.getAllWindows() if w.title];return [f"{w.title} | {getattr(w,'_hWnd',0)}" for w in wins]
