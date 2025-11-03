@@ -1,4 +1,4 @@
-import sys,subprocess,importlib,os,threading,time,random,contextlib,json
+import sys,subprocess,importlib,os,threading,time,random,contextlib,json,ctypes
 def _pip(x,base_dir):
     try:
         importlib.import_module(x)
@@ -22,6 +22,15 @@ import tkinter as tk
 from tkinter import ttk
 import pygetwindow as gw
 from screeninfo import get_monitors
+pyautogui.FAILSAFE=False;pyautogui.PAUSE=0.0;pyautogui.MINIMUM_DURATION=0.0
+if os.name=="nt":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except:
+            pass
 try:
     torch.set_num_threads(max(1,(os.cpu_count() or 4)-1))
 except:
