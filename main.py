@@ -1,4 +1,4 @@
-import sys,subprocess,importlib,os,threading,time,random,contextlib
+import sys,subprocess,importlib,os,threading,time,random,contextlib,json
 def _pip(x,base_dir):
     try:
         importlib.import_module(x)
@@ -36,7 +36,7 @@ try:
 except:
     pass
 device="cuda" if torch.cuda.is_available() else "cpu"
-model_path=os.path.join(models_dir,"model.pt");exp_dir=os.path.join(base_dir,"exp");os.makedirs(exp_dir,exist_ok=True)
+model_path=os.path.join(models_dir,"model.pt");exp_dir=os.path.join(base_dir,"experience");os.makedirs(exp_dir,exist_ok=True)
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
 pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(models_dir,"resnet18.pth")
 try:
@@ -87,6 +87,32 @@ class Replay:
             r=float(np.mean(np.abs(post.astype(np.float32)-pre.astype(np.float32)))/255.0)+self.rewards[k+self.seq-1]
             seqs.append(np.stack(fr,0));acts.append(np.array(ac,dtype=np.float32));rewards.append(r);masks.append(1.0);sources.append(self.src[k+self.seq-1])
         return np.stack(seqs,0),np.stack(acts,0),np.array(rewards,dtype=np.float32),np.array(masks,dtype=np.float32),np.array(sources,dtype=np.float32)
+class ExperienceWriter:
+    def __init__(self,path):
+        self.path=path;self.learn_dir=os.path.join(path,"learn");self.train_dir=os.path.join(path,"train");self.meta=os.path.join(path,"log.jsonl");os.makedirs(self.learn_dir,exist_ok=True);os.makedirs(self.train_dir,exist_ok=True);self.lock=threading.Lock()
+    def record(self,frame,action,pos,source,rect,title,mode):
+        if frame is None or rect is None:
+            return
+        if pos is None:
+            pos=(0.5,0.5)
+        ts=int(_now()*1000);sub=self.learn_dir if int(source)==1 else self.train_dir
+        try:
+            os.makedirs(sub,exist_ok=True)
+        except:
+            pass
+        name=os.path.join(sub,f"{ts}_{int(source)}.npz")
+        data={"time":ts,"action":[float(_clamp(action[0],-1.0,1.0)),float(_clamp(action[1],-1.0,1.0)),float(_clamp(action[2],0.0,1.0))],"pos":[float(_clamp(pos[0],0.0,1.0)),float(_clamp(pos[1],0.0,1.0))],"rect":[int(rect[0]),int(rect[1]),int(rect[2]),int(rect[3])],"source":int(source),"window":title or "","mode":mode}
+        arr=np.array(frame,dtype=np.uint8)
+        with self.lock:
+            try:
+                np.savez_compressed(name,frame=arr,meta=data)
+            except:
+                pass
+            try:
+                with open(self.meta,"a",encoding="utf-8") as f:
+                    f.write(json.dumps(data,ensure_ascii=False)+"\n")
+            except:
+                pass
 class BrainInspired(nn.Module):
     def __init__(self,dim):
         super().__init__();self.w=nn.Parameter(torch.randn(dim,dim)*0.02);self.register_buffer("trace",torch.zeros(dim,dim))
@@ -462,7 +488,7 @@ class App:
         self.pbar=ttk.Progressbar(self.bottom,orient="horizontal",mode="determinate",length=300,maximum=100);self.pbar.pack(side="right",padx=10)
         self.plabel=tk.Label(self.bottom,textvariable=self.pct_var);self.plabel.pack(side="right",padx=5)
         self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
-        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.frame_seq_raw=[];self.seq=4;self.exp=Replay(30000,self.seq);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.last_user_norm=[0.5,0.5];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0
+        self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.frame_seq_raw=[];self.seq=4;self.exp=Replay(30000,self.seq);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.last_user_norm=[0.5,0.5];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0;self.exp_writer=ExperienceWriter(exp_dir)
         self.ensure_models()
         self.agent=Agent(self.seq,1e-3)
         if not os.path.exists(model_path):
@@ -650,9 +676,9 @@ class App:
                         self.frame_seq_raw.append(img.copy());self.frame_seq.append(cv2.resize(img,(160,120)))
                         if len(self.frame_seq)==self.seq:
                             if self.mode=="learn":
-                                act=self.read_user_action();pos=self.get_user_norm();reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,1);self.exp.push(self.frame_seq[-1],act,1,reward)
+                                act=self.read_user_action();pos=self.get_user_norm();reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,1);self.exp.push(self.frame_seq[-1],act,1,reward);self.exp_writer.record(self.frame_seq_raw[-1] if self.frame_seq_raw else None,act,pos,1,self.rect,self.selected_title,"learn")
                             elif self.mode=="train":
-                                act=self.ai_action_and_apply();pos=self.action_to_norm(act);reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,0);self.exp.push(self.frame_seq[-1],act,0,reward)
+                                act=self.ai_action_and_apply();pos=self.action_to_norm(act);reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,0);self.exp.push(self.frame_seq[-1],act,0,reward);self.exp_writer.record(self.frame_seq_raw[-1] if self.frame_seq_raw else None,act,pos,0,self.rect,self.selected_title,"train")
                     if not self.optimizing and self.mode=="learn" and (_now()-self.last_any_time)>self.inactive_seconds and (self.visible and self.complete):
                         self.mode="train";self.start_ai_thread()
                 except:
