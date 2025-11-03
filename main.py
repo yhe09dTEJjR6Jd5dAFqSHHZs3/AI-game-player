@@ -47,7 +47,7 @@ except:
 device="cuda" if torch.cuda.is_available() else "cpu"
 model_path=os.path.join(models_dir,"model.pt");exp_dir=os.path.join(base_dir,"experience");os.makedirs(exp_dir,exist_ok=True)
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
-pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(models_dir,"resnet18.pth")
+pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(models_dir,"resnet18.pth");policy_url="https://download.pytorch.org/models/squeezenet1_1-b8a52dc0.pth"
 try:
     nvmlInit();_gpu_count=nvmlDeviceGetCount()
 except:
@@ -514,7 +514,7 @@ class App:
         self.refresh_windows();threading.Thread(target=self.resource_loop,daemon=True).start();threading.Thread(target=self.capture_loop,daemon=True).start()
         self.k_listener=keyboard.Listener(on_press=self.on_key_press);self.k_listener.start();self.m_listener=mouse.Listener(on_move=self.on_mouse,on_click=self.on_mouse,on_scroll=self.on_mouse);self.m_listener.start();self.root.bind("<Escape>",lambda e:self.quit());self.ui_tick()
     def ensure_models(self):
-        specs=[{"name":"resnet18.pth","path":pre_path,"url":pre_url,"desc":"视觉特征模型","local":lambda:_generate_resnet_local(pre_path)},{"name":"model.pt","path":model_path,"url":None,"desc":"策略模型","local":lambda:_generate_local_model(model_path,self.seq)}]
+        specs=[{"name":"resnet18.pth","path":pre_path,"url":pre_url,"desc":"视觉特征模型","local":lambda:_generate_resnet_local(pre_path)},{"name":"model.pt","path":model_path,"url":policy_url,"desc":"策略模型","local":lambda:_generate_local_model(model_path,self.seq)}]
         for spec in specs:
             if os.path.exists(spec["path"]):
                 continue
@@ -595,15 +595,15 @@ class App:
         return img
     def resource_loop(self):
         while not self.stop_all:
-            c,m,g,vr=_sys_usage();self.cpu=c;self.mem=m;self.gpu=g;self.vram=vr;M=max(c,m,g,vr)/100.0;self.capture_hz=int(_clamp(round(100*(1.0-M)),1,100))
+            c,m,g,vr=_sys_usage();self.cpu=c;self.mem=m;self.gpu=g;self.vram=vr;M=max(c,m,g,vr);Mp=M/100.0;self.capture_hz=max(0,int(round(100*(1.0-Mp))))
             with self.control_lock:
-                if M>=0.95:
+                if Mp>=0.95:
                     self.train_control.update({"paused":True,"delay":0.25,"batch":16,"loops":40});self.ai_interval=0.12
-                elif M>=0.85:
+                elif Mp>=0.85:
                     self.train_control.update({"paused":False,"delay":0.12,"batch":24,"loops":60});self.ai_interval=0.09
-                elif M<=0.35:
+                elif Mp<=0.35:
                     self.train_control.update({"paused":False,"delay":0.0,"batch":56,"loops":120});self.ai_interval=0.04
-                elif M<=0.6:
+                elif Mp<=0.6:
                     self.train_control.update({"paused":False,"delay":0.04,"batch":40,"loops":100});self.ai_interval=0.05
                 else:
                     self.train_control.update({"paused":False,"delay":0.07,"batch":32,"loops":80});self.ai_interval=0.06
@@ -676,7 +676,10 @@ class App:
                     if self.mode!="opt":
                         self.mode="learn"
                     time.sleep(0.2);continue
-                t=1.0/max(getattr(self,"capture_hz",30),1)
+                hz=max(int(getattr(self,"capture_hz",30)),0)
+                if hz==0:
+                    time.sleep(1.0);continue
+                t=1.0/max(hz,1)
                 try:
                     img=self.grab_frame(rect);self.last_frame=img
                     if not self.optimizing and self.mode in ["learn","train"]:
