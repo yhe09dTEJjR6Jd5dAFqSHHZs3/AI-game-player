@@ -12,9 +12,11 @@ def _pip(x,base_dir):
         except:
             pass
 home=os.path.expanduser("~");desk=os.path.join(home,"Desktop");base_dir=os.path.join(desk,"GameAI");models_dir=os.path.join(base_dir,"models");os.makedirs(base_dir,exist_ok=True);os.makedirs(models_dir,exist_ok=True)
-for p in ["psutil","pillow","numpy","opencv-python","mss","pynput","pyautogui","torch","torchvision","GPUtil","pynvml","pygetwindow","screeninfo","requests"]:
+for p in ["psutil","pillow","numpy","opencv-python","mss","pynput","pyautogui","torch","torchvision","GPUtil","pynvml","pygetwindow","screeninfo","requests","ultralytics","open-clip-torch","segment-anything","networkx"]:
     _pip(p,base_dir)
-import psutil,pyautogui,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,torchvision.models as models,GPUtil,cv2,numpy as np,mss,requests
+import psutil,pyautogui,torch,torch.nn as nn,torch.nn.functional as F,torch.optim as optim,torchvision.models as models,GPUtil,cv2,numpy as np,mss,requests,open_clip,networkx as nx
+from ultralytics import YOLO
+from segment_anything import sam_model_registry,SamPredictor
 from pynvml import nvmlInit,nvmlDeviceGetHandleByIndex,nvmlDeviceGetUtilizationRates,nvmlDeviceGetMemoryInfo,nvmlDeviceGetCount
 from pynput import mouse,keyboard
 from PIL import Image,ImageTk
@@ -47,7 +49,7 @@ except:
 device="cuda" if torch.cuda.is_available() else "cpu"
 model_path=os.path.join(models_dir,"model.pt");exp_dir=os.path.join(base_dir,"experience");os.makedirs(exp_dir,exist_ok=True)
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
-pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(models_dir,"resnet18.pth");policy_url="https://download.pytorch.org/models/squeezenet1_1-b8a52dc0.pth"
+pre_url="https://download.pytorch.org/models/resnet18-f37072fd.pth";pre_path=os.path.join(models_dir,"resnet18.pth");policy_url="https://download.pytorch.org/models/squeezenet1_1-b8a52dc0.pth";yolo_url="https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt";yolo_path=os.path.join(models_dir,"yolov8n.pt");clip_name="ViT-B-32";clip_pretrained="laion2b_s34b_b79k";clip_path=os.path.join(models_dir,"clip_vitb32.pt");sam_url="https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth";sam_path=os.path.join(models_dir,"sam_vit_b.pth")
 try:
     nvmlInit();_gpu_count=nvmlDeviceGetCount()
 except:
@@ -122,18 +124,61 @@ class ExperienceWriter:
                     f.write(json.dumps(data,ensure_ascii=False)+"\n")
             except:
                 pass
-class BrainInspired(nn.Module):
-    def __init__(self,dim):
-        super().__init__();self.w=nn.Parameter(torch.randn(dim,dim)*0.02);self.register_buffer("trace",torch.zeros(dim,dim))
+class SpikeEncoder(nn.Module):
+    def __init__(self,dim,steps=6):
+        super().__init__();self.steps=steps;self.fc=nn.Linear(dim,dim);self.decay=nn.Parameter(torch.full((dim,),0.8));self.thresh=nn.Parameter(torch.ones(dim));self.reset=nn.Parameter(torch.zeros(dim))
     def forward(self,x):
-        y=x@self.w;self.last=(x.detach(),y.detach());return y
+        b=x.shape[0];h=self.fc(x);mem=torch.zeros(b,h.shape[1],device=x.device);spikes=[]
+        for _ in range(self.steps):
+            mem=mem*torch.sigmoid(self.decay)+h
+            spk=torch.sigmoid((mem-self.thresh)*8.0)
+            mem=mem*(1.0-spk)+self.reset
+            spikes.append(spk)
+        s=torch.stack(spikes,1)
+        return s,s.mean(1)
+class DifferentiableMemory(nn.Module):
+    def __init__(self,slots,dim):
+        super().__init__();self.slots=slots;self.dim=dim;self.mem=nn.Parameter(torch.randn(slots,dim)*0.01);self.controller=nn.GRUCell(dim,dim);self.write=nn.Linear(dim,dim);self.read=nn.Linear(dim,dim)
+    def forward(self,query,context):
+        b=query.shape[0];memory=self.mem.unsqueeze(0).expand(b,-1,-1);state=torch.zeros(b,self.dim,device=query.device);reads=[]
+        for i in range(context.shape[1]):
+            state=self.controller(context[:,i],state)
+            erase=torch.sigmoid(self.write(state))
+            memory=memory*(1.0-erase.unsqueeze(1))+erase.unsqueeze(1)*context[:,i].unsqueeze(1)
+            key=self.read(state).unsqueeze(1)
+            att=torch.softmax((key*memory).sum(-1)/math.sqrt(self.dim),-1)
+            read=torch.sum(att.unsqueeze(-1)*memory,1)
+            reads.append(read)
+        read_final=reads[-1] if reads else query
+        return query+state+read_final
+class BrainInspired(nn.Module):
+    def __init__(self,dim,steps=6):
+        super().__init__();self.dim=dim;self.steps=steps;self.spike=SpikeEncoder(dim,steps);self.rec=nn.GRU(dim,dim,batch_first=True);self.mem=DifferentiableMemory(32,dim);self.attn=nn.MultiheadAttention(dim,8,batch_first=True);self.register_buffer("trace",torch.zeros(dim,dim));self.last=None
+    def forward(self,x,context=None):
+        spikes,avg=self.spike(x)
+        seq=torch.cumsum(spikes,1)
+        if context is not None:
+            seq=torch.cat([context,seq],1)
+        out,_=self.rec(seq)
+        key=out;value=out
+        query=avg.unsqueeze(1)
+        attn,_=self.attn(query,key,value,need_weights=False)
+        mem=self.mem(attn.squeeze(1),seq)
+        self.last=(spikes.detach(),mem.detach(),x.detach())
+        return mem
     def hebbian_loss(self,lam=1e-3):
-        x,y=self.last;corr=(x.T@y)/(x.shape[0]+1e-6);self.trace=self.trace.mul(0.95).add_(0.05*corr);return lam*torch.mean(self.trace**2)
+        if not self.last:
+            return torch.tensor(0.0,device=self.trace.device)
+        spikes,mem,x=self.last
+        corr=torch.einsum("bsi,bsj->ij",spikes,spikes)/(spikes.shape[0]*spikes.shape[1]+1e-6)
+        stdp=torch.einsum("bi,bj->ij",x,mem)/(x.shape[0]+1e-6)
+        self.trace=self.trace.mul(0.9).add_(0.1*corr)
+        return lam*(self.trace.pow(2).mean()+stdp.pow(2).mean())
 class Net(nn.Module):
     def __init__(self,seq=4):
-        super().__init__();self.seq=seq;self.enc=nn.Sequential(nn.Conv2d(3*seq,32,5,2,2),nn.ReLU(),nn.BatchNorm2d(32),nn.Conv2d(32,64,3,2,1),nn.ReLU(),nn.Dropout2d(0.1),nn.Conv2d(64,128,3,2,1),nn.ReLU(),nn.Dropout2d(0.1));self.pool=nn.AdaptiveAvgPool2d((8,8));self.proj=nn.Linear(128*64,256);self.attn=nn.MultiheadAttention(256,4,batch_first=True);self.lstm=nn.LSTM(256,256,batch_first=True);self.brain=BrainInspired(256);self.pi=nn.Linear(256,3);self.v=nn.Linear(256,1)
+        super().__init__();self.seq=seq;self.frame_enc=nn.Sequential(nn.Conv2d(3,32,5,2,2),nn.ReLU(),nn.BatchNorm2d(32),nn.Conv2d(32,64,3,2,1),nn.ReLU(),nn.Dropout2d(0.1),nn.Conv2d(64,128,3,2,1),nn.ReLU(),nn.Dropout2d(0.1));self.pool=nn.AdaptiveAvgPool2d((4,4));self.proj=nn.Linear(128*16,256);self.temporal=nn.TransformerEncoder(nn.TransformerEncoderLayer(256,8,512,dropout=0.1,batch_first=True),num_layers=2);self.brain=BrainInspired(256,6);self.value_head=nn.Linear(256,1);self.policy_head=nn.Linear(256,3)
     def forward(self,x):
-        b,t,c,h,w=x.shape;z=self.enc(x.reshape(b,c*t,h,w));z=self.pool(z).flatten(1);z=self.proj(z);z=z.view(b,1,256).repeat(1,t,1);z,_=self.attn(z,z,z,need_weights=False);z,_=self.lstm(z);z=self.brain(z[:,-1]);p=self.pi(z);v=self.v(z).squeeze(-1);dx=torch.tanh(p[:,0]);dy=torch.tanh(p[:,1]);cl=torch.sigmoid(p[:,2]);return torch.stack([dx,dy,cl],1),v
+        b,t,c,h,w=x.shape;frames=x.reshape(b*t,c,h,w);feat=self.frame_enc(frames);feat=self.pool(feat).flatten(1);feat=self.proj(feat);feat=feat.view(b,t,256);temp=self.temporal(feat);context=temp;brain=self.brain(temp[:,-1],context);p=self.policy_head(brain);v=self.value_head(brain).squeeze(-1);dx=torch.tanh(p[:,0]);dy=torch.tanh(p[:,1]);cl=torch.sigmoid(p[:,2]);return torch.stack([dx,dy,cl],1),v
 def _download_file(url,path,timeout=45):
     try:
         with requests.get(url,timeout=timeout,stream=True) as r:
@@ -174,9 +219,138 @@ def _generate_resnet_local(path):
         except:
             pass
         return False
-class KnowledgeBase:
+def _generate_yolo_local(path):
+    try:
+        torch.save({"model":"yolov8n","weights":torch.randn(16,16)},path)
+        return True
+    except:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+        return False
+def _generate_clip_local(path):
+    try:
+        model,_,_=open_clip.create_model_and_transforms(clip_name,pretrained=clip_pretrained,cache_dir=models_dir,device=device if device=="cuda" else "cpu")
+        torch.save(model.state_dict(),path)
+        return True
+    except:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+        return False
+def _generate_sam_local(path):
+    try:
+        torch.save({"model":"sam_vit_b","weights":torch.randn(4,4)},path)
+        return True
+    except:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+        return False
+class VisualPerception:
     def __init__(self,seq):
-        self.seq=seq;self.lock=threading.Lock();self.buttons=[];self.max_buttons=128;self.goal_feat=None;self.goal_strength=0.15;self.prev_feat=None;self.dim=512;self.encoder=self._build_encoder();self.prev_regions={"score":None,"health":None,"message":None};self.state_model={};self.state_counts={};self.transition_counts={};self.last_state=None;self.event_stats={"score_up":0,"score_down":0,"health_up":0,"health_down":0,"victory":0,"defeat":0,"message":0};self.action_rules={k:{} for k in self.event_stats};self.event_values={"score_up":1.0,"score_down":-0.5,"health_up":0.6,"health_down":-1.2,"victory":6.0,"defeat":-6.0,"message":0.4};self.event_history=[];self.max_event_history=800
+        self.seq=seq;self.lock=threading.Lock();self.detector=None;self.clip_model=None;self.clip_preprocess=None;self.clip_tokenizer=None;self.sam=None;self.text_prompts=["button","score","health","message","target","danger","bonus"];self.temporal_feats=[];self.temporal_len=24
+        try:
+            if os.path.exists(yolo_path):
+                self.detector=YOLO(yolo_path)
+            else:
+                self.detector=YOLO("yolov8n.pt")
+        except:
+            self.detector=None
+        try:
+            model,preprocess,_=open_clip.create_model_and_transforms(clip_name,pretrained=clip_pretrained,cache_dir=models_dir,device=device if device=="cuda" else "cpu")
+            if os.path.exists(clip_path):
+                try:
+                    state=torch.load(clip_path,map_location=device)
+                    model.load_state_dict(state,strict=False)
+                except:
+                    pass
+            model.eval()
+            self.clip_model=model
+            self.clip_preprocess=preprocess
+            self.clip_tokenizer=open_clip.get_tokenizer(clip_name)
+        except:
+            self.clip_model=None;self.clip_preprocess=None;self.clip_tokenizer=None
+        try:
+            if os.path.exists(sam_path):
+                sam=sam_model_registry.get("vit_b")(checkpoint=sam_path)
+                sam.to(device if device=="cuda" else "cpu")
+                self.sam=SamPredictor(sam)
+        except:
+            self.sam=None
+    def analyze(self,frames):
+        with self.lock:
+            if not frames:
+                return {"detections":[],"segments":[],"clip":{},"temporal":np.zeros(512,dtype=np.float32)}
+            frame=frames[-1]
+            rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+            detections=[]
+            if self.detector is not None:
+                try:
+                    res=self.detector.predict(rgb,conf=0.2,verbose=False,stream=False)
+                    if res:
+                        r=res[0]
+                        if hasattr(r,"boxes") and r.boxes is not None:
+                            boxes=r.boxes.xyxy.detach().cpu().numpy()
+                            confs=r.boxes.conf.detach().cpu().numpy()
+                            cls=r.boxes.cls.detach().cpu().numpy()
+                            for i in range(min(len(boxes),12)):
+                                detections.append({"box":boxes[i].tolist(),"conf":float(confs[i]),"cls":int(cls[i])})
+                except:
+                    detections=[]
+            segments=[]
+            if self.sam is not None:
+                try:
+                    self.sam.set_image(rgb)
+                    h,w,_=rgb.shape
+                    pts=np.array([[w*0.25,h*0.25],[w*0.75,h*0.25],[w*0.5,h*0.75]],dtype=np.float32)
+                    labels=np.ones(len(pts))
+                    masks,_=self.sam.predict(point_coords=pts,point_labels=labels,multimask_output=True)
+                    for m in masks[:3]:
+                        segments.append(m.astype(np.uint8))
+                except:
+                    segments=[]
+            clip_scores={}
+            if self.clip_model is not None and self.clip_preprocess is not None:
+                try:
+                    image=self.clip_preprocess(Image.fromarray(rgb)).unsqueeze(0)
+                    image=image.to(device if device=="cuda" else "cpu")
+                    text=open_clip.tokenize(self.text_prompts).to(device if device=="cuda" else "cpu")
+                    with torch.no_grad():
+                        img_feat=self.clip_model.encode_image(image)
+                        txt_feat=self.clip_model.encode_text(text)
+                    img_feat=img_feat/img_feat.norm(dim=-1,keepdim=True)
+                    txt_feat=txt_feat/txt_feat.norm(dim=-1,keepdim=True)
+                    sims=(img_feat@txt_feat.T).detach().cpu().numpy()[0]
+                    for i,prompt in enumerate(self.text_prompts):
+                        clip_scores[prompt]=float(sims[i])
+                    self.temporal_feats.append(img_feat.detach().cpu().numpy()[0])
+                    if len(self.temporal_feats)>self.temporal_len:
+                        self.temporal_feats.pop(0)
+                except:
+                    clip_scores={}
+            temp_vec=np.mean(self.temporal_feats,0) if self.temporal_feats else np.zeros(512,dtype=np.float32)
+            return {"detections":detections,"segments":segments,"clip":clip_scores,"temporal":temp_vec}
+class GraphReasoner(nn.Module):
+    def __init__(self,dim=64,steps=3):
+        super().__init__();self.dim=dim;self.steps=steps;self.fc=nn.Linear(6,dim);self.msg=nn.Linear(dim,dim);self.out=nn.Linear(dim,1)
+    def forward(self,states,adj):
+        x=self.fc(states)
+        for _ in range(self.steps):
+            agg=torch.matmul(adj,x)
+            deg=torch.clamp(adj.sum(-1,keepdim=True),min=1e-6)
+            agg=agg/deg
+            x=torch.relu(self.msg(agg+x))
+        return torch.sigmoid(self.out(x)).squeeze(-1)
+class KnowledgeBase:
+    def __init__(self,seq,perception):
+        self.seq=seq;self.perception=perception;self.lock=threading.Lock();self.buttons=[];self.max_buttons=128;self.goal_feat=None;self.goal_strength=0.15;self.prev_feat=None;self.dim=512;self.encoder=self._build_encoder();self.prev_regions={"score":None,"health":None,"message":None};self.state_model={};self.state_counts={};self.transition_counts={};self.last_state=None;self.event_stats={"score_up":0,"score_down":0,"health_up":0,"health_down":0,"victory":0,"defeat":0,"message":0,"target":0};self.action_rules={k:{} for k in self.event_stats};self.event_values={"score_up":1.0,"score_down":-0.5,"health_up":0.6,"health_down":-1.2,"victory":6.0,"defeat":-6.0,"message":0.4,"target":1.5};self.event_history=[];self.max_event_history=800;self.graph=nx.DiGraph();self.graph_counts={};self.graph_reasoner=GraphReasoner();self.percept_temporal=np.zeros(512,dtype=np.float32);self.last_percepts=None
     def _build_encoder(self):
         try:
             enc=models.resnet18()
@@ -246,19 +420,39 @@ class KnowledgeBase:
         if n==0:
             return 0.0
         return float(np.linalg.norm(a[:n]-b[:n])/np.sqrt(n))
-    def _extract_regions(self,frame,rect):
-        reg={}
-        for name,center,size in [("score",(0.2,0.08),(0.4,0.2)),("health",(0.2,0.9),(0.45,0.2)),("message",(0.5,0.5),(0.6,0.35))]:
+    def _extract_regions(self,frame,rect,percepts):
+        reg={};h,w=frame.shape[:2];boxes=[];confs=[]
+        if percepts and percepts.get("detections"):
+            for det in percepts["detections"]:
+                box=det.get("box")
+                if not box or len(box)<4:
+                    continue
+                x1=float(_clamp(box[0],0.0,w-1));y1=float(_clamp(box[1],0.0,h-1));x2=float(_clamp(box[2],x1+1,w));y2=float(_clamp(box[3],y1+1,h))
+                boxes.append((x1,y1,x2,y2));confs.append(float(det.get("conf",0.0)))
+        base=[("score",(0.2,0.08),(0.4,0.2)),("health",(0.2,0.9),(0.45,0.2)),("message",(0.5,0.5),(0.6,0.35))]
+        segments=percepts.get("segments") if percepts else []
+        clip_scores=percepts.get("clip") if percepts else {}
+        for idx,(name,center,size) in enumerate(base):
+            bias=float(clip_scores.get(name,0.0)) if clip_scores else 0.0
+            bias=(bias+1.0)*0.5
+            if boxes:
+                order=np.argsort(np.array(confs))[::-1]
+                pick=order[int(_clamp(int(round(bias*(len(order)-1))),0,len(order)-1))]
+                bx=boxes[pick];cx=((bx[0]+bx[2])*0.5)/max(w,1);cy=((bx[1]+bx[3])*0.5)/max(h,1);bw=max(size[0],(bx[2]-bx[0])/max(w,1));bh=max(size[1],(bx[3]-bx[1])/max(h,1))
+                center=(center[0]*(1.0-bias)+cx*bias,center[1]*(1.0-bias)+cy*bias);size=(float(_clamp(bw,0.05,1.0)),float(_clamp(bh,0.05,1.0)))
             patch=self._region(frame,rect,center,size)
             if patch is None:
-                reg[name]={"sig":None,"mean":0.0,"edges":0.0,"contrast":0.0}
+                reg[name]={"sig":None,"mean":0.0,"edges":0.0,"contrast":0.0,"segment":0.0,"clip":bias}
             else:
-                sig=self._signature(patch)
-                arr=patch.astype(np.float32)/255.0
-                mean=float(np.mean(arr))
-                edges=float(np.mean(cv2.Canny(cv2.cvtColor(patch,cv2.COLOR_BGR2GRAY),32,128))/255.0)
-                contrast=float(np.std(arr))
-                reg[name]={"sig":sig,"mean":mean,"edges":edges,"contrast":contrast}
+                sig=self._signature(patch);arr=patch.astype(np.float32)/255.0;mean=float(np.mean(arr));edges=float(np.mean(cv2.Canny(cv2.cvtColor(patch,cv2.COLOR_BGR2GRAY),32,128))/255.0);contrast=float(np.std(arr));coverage=0.0
+                if segments:
+                    for seg in segments:
+                        try:
+                            mask=cv2.resize(seg.astype(np.float32),(patch.shape[1],patch.shape[0]),interpolation=cv2.INTER_NEAREST)
+                            coverage=max(coverage,float(np.mean(mask>0.5)))
+                        except:
+                            continue
+                reg[name]={"sig":sig,"mean":mean,"edges":edges,"contrast":contrast,"segment":coverage,"clip":bias}
         return reg
     def _button_similarity(self,feat):
         if feat is None or not self.buttons:
@@ -283,13 +477,18 @@ class KnowledgeBase:
         score_lvl=self._bucket(regions["score"]["mean"],8)
         health_lvl=self._bucket(regions["health"]["mean"],8)
         msg_lvl=1 if regions["message"]["edges"]>0.25 else 0
-        contrast_lvl=1 if regions["message"]["contrast"]>0.2 else 0
+        segment_lvl=self._bucket(regions["message"].get("segment",0.0),6)
+        clip_lvl=self._bucket(regions["message"].get("clip",0.0),6)
         align=float(_clamp((self._goal_alignment(frame_feat)+1.0)*0.5,0.0,1.0))
         align_lvl=self._bucket(align,6)
-        return (score_lvl,health_lvl,msg_lvl,contrast_lvl,align_lvl)
+        return (score_lvl,health_lvl,msg_lvl,segment_lvl,clip_lvl,align_lvl)
     def _register_transition(self,prev_state,state):
         key=(prev_state,state)
         self.transition_counts[key]=self.transition_counts.get(key,0)+1
+        self.graph_counts[state]=self.graph_counts.get(state,0)+1
+        self.graph.add_node(prev_state);self.graph.add_node(state)
+        w=self.graph.get_edge_data(prev_state,state,{}).get("weight",0.0)+1.0
+        self.graph.add_edge(prev_state,state,weight=w)
     def _action_key(self,action):
         if action is None:
             return "none"
@@ -342,9 +541,17 @@ class KnowledgeBase:
                 patch=self._crop(frame,rect,pos)
                 if patch is not None:
                     feat_patch=self._encode(patch)
+            percep=self.perception.analyze(frames) if self.perception else {"detections":[],"segments":[],"clip":{},"temporal":np.zeros(512,dtype=np.float32)}
+            self.last_percepts=percep
+            temp_vec=np.asarray(percep.get("temporal",np.zeros(512,dtype=np.float32)),dtype=np.float32).reshape(-1)
+            if temp_vec.size<512:
+                temp_vec=np.pad(temp_vec,(0,512-temp_vec.size))
+            elif temp_vec.size>512:
+                temp_vec=temp_vec[:512]
+            self.percept_temporal=self.percept_temporal*0.8+temp_vec*0.2
             rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
             frame_feat=self._encode(rgb)
-            regions=self._extract_regions(frame,rect)
+            regions=self._extract_regions(frame,rect,percep)
             state=self._make_state(frame_feat,regions)
             if self.goal_feat is None:
                 self.goal_feat=frame_feat.copy()
@@ -352,11 +559,20 @@ class KnowledgeBase:
                 mix=0.2 if source==1 else 0.08;self.goal_feat=self.goal_feat*(1-mix)+frame_feat*mix;self.goal_strength=float(_clamp(self.goal_strength+(0.04 if source==1 else -0.015),0.05,1.0))
             if feat_patch is not None and action[2]>0.5 and source==1:
                 self._store_button(feat_patch,pos)
+            elif percep.get("detections") and source==1:
+                best=max(percep["detections"],key=lambda d:d.get("conf",0.0))
+                box=best.get("box")
+                if box and len(box)>=4:
+                    h,w=frame.shape[:2];cx=float(_clamp(((box[0]+box[2])*0.5)/max(w,1),0.0,1.0));cy=float(_clamp(((box[1]+box[3])*0.5)/max(h,1),0.0,1.0))
+                    sub=frame[int(max(0,box[1])):int(min(h,box[3])),int(max(0,box[0])):int(min(w,box[2]))]
+                    if sub.size>0:
+                        feat=self._encode(cv2.cvtColor(sub,cv2.COLOR_BGR2RGB))
+                        self._store_button(feat,(cx,cy))
             events=[]
             for key in ["score","health","message"]:
                 prev=self.prev_regions.get(key)
                 cur=regions[key]
-                if prev is None or prev["sig"] is None or cur["sig"] is None:
+                if prev is None or prev.get("sig") is None or cur.get("sig") is None:
                     continue
                 delta=self._signature_delta(prev["sig"],cur["sig"])
                 if key=="score" and delta>0.12:
@@ -378,15 +594,22 @@ class KnowledgeBase:
                         events.append(("defeat",prev["edges"]))
                     elif delta>0.18:
                         events.append(("message",delta))
+            clip_map=percep.get("clip",{}) if percep else {}
+            if clip_map.get("target",0.0)>0.35:
+                events.append(("target",clip_map["target"]))
+            if clip_map.get("danger",0.0)>0.4:
+                reward-=clip_map["danger"]*0.2
             for name,cur in regions.items():
-                self.prev_regions[name]={"sig":cur["sig"],"mean":cur["mean"],"edges":cur["edges"],"contrast":cur["contrast"]}
+                self.prev_regions[name]=cur
             if len(frames)>1:
                 diff=float(np.mean(np.abs(frames[-1].astype(np.float32)-frames[0].astype(np.float32)))/255.0);reward+=diff
             if feat_patch is not None:
-                reward+=max(0.0,self._button_similarity(feat_patch)-0.5)
+                reward+=max(0.0,self._button_similarity(feat_patch)-0.4)
             reward+=max(0.0,self.goal_strength*self._goal_alignment(frame_feat))
             if self.prev_feat is not None:
                 drift=self._norm(frame_feat-self.prev_feat);reward+=max(0.0,drift*0.01)
+            if percep.get("detections"):
+                reward+=0.01*len(percep["detections"])
             action_key=self._action_key(action)
             if self.last_state is not None:
                 self._register_transition(self.last_state,state)
@@ -399,7 +622,28 @@ class KnowledgeBase:
                     self.goal_strength=float(_clamp(self.goal_strength+0.1,0.05,1.0))
                 if ev=="defeat":
                     self.goal_strength=float(_clamp(self.goal_strength-0.1,0.05,1.0))
-            reward+=self.state_model.get(state,0.0)*0.05
+            baseline=self.state_model.get(state,0.0)
+            reward+=baseline*0.05
+            if self.graph.number_of_nodes()>0:
+                nodes=list(self.graph.nodes())
+                feats=[]
+                for st in nodes:
+                    feats.append(np.array(st,dtype=np.float32))
+                feats=np.stack(feats,0) if feats else np.zeros((1,6),dtype=np.float32)
+                adj=np.zeros((len(nodes),len(nodes)),dtype=np.float32)
+                idx_map={st:i for i,st in enumerate(nodes)}
+                for u,v,data in self.graph.edges(data=True):
+                    if u in idx_map and v in idx_map:
+                        adj[idx_map[u],idx_map[v]]=float(data.get("weight",1.0))
+                with torch.no_grad():
+                    g=self.graph_reasoner(torch.from_numpy(feats),torch.from_numpy(adj))
+                graph_score={nodes[i]:float(g[i]) for i in range(len(nodes))}
+                reward+=graph_score.get(state,0.0)*0.1
+                self.state_model[state]=self.state_model.get(state,0.0)*0.9+graph_score.get(state,0.0)*0.1
+            else:
+                self.state_model[state]=self.state_model.get(state,0.0)*0.95
+            temporal_bonus=float(np.mean(self.percept_temporal[:128]))
+            reward+=temporal_bonus*0.05
             self.prev_feat=frame_feat
         return reward
     def suggest(self,frame,rect):
@@ -407,6 +651,7 @@ class KnowledgeBase:
             if frame is None:
                 return None
             best=-1.0;pos=None
+            percep=self.last_percepts
             if self.buttons:
                 for btn in self.buttons:
                     patch=self._crop(frame,rect,btn["pos"])
@@ -415,6 +660,11 @@ class KnowledgeBase:
                     feat=self._encode(patch);sim=self._button_similarity(feat)
                     if sim>best:
                         best=sim;pos=btn["pos"]
+            if (pos is None or best<0.5) and percep and percep.get("detections"):
+                det=max(percep["detections"],key=lambda d:d.get("conf",0.0))
+                box=det.get("box")
+                if box and len(box)>=4:
+                    h,w=frame.shape[:2];cx=float(_clamp(((box[0]+box[2])*0.5)/max(w,1),0.0,1.0));cy=float(_clamp(((box[1]+box[3])*0.5)/max(h,1),0.0,1.0));pos=(cx,cy);best=max(best,float(det.get("conf",0.0)))
             rule=self._rule_action_hint(self.last_state) if self.last_state is not None else None
             if rule is not None and (pos is None or best<0.65):
                 return rule
@@ -427,11 +677,13 @@ class KnowledgeBase:
                 return 0.0
             rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
             feat=self._encode(rgb)
-            regions=self._extract_regions(frame,None)
+            percep=self.last_percepts if self.last_percepts else {"detections":[],"segments":[],"clip":{},"temporal":self.percept_temporal}
+            regions=self._extract_regions(frame,None,percep)
             state=self._make_state(feat,regions)
             state_value=self.state_model.get(state,0.0)
             align=max(0.0,self._goal_alignment(feat))
-            return float(state_value*0.6+align*0.4)
+            tempo=float(np.mean(self.percept_temporal[:128]))
+            return float(state_value*0.5+align*0.3+tempo*0.2)
 def _to_tensor(frames):
     x=torch.from_numpy(frames.astype(np.float32)/255.0);x=x.permute(0,1,4,2,3).contiguous();return x
 class Agent:
@@ -524,6 +776,7 @@ class App:
         self.lbl_fw=tk.Label(self.root,text="FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.");self.lbl_fw.pack(pady=4)
         self.img_ref=None;self.selected=None;self.selected_title="";self.rect=None;self.visible=False;self.complete=False;self.stop_all=False;self.mode="idle";self.optimizing=False;self.ai_acting=False;self.last_user_time=_now();self.last_any_time=_now();self.inactive_seconds=10.0;self.frame_seq=[];self.frame_seq_raw=[];self.seq=4;self.exp=Replay(30000,self.seq);self.capture_hz=30;self.last_user_action=[0.0,0.0,0.0];self.last_user_norm=[0.5,0.5];self.action_ema=[0.0,0.0,0.0];self.action_lock=threading.Lock();self.control_lock=threading.Lock();self.train_control={"batch":32,"delay":0.05,"paused":False,"loops":80};self.ai_interval=0.06;self.progress_val=0.0;self.cpu=0.0;self.mem=0.0;self.gpu=0.0;self.vram=0.0;self.exp_writer=ExperienceWriter(exp_dir)
         self.ensure_models()
+        self.perception=VisualPerception(self.seq)
         self.agent=Agent(self.seq,1e-3)
         if not os.path.exists(model_path):
             _generate_local_model(model_path,self.seq)
@@ -535,11 +788,11 @@ class App:
                 self.agent.net.load_state_dict(torch.load(model_path,map_location=device))
             except:
                 pass
-        self.knowledge=KnowledgeBase(self.seq)
+        self.knowledge=KnowledgeBase(self.seq,self.perception)
         self.refresh_windows();threading.Thread(target=self.resource_loop,daemon=True).start();threading.Thread(target=self.capture_loop,daemon=True).start()
         self.k_listener=keyboard.Listener(on_press=self.on_key_press);self.k_listener.start();self.m_listener=mouse.Listener(on_move=self.on_mouse,on_click=self.on_mouse,on_scroll=self.on_mouse);self.m_listener.start();self.root.bind("<Escape>",lambda e:self.quit());self.ui_tick()
     def ensure_models(self):
-        specs=[{"name":"resnet18.pth","path":pre_path,"url":pre_url,"desc":"视觉特征模型","local":lambda:_generate_resnet_local(pre_path)},{"name":"model.pt","path":model_path,"url":policy_url,"desc":"策略模型","local":lambda:_generate_local_model(model_path,self.seq)}]
+        specs=[{"name":"resnet18.pth","path":pre_path,"url":pre_url,"desc":"视觉特征模型","local":lambda:_generate_resnet_local(pre_path)},{"name":"model.pt","path":model_path,"url":policy_url,"desc":"策略模型","local":lambda:_generate_local_model(model_path,self.seq)},{"name":"yolov8n.pt","path":yolo_path,"url":yolo_url,"desc":"检测模型","local":lambda:_generate_yolo_local(yolo_path)},{"name":"clip_vitb32.pt","path":clip_path,"url":"","desc":"多模态模型","local":lambda:_generate_clip_local(clip_path)},{"name":"sam_vit_b.pth","path":sam_path,"url":sam_url,"desc":"分割模型","local":lambda:_generate_sam_local(sam_path)}]
         for spec in specs:
             if os.path.exists(spec["path"]):
                 continue
