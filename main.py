@@ -4,15 +4,18 @@ def _pip(x,base_dir):
     names=[x,_pkg_modules.get(x,x.replace("-","_"))]
     for name in names:
         try:
-            importlib.import_module(name)
-            return
+            if importlib.util.find_spec(name) is not None:
+                return
         except:
-            continue
-    cmds=[[sys.executable,"-m","pip","install","--upgrade","--no-input","--timeout","30","--target",base_dir,x]]
+            try:
+                importlib.import_module(name);return
+            except:
+                continue
+    cmds=[[sys.executable,"-m","pip","install","--no-input","--timeout","30",x]]
     if os.name=="nt":
-        cmds.append([sys.executable,"-m","pip","install","--upgrade","--no-input","--timeout","30","--user",x])
+        cmds.append([sys.executable,"-m","pip","install","--no-input","--timeout","30","--user",x])
     else:
-        cmds.append([sys.executable,"-m","pip","install","--upgrade","--no-input","--timeout","30",x])
+        cmds.append([sys.executable,"-m","pip","install","--no-input","--timeout","30","--user",x])
     for cmd in cmds:
         try:
             subprocess.check_call(cmd)
@@ -23,10 +26,6 @@ def _pip(x,base_dir):
                     continue
         except:
             continue
-    try:
-        subprocess.check_call([sys.executable,"-m","pip","download","-d",base_dir,"--no-input","--timeout","30",x])
-    except:
-        pass
 home=os.path.expanduser("~");desk=os.path.join(home,"Desktop");base_dir=os.path.join(desk,"GameAI");models_dir=os.path.join(base_dir,"models");os.makedirs(base_dir,exist_ok=True);os.makedirs(models_dir,exist_ok=True);site.addsitedir(base_dir);sys.path.insert(0,base_dir) if base_dir not in sys.path else None
 for p in ["psutil","pillow","numpy","opencv-python","mss","pynput","pyautogui","torch","torchvision","GPUtil","pynvml","pygetwindow","screeninfo","requests","ultralytics","open-clip-torch","segment-anything","networkx"]:
     _pip(p,base_dir)
