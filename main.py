@@ -1,4 +1,4 @@
-import sys,subprocess,importlib,os,threading,time,random,contextlib,json,ctypes
+import sys,subprocess,importlib,os,threading,time,random,contextlib,json,ctypes,math
 def _pip(x,base_dir):
     try:
         importlib.import_module(x)
@@ -76,26 +76,26 @@ def _now():
     return time.time()
 class Replay:
     def __init__(self,cap=50000,seq=4):
-        self.cap=cap;self.seq=seq;self.buf=[];self.src=[];self.rewards=[]
-    def push(self,frame,act,source,reward=0.0):
+        self.cap=cap;self.seq=seq;self.buf=[];self.src=[];self.rewards=[];self.logp=[]
+    def push(self,frame,act,source,reward=0.0,logp=0.0):
         if len(self.buf)>=self.cap:
-            self.buf.pop(0);self.src.pop(0);self.rewards.pop(0)
-        self.buf.append((frame,act,_now()));self.src.append(int(source));self.rewards.append(float(reward))
+            self.buf.pop(0);self.src.pop(0);self.rewards.pop(0);self.logp.pop(0)
+        self.buf.append((frame,act,_now()));self.src.append(int(source));self.rewards.append(float(reward));self.logp.append(float(logp))
     def can_sample(self,batch):
         return len(self.buf)>self.seq+batch
     def sample(self,batch):
         idx=[];mx=len(self.buf)-self.seq-1
         for _ in range(batch):
             idx.append(random.randint(0,mx))
-        seqs=[];acts=[];rewards=[];masks=[];sources=[]
+        seqs=[];acts=[];rewards=[];masks=[];sources=[];logps=[]
         for k in idx:
             fr=[self.buf[k+i][0] for i in range(self.seq)]
             ac=self.buf[k+self.seq-1][1]
             pre=self.buf[k+self.seq-2][0];post=self.buf[k+self.seq-1][0]
             pre=cv2.Canny(pre,32,128);post=cv2.Canny(post,32,128)
             r=float(np.mean(np.abs(post.astype(np.float32)-pre.astype(np.float32)))/255.0)+self.rewards[k+self.seq-1]
-            seqs.append(np.stack(fr,0));acts.append(np.array(ac,dtype=np.float32));rewards.append(r);masks.append(1.0);sources.append(self.src[k+self.seq-1])
-        return np.stack(seqs,0),np.stack(acts,0),np.array(rewards,dtype=np.float32),np.array(masks,dtype=np.float32),np.array(sources,dtype=np.float32)
+            seqs.append(np.stack(fr,0));acts.append(np.array(ac,dtype=np.float32));rewards.append(r);masks.append(1.0);sources.append(self.src[k+self.seq-1]);logps.append(self.logp[k+self.seq-1])
+        return np.stack(seqs,0),np.stack(acts,0),np.array(rewards,dtype=np.float32),np.array(masks,dtype=np.float32),np.array(sources,dtype=np.float32),np.array(logps,dtype=np.float32)
 class ExperienceWriter:
     def __init__(self,path):
         self.path=path;self.learn_dir=os.path.join(path,"learn");self.train_dir=os.path.join(path,"train");self.meta=os.path.join(path,"log.jsonl");os.makedirs(self.learn_dir,exist_ok=True);os.makedirs(self.train_dir,exist_ok=True);self.lock=threading.Lock()
@@ -436,14 +436,37 @@ def _to_tensor(frames):
     x=torch.from_numpy(frames.astype(np.float32)/255.0);x=x.permute(0,1,4,2,3).contiguous();return x
 class Agent:
     def __init__(self,seq=4,lr=1e-3):
-        self.seq=seq;self.net=Net(seq).to(device);self.opt=optim.AdamW(self.net.parameters(),lr=lr,weight_decay=1e-4);self.sched=optim.lr_scheduler.ReduceLROnPlateau(self.opt,patience=2,factor=0.5);self.amp=device=="cuda";self.last_losses=(0,0,0)
-    def act(self,frames):
+        self.seq=seq;self.net=Net(seq).to(device);base=torch.zeros(3);
+        if device=="cuda":
+            base=base.to(device)
+        self.log_std=nn.Parameter(base);self.opt=optim.AdamW(list(self.net.parameters())+[self.log_std],lr=lr,weight_decay=1e-4);self.sched=optim.lr_scheduler.ReduceLROnPlateau(self.opt,patience=2,factor=0.5);self.amp=device=="cuda";self.clip_eps=0.2;self.last_losses=(0,0,0,0)
+    def _std(self):
+        return torch.clamp(self.log_std.exp(),0.05,1.5)
+    def _log_prob(self,mean,std,action):
+        var=std**2
+        return -0.5*(((action-mean)**2)/var+2*torch.log(std)+math.log(2*math.pi)).sum(1)
+    def _entropy(self,std):
+        return 0.5*torch.sum(1.0+2.0*torch.log(std)+math.log(2*math.pi),1)
+    def act(self,frames,deterministic=False):
         self.net.eval();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
         with ctx:
-            x=_to_tensor(frames[None]).to(device);a,_=self.net(x);a=a[0].detach().cpu().numpy()
-        return a
+            x=_to_tensor(frames[None]).to(device);mean,value=self.net(x)
+        std=self._std().to(device).unsqueeze(0).expand_as(mean)
+        if deterministic:
+            action=mean
+        else:
+            noise=torch.randn_like(mean);action=mean+noise*std
+        action[:,0:2]=action[:,0:2].clamp(-1.0,1.0);action[:,2]=action[:,2].clamp(0.0,1.0)
+        logp=self._log_prob(mean,std,action)
+        return action[0].detach().cpu().numpy(),float(logp.detach().cpu().numpy()[0]),float(value.detach().cpu().numpy()[0])
+    def evaluate_action(self,frames,action):
+        self.net.eval();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext();act_arr=np.array(action,dtype=np.float32)
+        with ctx:
+            x=_to_tensor(frames[None]).to(device);mean,value=self.net(x)
+        std=self._std().to(device).unsqueeze(0).expand_as(mean);act_t=torch.from_numpy(act_arr).to(device).unsqueeze(0);act_t[:,0:2]=act_t[:,0:2].clamp(-1.0,1.0);act_t[:,2]=act_t[:,2].clamp(0.0,1.0);logp=self._log_prob(mean,std,act_t)
+        return float(logp.detach().cpu().numpy()[0]),float(value.detach().cpu().numpy()[0])
     def train_step(self,replay,batches=50,batch=32,stop_flag=None,progress_sink=None,control=None):
-        total=batches;done=0;policy_loss=0;value_loss=0;reg_loss=0
+        total=batches;done=0;pi_sum=0.0;val_sum=0.0;reg_sum=0.0;ent_sum=0.0
         while done<total:
             if stop_flag and stop_flag.is_set():
                 break
@@ -457,20 +480,22 @@ class Agent:
                 cur_batch=batch;cur_delay=0.0
             if not replay.can_sample(cur_batch):
                 time.sleep(0.05);continue
-            s,a,r,m,src=replay.sample(cur_batch);x=_to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device);src_w=torch.from_numpy(1.0+src*0.5).to(device);self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
+            s,a,r,m,src,lp=replay.sample(cur_batch);x=_to_tensor(s).to(device);t=torch.from_numpy(a).to(device);rew=torch.from_numpy(r).to(device);mask=torch.from_numpy(m).to(device);src_w=torch.from_numpy(1.0+src*0.5).to(device);old_lp=torch.from_numpy(lp).to(device);self.net.train();ctx=torch.amp.autocast("cuda") if self.amp else contextlib.nullcontext()
             with ctx:
-                pi,v=self.net(x);diff=F.smooth_l1_loss(pi,t,reduction="none").sum(1);bcl=torch.mean(diff*src_w);adv=(rew-v.detach());pl=-torch.mean(-0.5*((pi-t)**2).sum(1)*adv*src_w);vl=torch.mean(((v-rew)**2)*src_w);hl=self.net.brain.hebbian_loss(1e-3);loss=bcl+pl+0.5*vl+hl
+                mean,v=self.net(x);std=self._std().to(device).unsqueeze(0).expand_as(mean);new_lp=self._log_prob(mean,std,t);adv=rew-v.detach();adv=(adv-adv.mean())/torch.clamp(adv.std(),min=1e-5);ratio=torch.exp(new_lp-old_lp);clip_ratio=torch.clamp(ratio,1.0-self.clip_eps,1.0+self.clip_eps);surr1=ratio*adv;surr2=clip_ratio*adv;pi_loss=-torch.mean(torch.min(surr1,surr2)*src_w*mask);v_loss=torch.mean(((rew-v)**2)*src_w*mask);bc_loss=torch.mean(((t-mean)**2).sum(1)*src_w*mask);ent=self._entropy(std).mean();hl=self.net.brain.hebbian_loss(1e-3);loss=pi_loss+0.5*v_loss+0.2*bc_loss+hl-0.01*ent
             self.opt.zero_grad()
+            params=list(self.net.parameters())+[self.log_std]
             if scaler:
-                scaler.scale(loss).backward();scaler.unscale_(self.opt);torch.nn.utils.clip_grad_norm_(self.net.parameters(),1.0);scaler.step(self.opt);scaler.update()
+                scaler.scale(loss).backward();scaler.unscale_(self.opt);torch.nn.utils.clip_grad_norm_(params,1.0);scaler.step(self.opt);scaler.update()
             else:
-                loss.backward();torch.nn.utils.clip_grad_norm_(self.net.parameters(),1.0);self.opt.step()
-            self.sched.step((bcl+vl).item());policy_loss+=pl.item();value_loss+=vl.item();reg_loss+=hl.item();done+=1
+                loss.backward();torch.nn.utils.clip_grad_norm_(params,1.0);self.opt.step()
+            self.sched.step((v_loss+bc_loss).item());pi_sum+=pi_loss.item();val_sum+=v_loss.item();reg_sum+=hl.item();ent_sum+=ent.item();done+=1
             if progress_sink:
                 progress_sink(int(done*100/max(total,1)))
             if cur_delay>0:
                 time.sleep(cur_delay)
-        self.last_losses=(policy_loss/max(done,1),value_loss/max(done,1),reg_loss/max(done,1))
+        if done>0:
+            self.last_losses=(pi_sum/done,val_sum/done,reg_sum/done,ent_sum/done)
         try:
             torch.save(self.net.state_dict(),model_path)
         except:
@@ -687,10 +712,11 @@ class App:
                             self.frame_seq.pop(0);self.frame_seq_raw.pop(0)
                         self.frame_seq_raw.append(img.copy());self.frame_seq.append(cv2.resize(img,(160,120)))
                         if len(self.frame_seq)==self.seq:
+                            frames_stack=np.stack(self.frame_seq,0)
                             if self.mode=="learn":
-                                act=self.read_user_action();pos=self.get_user_norm();reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,1);self.exp.push(self.frame_seq[-1],act,1,reward);self.exp_writer.record(self.frame_seq_raw[-1] if self.frame_seq_raw else None,act,pos,1,self.rect,self.selected_title,"learn")
+                                act=self.read_user_action();pos=self.get_user_norm();logp,_=self.agent.evaluate_action(frames_stack,act);reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,1);self.exp.push(self.frame_seq[-1],act,1,reward,logp=logp);self.exp_writer.record(self.frame_seq_raw[-1] if self.frame_seq_raw else None,act,pos,1,self.rect,self.selected_title,"learn")
                             elif self.mode=="train":
-                                act=self.ai_action_and_apply();pos=self.action_to_norm(act);reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,0);self.exp.push(self.frame_seq[-1],act,0,reward);self.exp_writer.record(self.frame_seq_raw[-1] if self.frame_seq_raw else None,act,pos,0,self.rect,self.selected_title,"train")
+                                act,logp=self.ai_action_and_apply();pos=self.action_to_norm(act);reward=self.knowledge.update(self.frame_seq_raw,self.rect,act,pos,0);self.exp.push(self.frame_seq[-1],act,0,reward,logp=logp);self.exp_writer.record(self.frame_seq_raw[-1] if self.frame_seq_raw else None,act,pos,0,self.rect,self.selected_title,"train")
                     if not self.optimizing and self.mode=="learn" and (_now()-self.last_any_time)>self.inactive_seconds and (self.visible and self.complete):
                         self.mode="train";self.start_ai_thread()
                 except:
@@ -707,23 +733,24 @@ class App:
             return [0.0,0.0,0.0]
     def ai_action_and_apply(self):
         if len(self.frame_seq)<self.seq:
-            return [0.0,0.0,0.0]
-        a=self.agent.act(np.stack(self.frame_seq,0))
+            return [0.0,0.0,0.0],0.0
+        frames=np.stack(self.frame_seq,0)
+        act,_,_=self.agent.act(frames)
+        a=np.array(act,dtype=np.float32)
         try:
             suggest=self.knowledge.suggest(self.frame_seq_raw[-1] if self.frame_seq_raw else None,self.rect)
         except:
             suggest=None
-        if suggest:
+        if suggest is not None:
             a=0.6*a+0.4*np.array(suggest,dtype=np.float32)
         if self.frame_seq_raw:
             try:
                 goal_boost=self.knowledge.goal_score(self.frame_seq_raw[-1]);a[2]=float(_clamp(a[2]+goal_boost*0.2,0.0,1.0))
             except:
                 pass
-        if self.mode!="train":
-            return a.tolist()
-        if not (self.visible and self.complete):
-            return a.tolist()
+        logp_val,_=self.agent.evaluate_action(frames,a.tolist())
+        if self.mode!="train" or not (self.visible and self.complete):
+            return a.tolist(),logp_val
         x1,y1,x2,y2=self.rect;cx=(x1+x2)//2;cy=(y1+y2)//2;dx=int(a[0]*20);dy=int(a[1]*20);px=cx+dx;py=cy+dy
         try:
             pyautogui.moveTo(px,py,duration=0.01)
@@ -731,7 +758,7 @@ class App:
                 pyautogui.click()
         except:
             pass
-        return a.tolist()
+        return a.tolist(),logp_val
     def start_ai_thread(self):
         if getattr(self,"ai_acting",False):
             return
