@@ -722,8 +722,8 @@ class App:
         self.ai_interval=0.05
         self.selected_title=tk.StringVar()
         self.window_state=tk.StringVar(value="No window")
-        self.visible_var=tk.StringVar(value="可见: Unknown")
-        self.full_var=tk.StringVar(value="完整: Unknown")
+        self.visible_var=tk.StringVar(value='可见: 未检测')
+        self.full_var=tk.StringVar(value='完整: 未检测')
         self.pause_var=tk.StringVar(value="未选择窗口，功能锁定")
         self.mode_var=tk.StringVar(value="Init")
         self.cpu_var=tk.StringVar(value="CPU:0.0%")
@@ -737,8 +737,12 @@ class App:
         self.last_user_input=time.time()
         self.window_obj=None
         self.window_rect=None
+        self.window_hwnd=None
         self.window_visible=False
         self.window_full=False
+        self.window_occ_state=0
+        self.window_visible_reason='未知'
+        self.window_full_reason='未知'
         self.last_occl_check=0.0
         self.status_lock=threading.Lock()
         self.monitor_bounds=[(m.x,m.y,m.width,m.height) for m in get_monitors()]
@@ -834,6 +838,8 @@ class App:
         windows=[w for w in gw.getAllWindows() if w.title==title]
         if windows:
             self.window_obj=windows[0]
+            try:self.window_hwnd=int(self.window_obj._hWnd)
+            except Exception:self.window_hwnd=None
             self.window_state.set(f"Selected:{title}")
             self._update_window_status(force=True)
             self.buffer.clear()
@@ -859,20 +865,59 @@ class App:
         except Exception:
             pass
         return None
+    def _resolve_window_handle(self):
+        if self.window_obj is None:
+            return None
+        try:
+            self.window_obj.refresh()
+            return int(self.window_obj._hWnd)
+        except Exception:
+            pass
+        try:
+            title=getattr(self.window_obj,'title','') or self.selected_title.get()
+            if title:
+                windows=[w for w in gw.getAllWindows() if w.title==title]
+                if windows:
+                    self.window_obj=windows[0]
+                    self.window_obj.refresh()
+                    return int(self.window_obj._hWnd)
+        except Exception:
+            pass
+        return None
+    def _dwm_occlusion_state(self,hwnd):
+        if dwmapi is None or hwnd is None:
+            return 0
+        try:
+            DWMWA_OCCLUSION_STATE=18
+            state=ctypes.c_uint(0)
+            res=dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(int(hwnd)),ctypes.c_int(DWMWA_OCCLUSION_STATE),ctypes.byref(state),ctypes.sizeof(state))
+            if res==0:
+                return int(state.value)
+        except Exception:
+            pass
+        return 0
     def _pixel_occlusion_ratio(self,frame,hwnd,rect):
         try:
             if user32 is None:
                 self.last_occl_check=time.time()
                 return 0.0
+            hwnd_int=int(hwnd) if hwnd is not None else None
+            if hwnd_int is None:
+                self.last_occl_check=time.time()
+                return 1.0
+            occ_state=self._dwm_occlusion_state(hwnd_int)
+            if occ_state==1:
+                self.last_occl_check=time.time()
+                return 1.0
             left,top,right,bottom=rect;w=max(1,right-left);h=max(1,bottom-top);area=float(w*h)
-            overlaps=[];cur=user32.GetWindow(ctypes.wintypes.HWND(hwnd),ctypes.c_int(GW_HWNDPREV));seen=set()
+            overlaps=[];cur=user32.GetWindow(ctypes.wintypes.HWND(hwnd_int),ctypes.c_int(GW_HWNDPREV));seen=set()
             while cur:
                 h=int(cur)
                 if h in seen:
                     break
                 seen.add(h)
                 cur_hwnd=ctypes.wintypes.HWND(cur)
-                if user32.IsWindowVisible(cur_hwnd) and user32.IsIconic(cur_hwnd)==0:
+                if user32.IsWindow(cur_hwnd)!=0 and user32.IsWindowVisible(cur_hwnd) and user32.IsIconic(cur_hwnd)==0:
                     other=self._get_ext_frame_rect(h)
                     if other is not None:
                         inter=_rect_intersection(rect,other)
@@ -882,13 +927,15 @@ class App:
                 cur=user32.GetWindow(cur_hwnd,ctypes.c_int(GW_HWNDPREV))
             occ=float(_rect_union_area(overlaps));ratio=occ/area if area>0 else 1.0
             if frame is not None and ratio<=1.0:
-                capture=self._print_window(hwnd,w,h)
+                capture=self._print_window(hwnd_int,w,h)
                 if capture is not None:
                     if capture.shape[0]!=frame.shape[0] or capture.shape[1]!=frame.shape[1]:
                         sample=cv2.resize(frame,(capture.shape[1],capture.shape[0]))
                     else:
                         sample=frame
                     diff=cv2.absdiff(cv2.cvtColor(sample,cv2.COLOR_BGR2GRAY),cv2.cvtColor(capture,cv2.COLOR_BGR2GRAY));mask=(diff>18).astype(np.uint8);ratio=max(ratio,float(np.count_nonzero(mask))/mask.size)
+            if occ_state==2:
+                ratio=min(ratio,0.05)
             self.last_occl_check=time.time()
             return min(max(ratio,0.0),1.0)
         except Exception:
@@ -962,44 +1009,85 @@ class App:
         return covered/area if area>0 else 0.0
     def _check_window_visible(self,hwnd,rect):
         try:
-            if user32 is None:
-                return False
-            h=ctypes.wintypes.HWND(hwnd)
-            if user32.IsWindowVisible(h)==0 or user32.IsIconic(h)!=0:
-                return False
+            if user32 is None or hwnd is None:
+                return False,'系统不支持',0,0.0
+            h=ctypes.wintypes.HWND(int(hwnd))
+            if user32.IsWindow(h)==0:
+                return False,'窗口句柄无效',0,0.0
+            if user32.IsWindowVisible(h)==0:
+                return False,'窗口不可见',0,0.0
+            if user32.IsIconic(h)!=0:
+                return False,'窗口最小化',0,self._monitor_coverage(rect) if rect else 0.0
+            occ=self._dwm_occlusion_state(hwnd)
             if dwmapi is not None:
                 cloaked=ctypes.c_int(0)
                 try:
                     DWMWA_CLOAKED=14
                     dwmapi.DwmGetWindowAttribute(h,ctypes.c_int(DWMWA_CLOAKED),ctypes.byref(cloaked),ctypes.sizeof(cloaked))
                     if cloaked.value!=0:
-                        return False
+                        return False,'窗口被系统隐藏',occ,self._monitor_coverage(rect) if rect else 0.0
                 except Exception:
                     pass
-            return self._monitor_coverage(rect)>0.01
+            coverage=self._monitor_coverage(rect) if rect else 0.0
+            if coverage<=0.01:
+                return False,'窗口不在显示器范围',occ,coverage
+            if occ==1:
+                return False,'窗口被遮挡',occ,coverage
+            if occ==2:
+                return True,'完全可见',occ,coverage
+            return True,'检测到窗口',occ,coverage
         except Exception:
-            return False
+            return False,'检测异常',0,0.0
     def _update_window_status(self,force=False):
         if self.window_obj is None:
-            self.window_rect=None;self.window_visible=False;self.window_full=False;self.schedule(lambda:self.visible_var.set("可见: No window"));self.schedule(lambda:self.full_var.set("完整: No window"));return
+            self.window_rect=None;self.window_hwnd=None;self.window_visible=False;self.window_full=False;self.window_occ_state=0;self.window_visible_reason='未选择窗口';self.window_full_reason='未选择窗口';self.schedule(lambda:self.visible_var.set('可见: 否(未选择窗口)'));self.schedule(lambda:self.full_var.set('完整: 否(未选择窗口)'));return
         try:
-            self.window_obj.refresh();hwnd=int(self.window_obj._hWnd)
-            rect=self._get_ext_frame_rect(hwnd);self.window_rect=rect
-            visible=False;full=False
+            hwnd=self._resolve_window_handle()
+            self.window_hwnd=hwnd
+            rect=self._get_ext_frame_rect(hwnd) if hwnd is not None else None
+            self.window_rect=rect
+            visible=False
+            full=False
+            vis_reason='无法检测'
+            full_reason='无法检测'
             if rect:
-                visible=self._check_window_visible(hwnd,rect)
+                visible,vis_reason,occ,coverage=self._check_window_visible(hwnd,rect)
+                self.window_occ_state=occ
                 if visible:
-                    coverage=self._monitor_coverage(rect)
                     if coverage>=0.99:
                         ratio=self._pixel_occlusion_ratio(None,hwnd,rect)
-                        full=bool(ratio is not None and ratio<=OCCLUSION_THR)
+                        if ratio is not None:
+                            full=ratio<=OCCLUSION_THR
+                            full_reason=f"遮挡率:{ratio*100:.2f}%"
+                        else:
+                            full=False
+                            full_reason='遮挡检测失败'
                     else:
                         full=False
-            self.window_visible=visible;self.window_full=full
-            self.schedule(lambda v=self.window_visible:self.visible_var.set(f"可见: {'是' if v else '否'}"))
-            self.schedule(lambda f=self.window_full:self.full_var.set(f"完整: {'是' if f else '否'}"))
+                        full_reason=f"覆盖率:{coverage*100:.2f}%"
+                else:
+                    full=False
+                    full_reason=vis_reason
+            else:
+                self.window_occ_state=0
+                vis_reason='无法获取窗口区域'
+                full_reason=vis_reason
+            self.window_visible=visible
+            self.window_full=full
+            self.window_visible_reason=vis_reason
+            self.window_full_reason=full_reason
+            self.schedule(lambda v=visible,r=vis_reason:self.visible_var.set(f"可见: {'是' if v else '否'}({r})"))
+            self.schedule(lambda f=full,t=full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
         except Exception:
-            self.window_rect=None;self.window_visible=False;self.window_full=False;self.schedule(lambda:self.visible_var.set("可见: Unknown"));self.schedule(lambda:self.full_var.set("完整: Unknown"))
+            self.window_rect=None
+            self.window_hwnd=None
+            self.window_visible=False
+            self.window_full=False
+            self.window_occ_state=0
+            self.window_visible_reason='检测异常'
+            self.window_full_reason='检测异常'
+            self.schedule(lambda:self.visible_var.set('可见: 否(检测异常)'))
+            self.schedule(lambda:self.full_var.set('完整: 否(检测异常)'))
     def schedule(self,func):
         if self.running:self.ui_queue.put(func)
     def _gpu_metrics_nvml(self):
@@ -1101,7 +1189,7 @@ class App:
                             shot=self.mss_ctx.grab({"left":left,"top":top,"width":width,"height":height});frame=np.array(shot);frame=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
                             now=time.time()
                             if (now-self.last_occl_check>1.0 or not self.window_full) and self.window_visible:
-                                ratio=self._pixel_occlusion_ratio(frame,self.window_obj._hWnd,self.window_rect)
+                                ratio=self._pixel_occlusion_ratio(frame,self.window_hwnd,self.window_rect)
                                 if ratio is not None:
                                     coverage=self._monitor_coverage(self.window_rect)
                                     self.window_full=bool(coverage>=0.99 and ratio<=OCCLUSION_THR)
