@@ -25,6 +25,12 @@ from tkinter import ttk,messagebox
 from screeninfo import get_monitors
 torch.backends.cudnn.benchmark=True
 OCCLUSION_THR=0.01
+WS_EX_TRANSPARENT=0x00000020
+WS_EX_LAYERED=0x00080000
+LWA_ALPHA=0x2
+GWL_EXSTYLE=-20
+GW_HWNDPREV=3
+PW_RENDERFULLCONTENT=0x00000002
 pyautogui.FAILSAFE=False
 pyautogui.PAUSE=0.0
 pyautogui.MINIMUM_DURATION=0.0
@@ -36,6 +42,16 @@ if os.name=="nt":
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+    try:
+        dwmapi=ctypes.windll.dwmapi
+    except Exception:
+        dwmapi=None
+    user32=ctypes.windll.user32
+    gdi32=ctypes.windll.gdi32
+else:
+    dwmapi=None
+    user32=None
+    gdi32=None
 home=os.path.expanduser("~")
 base_dir=os.path.join(home,"Desktop","GameAI")
 models_dir=os.path.join(base_dir,"models")
@@ -60,6 +76,34 @@ def _rect_intersection(a,b):
     return None
 def _rect_area(rc):
     return max(0,rc[2]-rc[0])*max(0,rc[3]-rc[1])
+def _rect_union_area(rects):
+    if not rects:
+        return 0
+    xs=sorted({r[0] for r in rects}|{r[2] for r in rects})
+    area=0
+    for i in range(len(xs)-1):
+        x1=xs[i];x2=xs[i+1]
+        if x2<=x1:
+            continue
+        seg=[]
+        for l,t,r,b in rects:
+            if l<x2 and r>x1:
+                seg.append((t,b))
+        if not seg:
+            continue
+        seg.sort()
+        cs,ce=seg[0]
+        total=0
+        for s,e in seg[1:]:
+            if e<=cs:
+                continue
+            if s>ce:
+                total+=ce-cs;cs,ce=s,e
+            else:
+                if e>ce:ce=e
+        total+=ce-cs
+        area+=total*(x2-x1)
+    return area
 def _poly_simplify(points,eps=2.0):
     if len(points)<3:
         return points
@@ -801,75 +845,156 @@ class App:
             self.set_mode("learn")
     def _get_ext_frame_rect(self,hwnd):
         try:
-            class RECT(ctypes.Structure):
-                _fields_=[("left",ctypes.c_long),("top",ctypes.c_long),("right",ctypes.c_long),("bottom",ctypes.c_long)]
-            rect=RECT();DWMWA_EXTENDED_FRAME_BOUNDS=9
-            ctypes.windll.dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(hwnd),ctypes.c_int(DWMWA_EXTENDED_FRAME_BOUNDS),ctypes.byref(rect),ctypes.sizeof(rect))
-            return (rect.left,rect.top,rect.right,rect.bottom)
+            rect=ctypes.wintypes.RECT()
+            if dwmapi is not None:
+                DWMWA_EXTENDED_FRAME_BOUNDS=9
+                if dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(hwnd),ctypes.c_int(DWMWA_EXTENDED_FRAME_BOUNDS),ctypes.byref(rect),ctypes.sizeof(rect))==0:
+                    return (rect.left,rect.top,rect.right,rect.bottom)
         except Exception:
-            try:
-                import win32gui
-                r=win32gui.GetWindowRect(hwnd)
-                return (int(r[0]),int(r[1]),int(r[2]),int(r[3]))
-            except Exception:
-                return None
+            pass
+        try:
+            rect=ctypes.wintypes.RECT()
+            if user32 is not None and user32.GetWindowRect(ctypes.wintypes.HWND(hwnd),ctypes.byref(rect))!=0:
+                return (rect.left,rect.top,rect.right,rect.bottom)
+        except Exception:
+            pass
+        return None
     def _pixel_occlusion_ratio(self,frame,hwnd,rect):
         try:
-            import win32gui,win32ui,win32con
-            left,top,right,bottom=rect;w=max(1,right-left);h=max(1,bottom-top)
-            hdc=win32gui.GetWindowDC(hwnd);srcdc=win32ui.CreateDCFromHandle(hdc);memdc=srcdc.CreateCompatibleDC();bmp=win32ui.CreateBitmap();bmp.CreateCompatibleBitmap(srcdc,w,h);memdc.SelectObject(bmp)
-            PW_RENDERFULLCONTENT=0x00000002
-            ok=ctypes.windll.user32.PrintWindow(ctypes.wintypes.HWND(hwnd),memdc.GetSafeHdc(),PW_RENDERFULLCONTENT)
-            bits=bmp.GetBitmapBits(True);img=np.frombuffer(bits,dtype=np.uint8);img=img.reshape((h,w,4))[:,:,:3]
-            win32gui.ReleaseDC(hwnd,hdc);memdc.DeleteDC();srcdc.DeleteDC();win32gui.DeleteObject(bmp.GetHandle())
-            scr=cv2.resize(frame,(w,h)) if frame.shape[1]!=w or frame.shape[0]!=h else frame
-            d=cv2.absdiff(scr,img);m=(cv2.cvtColor(d,cv2.COLOR_BGR2GRAY)>5).astype(np.uint8);ratio=float(np.sum(m))/float(w*h)
-            if ok==0:ratio=1.0
+            if user32 is None:
+                self.last_occl_check=time.time()
+                return 0.0
+            left,top,right,bottom=rect;w=max(1,right-left);h=max(1,bottom-top);area=float(w*h)
+            overlaps=[];cur=user32.GetWindow(ctypes.wintypes.HWND(hwnd),ctypes.c_int(GW_HWNDPREV));seen=set()
+            while cur:
+                h=int(cur)
+                if h in seen:
+                    break
+                seen.add(h)
+                cur_hwnd=ctypes.wintypes.HWND(cur)
+                if user32.IsWindowVisible(cur_hwnd) and user32.IsIconic(cur_hwnd)==0:
+                    other=self._get_ext_frame_rect(h)
+                    if other is not None:
+                        inter=_rect_intersection(rect,other)
+                        if inter and inter[2]>inter[0] and inter[3]>inter[1]:
+                            if not self._is_window_transparent(h):
+                                overlaps.append(inter)
+                cur=user32.GetWindow(cur_hwnd,ctypes.c_int(GW_HWNDPREV))
+            occ=float(_rect_union_area(overlaps));ratio=occ/area if area>0 else 1.0
+            if frame is not None and ratio<=1.0:
+                capture=self._print_window(hwnd,w,h)
+                if capture is not None:
+                    if capture.shape[0]!=frame.shape[0] or capture.shape[1]!=frame.shape[1]:
+                        sample=cv2.resize(frame,(capture.shape[1],capture.shape[0]))
+                    else:
+                        sample=frame
+                    diff=cv2.absdiff(cv2.cvtColor(sample,cv2.COLOR_BGR2GRAY),cv2.cvtColor(capture,cv2.COLOR_BGR2GRAY));mask=(diff>18).astype(np.uint8);ratio=max(ratio,float(np.count_nonzero(mask))/mask.size)
+            self.last_occl_check=time.time()
             return min(max(ratio,0.0),1.0)
         except Exception:
             return None
+    def _print_window(self,hwnd,width,height):
+        if user32 is None or gdi32 is None or width<=0 or height<=0:
+            return None
+        hdc=None;memdc=None;bmp=None
+        try:
+            hdc=user32.GetWindowDC(ctypes.wintypes.HWND(hwnd))
+            if not hdc:
+                return None
+            memdc=gdi32.CreateCompatibleDC(hdc)
+            if not memdc:
+                return None
+            bmp=gdi32.CreateCompatibleBitmap(hdc,width,height)
+            if not bmp:
+                return None
+            old=gdi32.SelectObject(memdc,bmp)
+            res=user32.PrintWindow(ctypes.wintypes.HWND(hwnd),memdc,ctypes.c_uint(PW_RENDERFULLCONTENT))
+            buf=ctypes.create_string_buffer(width*height*4)
+            got=gdi32.GetBitmapBits(bmp,len(buf),buf)
+            gdi32.SelectObject(memdc,old)
+            if res==0 or got==0:
+                return None
+            arr=np.frombuffer(buf,dtype=np.uint8).reshape((height,width,4))
+            return arr[:,:,:3].copy()
+        except Exception:
+            return None
+        finally:
+            try:
+                if bmp:gdi32.DeleteObject(bmp)
+            except Exception:
+                pass
+            try:
+                if memdc:gdi32.DeleteDC(memdc)
+            except Exception:
+                pass
+            try:
+                if hdc:user32.ReleaseDC(ctypes.wintypes.HWND(hwnd),hdc)
+            except Exception:
+                pass
+    def _is_window_transparent(self,hwnd):
+        try:
+            if user32 is None:
+                return False
+            h=ctypes.wintypes.HWND(hwnd)
+            ex=user32.GetWindowLongW(h,ctypes.c_int(GWL_EXSTYLE))
+            if ex & WS_EX_TRANSPARENT:
+                return True
+            func=getattr(user32,'GetLayeredWindowAttributes',None)
+            if ex & WS_EX_LAYERED and func is not None:
+                key=ctypes.c_uint()
+                alpha=ctypes.c_ubyte()
+                flags=ctypes.c_uint()
+                if func(h,ctypes.byref(key),ctypes.byref(alpha),ctypes.byref(flags))!=0:
+                    if flags.value & LWA_ALPHA and alpha.value<250:
+                        return True
+            return False
+        except Exception:
+            return False
+    def _monitor_coverage(self,rect):
+        area=_rect_area(rect)
+        if area<=0:
+            return 0.0
+        covered=0
+        for mx,my,mw,mh in self.monitor_bounds:
+            inter=_rect_intersection(rect,(mx,my,mx+mw,my+mh))
+            if inter:
+                covered+=_rect_area(inter)
+        return covered/area if area>0 else 0.0
+    def _check_window_visible(self,hwnd,rect):
+        try:
+            if user32 is None:
+                return False
+            h=ctypes.wintypes.HWND(hwnd)
+            if user32.IsWindowVisible(h)==0 or user32.IsIconic(h)!=0:
+                return False
+            if dwmapi is not None:
+                cloaked=ctypes.c_int(0)
+                try:
+                    DWMWA_CLOAKED=14
+                    dwmapi.DwmGetWindowAttribute(h,ctypes.c_int(DWMWA_CLOAKED),ctypes.byref(cloaked),ctypes.sizeof(cloaked))
+                    if cloaked.value!=0:
+                        return False
+                except Exception:
+                    pass
+            return self._monitor_coverage(rect)>0.01
+        except Exception:
+            return False
     def _update_window_status(self,force=False):
         if self.window_obj is None:
             self.window_rect=None;self.window_visible=False;self.window_full=False;self.schedule(lambda:self.visible_var.set("可见: No window"));self.schedule(lambda:self.full_var.set("完整: No window"));return
         try:
-            import win32gui,win32con
-            self.window_obj.refresh();hwnd=self.window_obj._hWnd
+            self.window_obj.refresh();hwnd=int(self.window_obj._hWnd)
             rect=self._get_ext_frame_rect(hwnd);self.window_rect=rect
             visible=False;full=False
             if rect:
-                cloaked=ctypes.c_int(0)
-                try:
-                    DWMWA_CLOAKED=14
-                    ctypes.windll.dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(hwnd),ctypes.c_int(DWMWA_CLOAKED),ctypes.byref(cloaked),ctypes.sizeof(cloaked))
-                except Exception:
-                    pass
-                if win32gui.IsWindowVisible(hwnd) and not win32gui.IsIconic(hwnd) and cloaked.value==0:
-                    any_intersect=False;fully_inside=False
-                    for mx,my,mw,mh in self.monitor_bounds:
-                        inter=_rect_intersection(rect,(mx,my,mx+mw,my+mh))
-                        if inter:
-                            any_intersect=True
-                            if rect[0]>=mx and rect[1]>=my and rect[2]<=mx+mw and rect[3]<=my+mh:
-                                fully_inside=True
-                    if any_intersect:visible=True
-                    if visible and fully_inside:
-                        area=_rect_area(rect);work_area=0
-                        for mx,my,mw,mh in self.monitor_bounds:
-                            inter=_rect_intersection(rect,(mx,my,mx+mw,my+mh))
-                            if inter:work_area+=_rect_area(inter)
-                        occl_area=0;cur=win32gui.GetWindow(hwnd,win32con.GW_HWNDPREV)
-                        while cur and cur!=0:
-                            try:
-                                if win32gui.IsWindowVisible(cur) and not win32gui.IsIconic(cur):
-                                    r2=self._get_ext_frame_rect(cur)
-                                    if r2:
-                                        over=_rect_intersection(rect,r2)
-                                        if over:
-                                            a=_rect_area(over);occl_area+=a
-                            except Exception:
-                                pass
-                            cur=win32gui.GetWindow(cur,win32con.GW_HWNDPREV)
-                        occluded_ratio=(occl_area/work_area) if work_area>0 else 1.0;full=(work_area>0 and occluded_ratio<=OCCLUSION_THR)
+                visible=self._check_window_visible(hwnd,rect)
+                if visible:
+                    coverage=self._monitor_coverage(rect)
+                    if coverage>=0.99:
+                        ratio=self._pixel_occlusion_ratio(None,hwnd,rect)
+                        full=bool(ratio is not None and ratio<=OCCLUSION_THR)
+                    else:
+                        full=False
             self.window_visible=visible;self.window_full=full
             self.schedule(lambda v=self.window_visible:self.visible_var.set(f"可见: {'是' if v else '否'}"))
             self.schedule(lambda f=self.window_full:self.full_var.set(f"完整: {'是' if f else '否'}"))
@@ -978,7 +1103,10 @@ class App:
                             if (now-self.last_occl_check>1.0 or not self.window_full) and self.window_visible:
                                 ratio=self._pixel_occlusion_ratio(frame,self.window_obj._hWnd,self.window_rect)
                                 if ratio is not None:
-                                    self.window_full=(ratio<=OCCLUSION_THR)
+                                    coverage=self._monitor_coverage(self.window_rect)
+                                    self.window_full=bool(coverage>=0.99 and ratio<=OCCLUSION_THR)
+                                else:
+                                    self.window_full=False
                             self._enqueue_drop(self.cap_queue,(frame,now))
                         except Exception:
                             pass
