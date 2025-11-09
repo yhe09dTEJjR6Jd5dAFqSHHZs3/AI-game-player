@@ -1,12 +1,30 @@
-import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime
-import psutil,pyautogui,torch,torch.nn as nn,torch.optim as optim,torch.nn.functional as F,GPUtil,cv2,numpy as np,mss,requests,pygetwindow as gw
+import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime,re,traceback
+import psutil,pyautogui
+try:
+ import torch,torch.nn as nn,torch.optim as optim,torch.nn.functional as F
+except OSError as e:
+ import tkinter as _tk
+ from tkinter import messagebox as _mb
+ try:
+  _r=_tk.Tk();_r.withdraw()
+  _mb.showerror('PyTorch错误','检测到CUDA版PyTorch但缺少依赖\n请安装CPU版PyTorch后重试:\nhttps://pytorch.org/get-started/locally/\n建议命令: pip install torch --index-url https://download.pytorch.org/whl/cpu')
+ except Exception:
+  pass
+ sys.exit(1)
+import GPUtil,cv2,numpy as np,mss,requests,pygetwindow as gw
 from pynput import mouse,keyboard
-from pynvml import nvmlInit,nvmlDeviceGetCount,nvmlDeviceGetHandleByIndex,nvmlDeviceGetUtilizationRates,nvmlDeviceGetMemoryInfo,nvmlDeviceGetTemperature,nvmlDeviceGetPowerUsage,nvmlDeviceGetEnforcedPowerLimit
+from PIL import Image,ImageTk
+import tkinter as tk
+from tkinter import ttk,messagebox
+from screeninfo import get_monitors
+import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime,re,traceback
+from pynput import mouse,keyboard
 from PIL import Image,ImageTk
 import tkinter as tk
 from tkinter import ttk,messagebox
 from screeninfo import get_monitors
 torch.backends.cudnn.benchmark=True
+OCCLUSION_THR=0.01
 pyautogui.FAILSAFE=False
 pyautogui.PAUSE=0.0
 pyautogui.MINIMUM_DURATION=0.0
@@ -28,72 +46,31 @@ model_path=os.path.join(models_dir,"policy.pt")
 resnet_path=os.path.join(models_dir,"resnet18-f37072fd.pth")
 yolo_path=os.path.join(models_dir,"yolov8n.pt")
 sam_path=os.path.join(models_dir,"sam_vit_b_01ec64.pth")
-clicks_dir=os.path.join(experience_dir,"clicks")
-os.makedirs(clicks_dir,exist_ok=True)
 device="cuda" if torch.cuda.is_available() else "cpu"
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
 try:
-    nvmlInit()
-    _gpu_count=nvmlDeviceGetCount()
+    from pynvml import nvmlInit,nvmlDeviceGetCount,nvmlDeviceGetHandleByIndex,nvmlDeviceGetUtilizationRates,nvmlDeviceGetMemoryInfo,nvmlDeviceGetTemperature,nvmlDeviceGetPowerUsage,nvmlDeviceGetEnforcedPowerLimit
+    nvmlInit();_gpu_count=nvmlDeviceGetCount()
 except Exception:
     _gpu_count=0
-def _safe_imports():
-    yolo=None
-    sam_predictor=None
-    ocr=None
-    resnet=None
-    clip_model=None
-    preprocess=None
-    try:
-        from ultralytics import YOLO
-        if os.path.exists(yolo_path):
-            yolo=YOLO(yolo_path)
-    except Exception:
-        yolo=None
-    try:
-        from segment_anything import sam_model_registry,SamPredictor
-        if os.path.exists(sam_path):
-            sam=sam_model_registry.get("vit_b")(checkpoint=sam_path)
-            sam.to(device)
-            sam_predictor=SamPredictor(sam)
-    except Exception:
-        sam_predictor=None
-    try:
-        import pytesseract
-        ocr=pytesseract
-    except Exception:
-        ocr=None
-    try:
-        import torchvision.models as tvm
-        import torchvision.transforms as T
-        resnet=tvm.resnet18(weights=None)
-        if os.path.exists(resnet_path):
-            sd=torch.load(resnet_path,map_location="cpu")
-            resnet.load_state_dict(sd,strict=False)
-        resnet.eval().to(device)
-        preprocess=T.Compose([T.ToTensor(),T.Resize((224,224))])
-    except Exception:
-        resnet=None
-        preprocess=None
-    try:
-        import clip as openai_clip
-        clip_model,clip_preprocess=openai_clip.load("ViT-B/32",device=device,download_root=models_dir)
-        preprocess=clip_preprocess
-    except Exception:
-        pass
-    return yolo,sam_predictor,ocr,resnet,clip_model,preprocess
-yolo_model,sam_predictor,ocr_engine,resnet_model,clip_model,vision_preprocess=_safe_imports()
-class ModelSpec:
-    def __init__(self,name,path,urls,generator,sha256=None,expected_size=None,max_retries=3):
-        self.name=name
-        self.path=path
-        self.urls=urls if isinstance(urls,(list,tuple)) else ([urls] if urls is not None else [])
-        self.generator=generator
-        self.sha256=sha256
-        self.expected_size=expected_size
-        self.max_retries=max_retries
+def _rect_intersection(a,b):
+    l=max(a[0],b[0]);t=max(a[1],b[1]);r=min(a[2],b[2]);btm=min(a[3],b[3])
+    if r>l and btm>t:
+        return (l,t,r,btm)
+    return None
+def _rect_area(rc):
+    return max(0,rc[2]-rc[0])*max(0,rc[3]-rc[1])
+def _poly_simplify(points,eps=2.0):
+    if len(points)<3:
+        return points
+    pts=np.array(points,dtype=np.float32).reshape(-1,1,2)
+    eps=float(eps)
+    simp=cv2.approxPolyDP(pts,eps,False).reshape(-1,2).tolist()
+    return simp if len(simp)>=2 else points
+def _now_ms():
+    return int(time.time()*1000)
 class UIElementPool:
-    def __init__(self,embedder,pre):
+    def __init__(self,embedder=None,pre=None):
         self.embedder=embedder
         self.pre=pre
         self.lock=threading.Lock()
@@ -105,11 +82,12 @@ class UIElementPool:
         try:
             if patch is None or patch.size==0:
                 return None
-            if clip_model is not None and self.pre is not None:
+            import torchvision.transforms as T
+            if self.embedder is not None and self.pre is not None:
                 img=Image.fromarray(cv2.cvtColor(patch,cv2.COLOR_BGR2RGB))
                 x=self.pre(img).unsqueeze(0).to(device)
                 with torch.no_grad():
-                    e=clip_model.encode_image(x).float().detach().cpu().numpy().reshape(-1)
+                    e=self.embedder.encode_image(x).float().detach().cpu().numpy().reshape(-1)
                 n=np.linalg.norm(e)+1e-8
                 return e/n
         except Exception:
@@ -237,11 +215,11 @@ class ReplayBuffer:
         self.cap=cap
         self.data=[]
         self.lock=threading.Lock()
-    def add(self,frame,action,source,event_id=0,atype=0,ctrl=-1):
+    def add(self,frame,action,source,event_id=0,atype=0,ctrl=-1,txt=""):
         with self.lock:
             if len(self.data)>=self.cap:
                 self.data.pop(0)
-            self.data.append((frame.astype(np.uint8),np.array(action,dtype=np.float32),int(source),int(event_id),int(atype),int(ctrl)))
+            self.data.append((frame.astype(np.uint8),np.array(action,dtype=np.float32),int(source),int(event_id),int(atype),int(ctrl),str(txt)))
     def size(self):
         with self.lock:
             return len(self.data)
@@ -253,7 +231,7 @@ class ReplayBuffer:
             if len(self.data)<seq+batch:
                 return None
             idx=[random.randint(0,len(self.data)-seq) for _ in range(batch)]
-            frames=[];actions=[];sources=[];events=[];atypes=[];ctrls=[]
+            frames=[];actions=[];sources=[];events=[];atypes=[];ctrls=[];txts=[]
             for i in idx:
                 seq_frames=[self.data[i+j][0] for j in range(seq)]
                 frames.append(np.stack(seq_frames,0))
@@ -262,7 +240,8 @@ class ReplayBuffer:
                 events.append(self.data[i+seq-1][3])
                 atypes.append(self.data[i+seq-1][4])
                 ctrls.append(self.data[i+seq-1][5])
-            return np.stack(frames,0),np.stack(actions,0),np.array(sources),np.array(events),np.array(atypes),np.array(ctrls)
+                txts.append(self.data[i+seq-1][6])
+            return np.stack(frames,0),np.stack(actions,0),np.array(sources),np.array(events),np.array(atypes),np.array(ctrls),txts
 class DiskExperienceDataset(torch.utils.data.Dataset):
     def __init__(self,root_dir,seq=4,aug=True):
         self.files=[]
@@ -320,7 +299,7 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
             blank=np.zeros((256,256,3),np.uint8)
             seq=np.stack([blank]*self.seq,0)
             act=np.zeros(3,np.float32)
-            return seq,act,np.array(0,dtype=np.int64),np.array(-1,dtype=np.int64),np.zeros((64,),np.float32)
+            return seq,act,np.array(0,dtype=np.int64),np.array(-1,dtype=np.int64),np.zeros((64,),np.float32),"",0
         i=random.randint(0,len(self.files)-1)
         try:
             arr=np.load(self.files[i],allow_pickle=True)
@@ -339,10 +318,12 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
                 atype=2
             ctrl=int(extra.get("proto",-1)) if isinstance(extra,dict) else -1
             path_vec=self._encode_path(extra)
+            text=str(meta.get("event_text",""))
+            success=1 if any(k in text.lower() for k in ["win","victory","success","complete"]) else 0
         except Exception:
-            frame=np.zeros((256,256,3),np.uint8);act=np.zeros(3,np.float32);atype=0;ctrl=-1;path_vec=np.zeros((64,),np.float32)
+            frame=np.zeros((256,256,3),np.uint8);act=np.zeros(3,np.float32);atype=0;ctrl=-1;path_vec=np.zeros((64,),np.float32);text="";success=0
         seq=np.stack([self._aug(frame.copy()) for _ in range(self.seq)],0)
-        return seq,act,np.array(atype,dtype=np.int64),np.array(ctrl,dtype=np.int64),path_vec
+        return seq,act,np.array(atype,dtype=np.int64),np.array(ctrl,dtype=np.int64),path_vec,text,success
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -379,17 +360,6 @@ def generate_policy(path):
         net=PolicyNet()
         torch.save(net.state_dict(),path)
         return True
-    except Exception as e:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-        return False
-def generate_placeholder(path):
-    try:
-        torch.save({"placeholder":True,"weights":[]},path)
-        return True
     except Exception:
         try:
             if os.path.exists(path):
@@ -397,6 +367,15 @@ def generate_placeholder(path):
         except Exception:
             pass
         return False
+class ModelSpec:
+    def __init__(self,name,path,urls,generator,sha256=None,expected_size=None,max_retries=3):
+        self.name=name
+        self.path=path
+        self.urls=urls if isinstance(urls,(list,tuple)) else ([urls] if urls is not None else [])
+        self.generator=generator
+        self.sha256=sha256
+        self.expected_size=expected_size
+        self.max_retries=max_retries
 class ModelManager:
     def __init__(self,app):
         self.app=app
@@ -416,16 +395,11 @@ class ModelManager:
     def _validate(self,spec):
         try:
             if spec.name=="resnet18":
-                _=torch.load(spec.path,map_location="cpu")
-                return True
+                _=torch.load(spec.path,map_location="cpu");return True
             if spec.name=="yolov8n":
-                from ultralytics import YOLO
-                _=YOLO(spec.path)
-                return True
+                from ultralytics import YOLO;_=YOLO(spec.path);return True
             if spec.name=="sam_vit_b":
-                from segment_anything import sam_model_registry
-                _=sam_model_registry.get("vit_b")(checkpoint=spec.path)
-                return True
+                from segment_anything import sam_model_registry;_=sam_model_registry.get("vit_b")(checkpoint=spec.path);return True
             return True
         except Exception:
             try:
@@ -433,6 +407,79 @@ class ModelManager:
             except Exception:
                 pass
             return False
+    def _alert(self,msg):
+        try:
+            messagebox.showerror("Error",msg)
+        except Exception:
+            pass
+    def _download(self,url,path,max_retries):
+        tmp=path+".download"
+        try:
+            from requests.adapters import HTTPAdapter
+            try:
+                from urllib3.util.retry import Retry
+            except Exception:
+                from urllib3.util import Retry
+            sess=requests.Session()
+            retry=Retry(total=max(0,int(max_retries)),read=max(0,int(max_retries)),connect=max(0,int(max_retries)),backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=frozenset(["GET","HEAD"]))
+            sess.mount("http://",HTTPAdapter(max_retries=retry))
+            sess.mount("https://",HTTPAdapter(max_retries=retry))
+            headers={}
+            exist=0
+            if os.path.exists(tmp):
+                try:
+                    exist=os.path.getsize(tmp)
+                    if exist>0:
+                        headers["Range"]=f"bytes={exist}-"
+                except Exception:
+                    exist=0
+            t0=time.time();bytes0=exist
+            with sess.get(url,timeout=45,stream=True,headers=headers) as r:
+                if r.status_code in (200,206):
+                    mode="ab" if "Range" in headers and r.status_code==206 else "wb"
+                    if mode=="wb" and os.path.exists(tmp):
+                        try:os.remove(tmp)
+                        except Exception:pass
+                    with open(tmp,mode) as f:
+                        for chunk in r.iter_content(65536):
+                            if chunk:
+                                f.write(chunk)
+                                t=time.time()
+                                if t-t0>=1.0:
+                                    sz=os.path.getsize(tmp);spd=(sz-bytes0)/(t-t0);self.app.schedule(lambda s=int(spd):self.app.pause_var.set(f"下载中 {os.path.basename(path)} {s}B/s(超时45秒)"));t0=t;bytes0=sz
+                    size=os.path.getsize(tmp)
+                    if size<=0:
+                        try:os.remove(tmp)
+                        except Exception:pass
+                        return False,"下载大小为0"
+                    os.replace(tmp,path)
+                    return True,""
+                else:
+                    return False,f"HTTP {r.status_code}"
+        except Exception as e:
+            try:
+                if os.path.exists(tmp):os.remove(tmp)
+            except Exception:
+                pass
+            return False,str(e)
+    def prompt_retry_or_local(self,name,url,reason,path_hint):
+        result=queue.Queue(maxsize=1)
+        def dialog():
+            top=tk.Toplevel(self.app.root);top.title(f"Model {name}")
+            ttk.Label(top,text=f"下载 {name} 失败：{reason}").grid(row=0,column=0,columnspan=3,sticky="w")
+            ttk.Label(top,text=f"可手动下载链接:").grid(row=1,column=0,sticky="w")
+            link=tk.Entry(top);link.insert(0,url);link.configure(state="readonly");link.grid(row=1,column=1,columnspan=2,sticky="ew")
+            ttk.Label(top,text=f"请将文件放到:").grid(row=2,column=0,sticky="w")
+            path=tk.Entry(top);path.insert(0,path_hint);path.configure(state="readonly");path.grid(row=2,column=1,columnspan=2,sticky="ew")
+            ttk.Label(top,text=f"超时45秒，最大重试{3}次").grid(row=3,column=0,columnspan=3,sticky="w")
+            top.columnconfigure(1,weight=1)
+            def choose(val):
+                if result.empty():result.put(val);top.destroy()
+            ttk.Button(top,text="Open Link",command=lambda:choose("open")).grid(row=4,column=0,sticky="ew")
+            ttk.Button(top,text="Retry",command=lambda:choose("retry")).grid(row=4,column=1,sticky="ew")
+            ttk.Button(top,text="Local",command=lambda:choose("local")).grid(row=4,column=2,sticky="ew")
+            top.grab_set();top.protocol("WM_DELETE_WINDOW",lambda:choose("retry"))
+        self.app.schedule(dialog);return result.get()
     def _worker(self):
         for spec in self.specs:
             if os.path.exists(spec.path):
@@ -448,7 +495,6 @@ class ModelManager:
             done=False;attempt=0;delay=2.0
             while not done and self.app.running and (spec.max_retries==0 or attempt<spec.max_retries):
                 attempt+=1
-                self.retry_counts[spec.name]=attempt
                 if spec.urls==[]:
                     try:
                         if spec.generator and spec.generator(spec.path):
@@ -456,21 +502,19 @@ class ModelManager:
                         else:
                             raise RuntimeError("本地生成失败")
                     except Exception as e:
-                        reason=str(e)
-                        self.app.schedule(lambda n=spec.name:self._alert(f"{n} 生成失败:{reason}"));break
+                        reason=str(e);self.app.schedule(lambda n=spec.name:self._alert(f"{n} 生成失败:{reason}"));break
                 ok_any=False;last_reason=""
                 for url in spec.urls:
                     try:
-                        self.app.schedule(lambda n=spec.name,a=attempt:self.app.pause_var.set(f"正在下载 {n} 第{a}次尝试(超时45秒,最大重试{spec.max_retries},回退指数到30秒)"))
-                        ok,reason=self._download(url,spec.path)
+                        self.app.schedule(lambda n=spec.name,a=attempt,m=spec.max_retries:self.app.pause_var.set(f"正在下载 {n} 第{a}次尝试"))
+                        ok,reason=self._download(url,spec.path,spec.max_retries)
                         if ok:
                             if spec.expected_size and os.path.getsize(spec.path)!=spec.expected_size:
                                 raise RuntimeError("文件大小校验失败")
                             if spec.sha256 and self._sha256(spec.path)!=spec.sha256:
                                 raise RuntimeError("哈希校验失败")
                             if not self._validate(spec):
-                                last_reason="文件校验失败"
-                                ok=False
+                                last_reason="文件校验失败";ok=False
                             else:
                                 ok_any=True;break
                         else:
@@ -478,14 +522,9 @@ class ModelManager:
                     except Exception as e:
                         last_reason=str(e)
                 if ok_any:
-                    self.app.schedule(lambda:self.app.pause_var.set(""))
-                    try:self.app.reload_perception()
-                    except Exception:pass
-                    try:self.app.update_model_ready_ui()
-                    except Exception:pass
-                    done=True;break
-                self.app.schedule(lambda n=spec.name,a=attempt,r=last_reason:self.app.pause_var.set(f"{n} 下载失败(第{a}次)：{r}，超时45秒,最大重试{spec.max_retries},回退到{int(delay)}秒"))
-                choice=self.app.prompt_retry_or_local(spec.name,(spec.urls[0] if spec.urls else ""),last_reason or "网络错误或超时",spec.path)
+                    self.app.schedule(lambda:self.app.pause_var.set(""));self.app.reload_perception();self.app.update_model_ready_ui();done=True;break
+                self.app.schedule(lambda n=spec.name,a=attempt,r=last_reason:self.app.pause_var.set(f"{n} 下载失败：{r}"))
+                choice=self.prompt_retry_or_local(spec.name,(spec.urls[0] if spec.urls else ""),last_reason or "网络错误或超时",spec.path)
                 if choice=="open":
                     try:webbrowser.open(spec.urls[0] if spec.urls else "")
                     except Exception:pass
@@ -502,75 +541,19 @@ class ModelManager:
                         self.app.schedule(lambda:self._alert(f"{spec.name} 未就绪，请手动下载放置到指定路径"))
                 else:
                     continue
-    def _alert(self,msg):
-        try:
-            messagebox.showerror("Error",msg)
-        except Exception:
-            pass
-    def _download(self,url,path):
-        tmp=path+".download"
-        try:
-            headers={}
-            exist=0
-            if os.path.exists(tmp):
-                try:
-                    exist=os.path.getsize(tmp)
-                    if exist>0:
-                        headers["Range"]=f"bytes={exist}-"
-                except Exception:
-                    exist=0
-            t0=time.time();bytes0=exist
-            with requests.get(url,timeout=45,stream=True,headers=headers) as r:
-                if r.status_code in (200,206):
-                    mode="ab" if "Range" in headers and r.status_code==206 else "wb"
-                    if mode=="wb" and os.path.exists(tmp):
-                        try:os.remove(tmp)
-                        except Exception:pass
-                    with open(tmp,mode) as f:
-                        for chunk in r.iter_content(65536):
-                            if chunk:
-                                f.write(chunk)
-                                t=time.time()
-                                if t-t0>=1.0:
-                                    sz=os.path.getsize(tmp);spd=(sz-bytes0)/(t-t0);self.app.schedule(lambda s=int(spd):self.app.pause_var.set(f"下载中 {os.path.basename(path)} {s}B/s(超时45秒,最大重试{spec.max_retries})"));t0=t;bytes0=sz
-                    size=os.path.getsize(tmp)
-                    if size<=0:
-                        try:os.remove(tmp)
-                        except Exception:pass
-                        return False,"下载大小为0"
-                    os.replace(tmp,path)
-                    return True,""
-                else:
-                    return False,f"HTTP {r.status_code}"
-        except Exception as e:
-            try:
-                if os.path.exists(tmp):os.remove(tmp)
-            except Exception:
-                pass
-            return False,str(e)
-def _rect_intersection(a,b):
-    l=max(a[0],b[0]);t=max(a[1],b[1]);r=min(a[2],b[2]);btm=min(a[3],b[3])
-    if r>l and btm>t:
-        return (l,t,r,btm)
-    return None
-def _rect_area(rc):
-    return max(0,rc[2]-rc[0])*max(0,rc[3]-rc[1])
-def _poly_simplify(points,eps=2.0):
-    if len(points)<3:
-        return points
-    pts=np.array(points,dtype=np.float32).reshape(-1,1,2)
-    eps=float(eps)
-    simp=cv2.approxPolyDP(pts,eps,False).reshape(-1,2).tolist()
-    return simp if len(simp)>=2 else points
 class PerceptionEngine:
     def __init__(self):
-        self.yolo=yolo_model
-        self.sam=sam_predictor
-        self.ocr=ocr_engine
-        self.resnet=resnet_model
-        self.clip=clip_model
-        self.pre=vision_preprocess
         self.last_text=""
+        try:
+            from ultralytics import YOLO
+            self.yolo=YOLO(yolo_path) if os.path.exists(yolo_path) else None
+        except Exception:
+            self.yolo=None
+        try:
+            import pytesseract
+            self.ocr=pytesseract
+        except Exception:
+            self.ocr=None
     def detect(self,frame):
         H,W=frame.shape[:2]
         dets=[]
@@ -590,27 +573,16 @@ class PerceptionEngine:
                 x,y,w,h=cv2.boundingRect(c)
                 if w*h>2000 and 10<=w<=600 and 10<=h<=300:
                     dets.append({"bbox":[x,y,x+w,y+h],"score":0.3,"label":"edge"})
-        if self.sam is not None and dets:
-            try:
-                self.sam.set_image(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
-                for d in dets[:10]:
-                    x1,y1,x2,y2=d["bbox"];cx=(x1+x2)/2;cy=(y1+y2)/2
-                    m,_=self.sam.predict(point_coords=np.array([[cx,cy]]),point_labels=np.array([1]),multimask_output=False)
-                    d["mask"]=m[0].astype(np.uint8)
-            except Exception:
-                pass
         txt=""
         if self.ocr is not None:
             try:
-                rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-                txt=self.ocr.image_to_string(rgb,lang="eng")
+                rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);txt=self.ocr.image_to_string(rgb,lang="eng")
             except Exception:
                 txt=""
         else:
             try:
                 gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY);thr=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-                cnts,_=cv2.findContours(thr,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-                numbers=0
+                cnts,_=cv2.findContours(thr,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE);numbers=0
                 for c in cnts:
                     x,y,w,h=cv2.boundingRect(c)
                     if 8<w<80 and 12<h<80 and w*h<2000:
@@ -624,26 +596,67 @@ class PerceptionEngine:
             x1,y1,x2,y2=d["bbox"];cx=(x1+x2)/2/W;cy=(y1+y2)/2/H
             out.append((cx,cy,d.get("label","0"),d.get("score",0.0)))
         return out,txt
+class GoalGraph:
+    def __init__(self):
+        self.lock=threading.Lock()
+        self.events=[]
+        self.proto_success={}
+        self.proto_counts={}
+        self.last_score=None
+    def _extract_score(self,txt):
+        try:
+            nums=[int(x) for x in re.findall(r"\d+",txt)]
+            return max(nums) if nums else None
+        except Exception:
+            return None
+    def add(self,ts,proto_id,text,atype,path_vec):
+        score=self._extract_score(text.lower())
+        success=1 if any(k in text.lower() for k in ["win","victory","success","complete"]) else 0
+        with self.lock:
+            self.events.append((ts,proto_id,score,success,atype))
+            if proto_id is not None and proto_id>=0:
+                self.proto_counts[proto_id]=self.proto_counts.get(proto_id,0)+1
+                self.proto_success[proto_id]=self.proto_success.get(proto_id,0)+success
+    def causal_score(self,proto_id):
+        with self.lock:
+            c=self.proto_counts.get(proto_id,0)
+            if c==0:return 0.0
+            s=self.proto_success.get(proto_id,0)
+            p1=s/max(c,1)
+            p0=(sum(self.proto_success.values())-s)/max(sum(self.proto_counts.values())-c,1)
+            return float(p1-p0)
+    def granger(self,lag=1):
+        with self.lock:
+            if len(self.events)<lag+5:return {}
+            ids=list(set([e[1] for e in self.events if e[1]>=0]))
+            res={}
+            for pid in ids:
+                x=[];y=[]
+                for i in range(lag,len(self.events)):
+                    prev=self.events[i-lag];curr=self.events[i]
+                    x.append(1.0 if prev[1]==pid else 0.0)
+                    y.append(1.0 if curr[3]>0 else 0.0)
+                X=np.array(x,dtype=np.float32).reshape(-1,1);Y=np.array(y,dtype=np.float32).reshape(-1,1)
+                try:
+                    w=np.linalg.lstsq(X,Y,rcond=None)[0];res[pid]=float(w[0][0])
+                except Exception:
+                    res[pid]=0.0
+            return res
 class App:
     def __init__(self):
         self.root=tk.Tk()
         self.root.title("Game AI")
         if device!="cuda":
-            try:
-                self.root.after(100,lambda:messagebox.showwarning("GPU不可用","未检测到可用的GPU，将使用CPU运行，性能可能受限"))
-            except Exception:
-                pass
+            try:self.root.after(100,lambda:messagebox.showwarning("GPU不可用","未检测到可用的GPU，将使用CPU运行"))
+            except Exception:pass
         self.ui_queue=queue.Queue()
         self.running=True
         self.writer=ExperienceWriter(experience_dir)
         self.buffer=ReplayBuffer()
         self.model=PolicyNet().to(device)
-        self._verify_model_integrity_initial()
         if os.path.exists(model_path):
-            try:
-                self.model.load_state_dict(torch.load(model_path,map_location=device),strict=False)
-            except Exception:
-                pass
+            try:self.model.load_state_dict(torch.load(model_path,map_location=device),strict=False)
+            except Exception:pass
         self.optimizer=optim.Adam(self.model.parameters(),lr=1e-4)
         self.capture_interval=0.05
         self.metrics={"cpu":0.0,"mem":0.0,"gpu":0.0,"vram":0.0,"freq":20.0,"temp":0.0,"pwr":0.0}
@@ -674,6 +687,7 @@ class App:
         self.gpu_var=tk.StringVar(value="GPU:0.0%")
         self.vram_var=tk.StringVar(value="VRAM:0.0%")
         self.gpu_src_var=tk.StringVar(value="GPU指标来源: 不可用")
+        self.freq_var=tk.StringVar(value="Capture:0.0 Hz")
         self.progress_var=tk.DoubleVar(value=0.0)
         self.progress_text=tk.StringVar(value="0%")
         self.last_user_input=time.time()
@@ -681,6 +695,7 @@ class App:
         self.window_rect=None
         self.window_visible=False
         self.window_full=False
+        self.last_occl_check=0.0
         self.status_lock=threading.Lock()
         self.monitor_bounds=[(m.x,m.y,m.width,m.height) for m in get_monitors()]
         self.mss_ctx=mss.mss()
@@ -708,22 +723,33 @@ class App:
         self.drag_points=[]
         self.drag_start=None
         self.perception=PerceptionEngine()
-        self.pool=UIElementPool(clip_model,vision_preprocess)
-        self.prev_gray=None
+        try:
+            import clip as openai_clip
+            self.clip_model,self.clip_preprocess=openai_clip.load("ViT-B/32",device=device,download_root=models_dir)
+        except Exception:
+            self.clip_model=None;self.clip_preprocess=None
+        self.pool=UIElementPool(self.clip_model,self.clip_preprocess)
         self.rule_text=""
+        self.goal_graph=GoalGraph()
         try:
             if os.cpu_count():
                 torch.set_num_threads(max(1,min(os.cpu_count(),8)))
         except Exception:
             pass
-    def _verify_model_integrity_initial(self):
+    def reload_perception(self):
+        try:self.perception=PerceptionEngine()
+        except Exception:pass
+    def models_ready(self):
+        ok=True
+        for p in [model_path]:
+            ok=ok and os.path.exists(p)
+        return ok
+    def update_model_ready_ui(self):
         try:
-            names=[n for n,_ in PolicyNet().named_parameters()]
-            has_conv=any(n.startswith("encoder.conv") for n in names)
-            has_fc=any(n.startswith("encoder.fc") for n in names)
-            count=sum(p.numel() for p in self.model.parameters())
-            if not (has_conv and has_fc) or count==0:
-                messagebox.showerror("模型错误","模型参数注册失败，已终止。");sys.exit(1)
+            if self.models_ready():
+                self.sleep_btn.configure(state="normal" if self.window_obj is not None else "disabled")
+            else:
+                self.sleep_btn.configure(state="disabled")
         except Exception:
             pass
     def _build_ui(self):
@@ -739,12 +765,12 @@ class App:
         mid=tk.Frame(self.root);mid.grid(row=1,column=0,sticky="nsew");mid.rowconfigure(0,weight=1);mid.columnconfigure(0,weight=1)
         self.frame_label=tk.Label(mid);self.frame_label.grid(row=0,column=0,sticky="nsew")
         stats=tk.Frame(self.root);stats.grid(row=2,column=0,sticky="ew")
-        for i in range(5):stats.columnconfigure(i,weight=1)
+        for i in range(6):stats.columnconfigure(i,weight=1)
         ttk.Label(stats,textvariable=self.cpu_var).grid(row=0,column=0,sticky="w")
         ttk.Label(stats,textvariable=self.mem_var).grid(row=0,column=1,sticky="w")
         ttk.Label(stats,textvariable=self.gpu_var).grid(row=0,column=2,sticky="w")
         ttk.Label(stats,textvariable=self.vram_var).grid(row=0,column=3,sticky="w")
-        ttk.Label(stats,textvariable=self.gpu_src_var).grid(row=0,column=4,sticky="e")
+        ttk.Label(stats,textvariable=self.gpu_src_var).grid(row=0,column=4,sticky="e");ttk.Label(stats,textvariable=self.freq_var).grid(row=0,column=5,sticky="e")
         control=tk.Frame(self.root);control.grid(row=3,column=0,sticky="ew");control.columnconfigure(0,weight=1);control.columnconfigure(1,weight=1)
         ttk.Label(control,textvariable=self.mode_var).grid(row=0,column=0,columnspan=2,sticky="w")
         self.sleep_btn=ttk.Button(control,text="Sleep",command=self.on_sleep,state="disabled");self.sleep_btn.grid(row=1,column=0,sticky="ew")
@@ -765,7 +791,7 @@ class App:
         if windows:
             self.window_obj=windows[0]
             self.window_state.set(f"Selected:{title}")
-            self._update_window_status()
+            self._update_window_status(force=True)
             self.buffer.clear()
             self.capture_enabled=True
             self.recording_enabled=True
@@ -787,12 +813,26 @@ class App:
                 return (int(r[0]),int(r[1]),int(r[2]),int(r[3]))
             except Exception:
                 return None
-    def _update_window_status(self):
+    def _pixel_occlusion_ratio(self,frame,hwnd,rect):
+        try:
+            import win32gui,win32ui,win32con
+            left,top,right,bottom=rect;w=max(1,right-left);h=max(1,bottom-top)
+            hdc=win32gui.GetWindowDC(hwnd);srcdc=win32ui.CreateDCFromHandle(hdc);memdc=srcdc.CreateCompatibleDC();bmp=win32ui.CreateBitmap();bmp.CreateCompatibleBitmap(srcdc,w,h);memdc.SelectObject(bmp)
+            PW_RENDERFULLCONTENT=0x00000002
+            ok=ctypes.windll.user32.PrintWindow(ctypes.wintypes.HWND(hwnd),memdc.GetSafeHdc(),PW_RENDERFULLCONTENT)
+            bits=bmp.GetBitmapBits(True);img=np.frombuffer(bits,dtype=np.uint8);img=img.reshape((h,w,4))[:,:,:3]
+            win32gui.ReleaseDC(hwnd,hdc);memdc.DeleteDC();srcdc.DeleteDC();win32gui.DeleteObject(bmp.GetHandle())
+            scr=cv2.resize(frame,(w,h)) if frame.shape[1]!=w or frame.shape[0]!=h else frame
+            d=cv2.absdiff(scr,img);m=(cv2.cvtColor(d,cv2.COLOR_BGR2GRAY)>5).astype(np.uint8);ratio=float(np.sum(m))/float(w*h)
+            if ok==0:ratio=1.0
+            return min(max(ratio,0.0),1.0)
+        except Exception:
+            return None
+    def _update_window_status(self,force=False):
         if self.window_obj is None:
             self.window_rect=None;self.window_visible=False;self.window_full=False;self.schedule(lambda:self.visible_var.set("可见: No window"));self.schedule(lambda:self.full_var.set("完整: No window"));return
         try:
-            import win32gui,win32con,win32api,win32process
-            WS_EX_LAYERED=0x00080000;WS_EX_TRANSPARENT=0x00000020
+            import win32gui,win32con
             self.window_obj.refresh();hwnd=self.window_obj._hWnd
             rect=self._get_ext_frame_rect(hwnd);self.window_rect=rect
             visible=False;full=False
@@ -821,12 +861,6 @@ class App:
                         while cur and cur!=0:
                             try:
                                 if win32gui.IsWindowVisible(cur) and not win32gui.IsIconic(cur):
-                                    ex=win32gui.GetWindowLong(cur,-20)
-                                    if (ex&WS_EX_LAYERED)!=0 or (ex&WS_EX_TRANSPARENT)!=0:
-                                        cur=win32gui.GetWindow(cur,win32con.GW_HWNDPREV);continue
-                                    cname=win32gui.GetClassName(cur)
-                                    if cname.lower() in ["shell_traywnd","multitaskingviewframe"]:
-                                        cur=win32gui.GetWindow(cur,win32con.GW_HWNDPREV);continue
                                     r2=self._get_ext_frame_rect(cur)
                                     if r2:
                                         over=_rect_intersection(rect,r2)
@@ -835,39 +869,14 @@ class App:
                             except Exception:
                                 pass
                             cur=win32gui.GetWindow(cur,win32con.GW_HWNDPREV)
-                        full=(work_area>0 and (occl_area/work_area)<=0.01)
+                        occluded_ratio=(occl_area/work_area) if work_area>0 else 1.0;full=(work_area>0 and occluded_ratio<=OCCLUSION_THR)
             self.window_visible=visible;self.window_full=full
-            if not self.window_visible or not self.window_full:
-                if self.mode!="learn":
-                    self._mouse_up_safety();self.buffer.clear();self.set_mode("learn")
             self.schedule(lambda v=self.window_visible:self.visible_var.set(f"可见: {'是' if v else '否'}"))
             self.schedule(lambda f=self.window_full:self.full_var.set(f"完整: {'是' if f else '否'}"))
-            if not self.window_visible or not self.window_full:self.schedule(lambda:self.pause_var.set("已暂停且 10 秒切换规则失效"))
-            else:
-                if self.metrics.get("freq",0)<=0:self.schedule(lambda:self.pause_var.set("已暂停且 10 秒切换规则暂时失效"))
-                else:self.schedule(lambda:self.pause_var.set(""))
         except Exception:
             self.window_rect=None;self.window_visible=False;self.window_full=False;self.schedule(lambda:self.visible_var.set("可见: Unknown"));self.schedule(lambda:self.full_var.set("完整: Unknown"))
     def schedule(self,func):
         if self.running:self.ui_queue.put(func)
-    def prompt_retry_or_local(self,name,url,reason,path_hint):
-        result=queue.Queue(maxsize=1)
-        def dialog():
-            top=tk.Toplevel(self.root);top.title(f"Model {name}")
-            ttk.Label(top,text=f"下载 {name} 失败：{reason}").grid(row=0,column=0,columnspan=3,sticky="w")
-            ttk.Label(top,text=f"可手动下载链接:").grid(row=1,column=0,sticky="w")
-            link=tk.Entry(top);link.insert(0,url);link.configure(state="readonly");link.grid(row=1,column=1,columnspan=2,sticky="ew")
-            ttk.Label(top,text=f"请将文件放到:").grid(row=2,column=0,sticky="w")
-            path=tk.Entry(top);path.insert(0,path_hint);path.configure(state="readonly");path.grid(row=2,column=1,columnspan=2,sticky="ew")
-            ttk.Label(top,text=f"超时45秒，最大重试{3}次，指数退避至30秒").grid(row=3,column=0,columnspan=3,sticky="w")
-            top.columnconfigure(1,weight=1)
-            def choose(val):
-                if result.empty():result.put(val);top.destroy()
-            ttk.Button(top,text="Open Link",command=lambda:choose("open")).grid(row=4,column=0,sticky="ew")
-            ttk.Button(top,text="Retry",command=lambda:choose("retry")).grid(row=4,column=1,sticky="ew")
-            ttk.Button(top,text="Local",command=lambda:choose("local")).grid(row=4,column=2,sticky="ew")
-            top.grab_set();top.protocol("WM_DELETE_WINDOW",lambda:choose("retry"))
-        self.schedule(dialog);return result.get()
     def _gpu_metrics_nvml(self):
         try:
             if _gpu_count>0:
@@ -920,7 +929,7 @@ class App:
             cpu=float(psutil.cpu_percent(interval=None));mem=float(psutil.virtual_memory().percent);gpu,mem_gpu,temp,pwr_ratio=self._gpu_metrics_ext()
             if self.gpu_source=="不可用":M=max(cpu,mem)/100.0
             else:M=max(cpu,mem,gpu,mem_gpu)/100.0
-            freq=max(0.0,100.0*(1.0-M));freq=min(freq,60.0)
+            freq=max(0.0,100.0*(1.0-M))
             self.metrics={"cpu":cpu,"mem":mem,"gpu":gpu,"vram":mem_gpu,"freq":freq,"temp":temp,"pwr":pwr_ratio}
             if freq>0:self.capture_interval=1.0/freq
             self.ai_interval=0.02+0.08*min(max(M,0.0),1.0)
@@ -936,7 +945,7 @@ class App:
                     if self.window_obj is not None:self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
             try:
                 if os.cpu_count():
-                    target_threads=max(1,int((1.0+0.0*(mem_gpu/100.0))*min(os.cpu_count(),max(1,int((1.0-M)*os.cpu_count())))))
+                    target_threads=max(1,int(min(os.cpu_count(),max(1,int((1.0-M)*os.cpu_count())))))
                     if target_threads!=last_threads:
                         torch.set_num_threads(target_threads);last_threads=target_threads
             except Exception:
@@ -965,7 +974,12 @@ class App:
                     if width>0 and height>0:
                         try:
                             shot=self.mss_ctx.grab({"left":left,"top":top,"width":width,"height":height});frame=np.array(shot);frame=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
-                            self._enqueue_drop(self.cap_queue,(frame,time.time()))
+                            now=time.time()
+                            if (now-self.last_occl_check>1.0 or not self.window_full) and self.window_visible:
+                                ratio=self._pixel_occlusion_ratio(frame,self.window_obj._hWnd,self.window_rect)
+                                if ratio is not None:
+                                    self.window_full=(ratio<=OCCLUSION_THR)
+                            self._enqueue_drop(self.cap_queue,(frame,now))
                         except Exception:
                             pass
                 else:
@@ -1000,7 +1014,7 @@ class App:
                 action=[0.0,0.0,0.0]
                 pos=[(center[0]-rect[0])/(rect[2]-rect[0]),(center[1]-rect[1])/(rect[3]-rect[1])]
                 source=1 if self.mode=="learn" else 2;title=self.window_obj.title if self.window_obj else ""
-                try:self.writer.record(frame,action,pos,source,rect,title,self.mode,"frame");self.buffer.add(frame,action,source,0,0,-1)
+                try:self.writer.record(frame,action,pos,source,rect,title,self.mode,"frame");self.buffer.add(frame,action,source,0,0,-1,self.perception.last_text)
                 except Exception:pass
             try:self.prep_queue.task_done()
             except Exception:pass
@@ -1009,15 +1023,16 @@ class App:
             self.frame_history.append(frame)
             if len(self.frame_history)>8:self.frame_history.pop(0)
     def _save_click_patches(self,frame,nx,ny):
-        H,W=frame.shape[:2];x=int(nx*W);y=int(ny*H);sz=max(16,min(H,W)//10);x1=max(0,x-sz);y1=max(0,y-sz);x2=min(W,x+sz);y2=min(H,y+sz)
-        pos=frame[y1:y2,x1:x2]
-        neg=None
-        for _ in range(10):
-            rx=random.randint(sz,W-sz-1);ry=random.randint(sz,H-sz-1)
-            if abs(rx-x)>2*sz and abs(ry-y)>2*sz:
-                neg=frame[ry-sz:ry+sz,rx-sz:rx+sz];break
-        ts=int(time.time()*1000)
         try:
+            clicks_dir=os.path.join(experience_dir,"clicks");os.makedirs(clicks_dir,exist_ok=True)
+            H,W=frame.shape[:2];x=int(nx*W);y=int(ny*H);sz=max(16,min(H,W)//10);x1=max(0,x-sz);y1=max(0,y-sz);x2=min(W,x+sz);y2=min(H,y+sz)
+            pos=frame[y1:y2,x1:x2]
+            neg=None
+            for _ in range(10):
+                rx=random.randint(sz,W-sz-1);ry=random.randint(sz,H-sz-1)
+                if abs(rx-x)>2*sz and abs(ry-y)>2*sz:
+                    neg=frame[ry-sz:ry+sz,rx-sz:rx+sz];break
+            ts=int(time.time()*1000)
             if pos is not None:cv2.imwrite(os.path.join(clicks_dir,f"pos_{ts}.png"),pos)
             if neg is not None:cv2.imwrite(os.path.join(clicks_dir,f"neg_{ts}.png"),neg)
         except Exception:
@@ -1032,20 +1047,16 @@ class App:
             if rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3]:
                 width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,0.0]
                 frame=self._current_frame_copy()
-                if frame is not None:self.writer.record(frame,action,[norm_x,norm_y],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"move");self.buffer.add(frame,action,1,1,0,-1)
+                if frame is not None:self.writer.record(frame,action,[norm_x,norm_y],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"move");self.buffer.add(frame,action,1,1,0,-1,self.perception.last_text)
     def _on_mouse_click(self,x,y,button,pressed):
         self.last_user_input=time.time()
-        if self.window_rect is not None:
-            rect=self.window_rect
-            inside=(rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3])
-        else:
-            inside=False
+        inside=False;rect=self.window_rect
+        if rect is not None:inside=(rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3])
         if pressed and self.mode=="learn" and self.window_visible and self.window_full and inside and self.recording_enabled and not self.resource_paused and self.capture_enabled:
             self.drag_active=True;self.drag_points=[(x,y,time.time())];self.drag_start=time.time()
             width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,1.0];frame=self._current_frame_copy()
             if frame is not None:
-                pid=self.pool.add_click(frame,rect,norm_x,norm_y)
-                self._save_click_patches(frame,norm_x,norm_y);self.writer.record(frame,action,[norm_x,norm_y],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"press",{"proto":int(pid)});self.buffer.add(frame,action,1,2,1,int(pid))
+                pid=self.pool.add_click(frame,rect,norm_x,norm_y);self._save_click_patches(frame,norm_x,norm_y);self.writer.record(frame,action,[norm_x,norm_y],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"press",{"proto":int(pid)});self.buffer.add(frame,action,1,2,1,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,1,np.zeros((64,),np.float32))
         if (not pressed) and self.drag_active:
             self.drag_active=False
             if self.window_rect is not None:
@@ -1055,8 +1066,7 @@ class App:
                     path=[((px-rect[0])/width,(py-rect[1])/height) for px,py in simp]
                     frame=self._current_frame_copy()
                     if frame is not None:
-                        pid=self.pool.add_drag(frame,rect,path)
-                        self.writer.record(frame,[0.0,0.0,0.0],path[-1],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"drag",{"path":path,"duration":time.time()-self.drag_start,"proto":int(pid)});self.buffer.add(frame,[0.0,0.0,0.0],1,5,2,int(pid))
+                        pid=self.pool.add_drag(frame,rect,path);self.writer.record(frame,[0.0,0.0,0.0],path[-1],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"drag",{"path":path,"duration":time.time()-self.drag_start,"proto":int(pid)});self.buffer.add(frame,[0.0,0.0,0.0],1,5,2,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,2,np.zeros((64,),np.float32))
     def _on_key_press(self,key):
         self.last_user_input=time.time()
         if key==keyboard.Key.esc:self.schedule(self.stop)
@@ -1076,17 +1086,15 @@ class App:
             rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);image=Image.fromarray(rgb);w=min(640,image.width);h=int(image.height*float(w)/float(image.width));image=image.resize((w,h))
             self.photo=ImageTk.PhotoImage(image=image);self.frame_label.configure(image=self.photo)
         else:self.frame_label.configure(image="")
-        self.cpu_var.set(f"CPU:{self.metrics['cpu']:.1f}%");self.mem_var.set(f"Memory:{self.metrics['mem']:.1f}%");self.gpu_var.set(f"GPU:{self.metrics['gpu']:.1f}%");self.vram_var.set(f"VRAM:{self.metrics['vram']:.1f}%");self.progress_text.set(f"{self.progress_var.get():.0f}%")
+        self.cpu_var.set(f"CPU:{self.metrics['cpu']:.1f}%");self.mem_var.set(f"Memory:{self.metrics['mem']:.1f}%");self.gpu_var.set(f"GPU:{self.metrics['gpu']:.1f}%");self.vram_var.set(f"VRAM:{self.metrics['vram']:.1f}%");self.freq_var.set(f"Capture:{self.metrics['freq']:.1f} Hz");self.progress_text.set(f"{self.progress_var.get():.0f}%")
         self.root.after(50,self._update_ui)
     def _check_mode_switch(self):
         if not self.resource_paused and self.mode=="learn" and self.recording_enabled and self.window_visible and self.window_full and self.capture_enabled:
             if time.time()-self.last_user_input>=10.0:self.set_mode("train")
         self.root.after(200,self._check_mode_switch)
     def _mouse_up_safety(self):
-        try:
-            pyautogui.mouseUp()
-        except Exception:
-            pass
+        try:pyautogui.mouseUp()
+        except Exception:pass
         self.hold_state=False
     def set_mode(self,mode):
         if not self.running:return
@@ -1130,19 +1138,17 @@ class App:
             if not self.hold_state and 0.5<click_prob<=0.7:pyautogui.click()
             frame=self._current_frame_copy()
             if frame is not None and self.recording_enabled and not self.resource_paused:
-                norm_x=(target_x-rect[0])/width;norm_y=(target_y-rect[1])/height;self.writer.record(frame,[dx,dy,click_prob],[norm_x,norm_y],2,rect,self.window_obj.title if self.window_obj else "",self.mode,"ai");self.buffer.add(frame,[dx,dy,click_prob],2,3,0,-1)
+                norm_x=(target_x-rect[0])/width;norm_y=(target_y-rect[1])/height;self.writer.record(frame,[dx,dy,click_prob],[norm_x,norm_y],2,rect,self.window_obj.title if self.window_obj else "",self.mode,"ai");self.buffer.add(frame,[dx,dy,click_prob],2,3,0,-1,self.perception.last_text)
             time.sleep(self.ai_interval)
     def _analyze_ui_async(self,frame):
         def worker(img):
             try:
-                dets,txt=self.perception.detect(img)
-                self.pool.update_state(txt)
+                dets,txt=self.perception.detect(img);self.pool.update_state(txt)
                 if dets and self.window_rect is not None:
                     rect=self.window_rect
                     for cx,cy,label,score in dets[:8]:
-                        self.writer.record(img,[0.0,0.0,0.0],[cx,cy],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"ui",{"label":label,"score":float(score)});self.buffer.add(img,[0.0,0.0,0.0],1,4,0,-1)
-                if txt:
-                    self.rule_text=txt
+                        self.writer.record(img,[0.0,0.0,0.0],[cx,cy],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"ui",{"label":label,"score":float(score)});self.buffer.add(img,[0.0,0.0,0.0],1,4,0,-1,txt)
+                if txt:self.rule_text=txt
             except Exception:
                 pass
         threading.Thread(target=worker,args=(frame.copy(),),daemon=True).start()
@@ -1151,6 +1157,16 @@ class App:
             self._mouse_up_safety();self.recording_enabled=False;self.getup_btn.configure(state="normal");self.sleep_btn.configure(state="disabled");self.progress_var.set(0.0);self.progress_text.set("0%");self.set_mode("optimize");self.optimize_event=threading.Event();self.optimize_thread=threading.Thread(target=self._optimize_loop,daemon=True);self.optimize_thread.start()
         else:
             self.pause_var.set("模型未就绪或资源受限，已暂停且 10 秒切换规则失效")
+    def _confirm_dialog(self):
+        q=queue.Queue(maxsize=1)
+        def dlg():
+            top=tk.Toplevel(self.root);top.title("Optimization Done")
+            ttk.Label(top,text="优化完成").grid(row=0,column=0,sticky="ew")
+            def ok():
+                if q.empty():q.put(True);top.destroy()
+            ttk.Button(top,text="Confirm",command=ok).grid(row=1,column=0,sticky="ew")
+            top.grab_set();top.protocol("WM_DELETE_WINDOW",ok)
+        self.schedule(dlg);q.get()
     def on_getup(self):
         if self.mode=="optimize" and self.optimize_event is not None:
             self.optimize_event.set();self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self._mouse_up_safety();self.set_mode("learn")
@@ -1159,17 +1175,17 @@ class App:
             a=seq_frames[-1].astype(np.float32);b=seq_frames[-2].astype(np.float32);diff=np.mean(np.abs(a-b))/255.0
         except Exception:
             diff=0.0
-        bonus=0.0
-        s=(txt or "").lower()
+        bonus=0.0;s=(txt or "").lower()
         if any(k in s for k in ["score","win","victory","complete","success","level"]):bonus+=1.0
         if any(k in s for k in ["fail","lose","game over","defeat"]):bonus-=1.0
-        return float(np.clip(diff*0.5+bonus, -1.0, 2.0))
+        m=re.findall(r"\d+",s)
+        if len(m)>=2:
+            try:
+                if int(m[-1])>int(m[-2]):bonus+=0.5
+            except Exception:
+                pass
+        return float(np.clip(diff*0.5+bonus,-1.0,2.0))
     def _optimize_loop(self):
-        total_params=sum(p.numel() for p in self.model.parameters())
-        if total_params==0:self.schedule(lambda:messagebox.showerror("优化失败","模型参数为0，已回退"));self.schedule(self._reset_after_opt_cancel);return
-        names=[n for n,_ in self.model.named_parameters()]
-        if not any(n.startswith("encoder.conv") for n in names) or not any(n.startswith("encoder.fc") for n in names):
-            self.schedule(lambda:messagebox.showerror("优化失败","未检测到Encoder卷积/全连接参数，已回退"));self.schedule(self._reset_after_opt_cancel);return
         backup=None
         try:
             if os.path.exists(model_path):backup=torch.load(model_path,map_location="cpu")
@@ -1179,21 +1195,13 @@ class App:
         ds=DiskExperienceDataset(experience_dir,seq=seq_len,aug=True)
         M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
         num_workers=max(0,min(6,os.cpu_count() or 2)-1)
-        bs=max(4,int(8+64*(1.0-M)))
-        if hot:bs=max(4,int(bs*0.5))
-        lr=1e-4*(0.5 if hot else 1.0)
+        bs=max(4,int(8+64*(1.0-M)));lr=1e-4*(0.5 if hot else 1.0)
         for g in self.optimizer.param_groups:g["lr"]=lr
         prefetch_factor=4
         dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=True,drop_last=True,persistent_workers=(num_workers>0),prefetch_factor=prefetch_factor if num_workers>0 else None)
-        epochs=3;step=0;total=max(1,(len(ds)//max(1,bs))*epochs)
-        vram=self.metrics["vram"]
-        accum_steps=4 if (vram<50 and M<0.3) else (2 if vram<70 else 1)
-        use_cl=(device=="cuda" and vram>=70)
-        self.model.train()
-        if use_cl:
-            for p in self.model.parameters():p.data=p.data.contiguous(memory_format=torch.channels_last)
-        zero_grad_steps=0
-        self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
+        epochs=3;total=max(1,(len(ds)//max(1,bs))*epochs);done_steps=0
+        self.model.train();best_loss=None;c_scores={}
+        start_time=time.time();self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
         for ep in range(epochs):
             if self.optimize_event.is_set():break
             it=iter(dl)
@@ -1201,39 +1209,33 @@ class App:
                 try:item=next(it)
                 except StopIteration:break
                 if self.optimize_event.is_set():break
-                if isinstance(item,tuple) and len(item)==5:
-                    seq,act,atype_t,ctrl_t,path_vec=item
+                if isinstance(item,tuple) and len(item)==7:
+                    seq,act,atype_t,ctrl_t,path_vec,texts,success=item
                 else:
-                    seq,act=item;atype_t=torch.zeros((seq.shape[0],),dtype=torch.long);ctrl_t=torch.full((seq.shape[0],),-1,dtype=torch.long);path_vec=torch.zeros((seq.shape[0],64),dtype=torch.float32)
+                    seq,act=item;atype_t=torch.zeros((seq.shape[0],),dtype=torch.long);ctrl_t=torch.full((seq.shape[0],),-1,dtype=torch.long);path_vec=torch.zeros((seq.shape[0],64),dtype=torch.float32);texts=[""]*seq.shape[0];success=torch.zeros((seq.shape[0],),dtype=torch.long)
                 sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
                 if sample is not None:
-                    frames_b,actions_b,_,events_b,atypes_b,ctrls_b=sample
+                    frames_b,actions_b,_,events_b,atypes_b,ctrls_b,txts_b=sample
                     seq_np=frames_b.astype(np.float32)
                     seq_t=torch.from_numpy(np.transpose(seq_np,(0,1,4,2,3))/255.0).to(device,non_blocking=True)
                     act_t=torch.from_numpy(actions_b).to(device,non_blocking=True)
                     atype_t=torch.from_numpy(atypes_b).to(device,non_blocking=True)
                     ctrl_t=torch.from_numpy(ctrls_b).to(device,non_blocking=True)
                     path_vec=torch.zeros((seq_t.shape[0],64),device=device,dtype=torch.float32)
+                    texts=list(txts_b);success=torch.tensor([1 if any(k in (t or "").lower() for k in ["win","victory","success","complete"]) else 0 for t in texts],device=device,dtype=torch.long)
                 else:
-                    seq_t=torch.from_numpy(np.transpose(seq.numpy(),(0,1,4,2,3))/255.0).to(device,non_blocking=True)
-                    act_t=act.to(device,non_blocking=True)
-                    atype_t=atype_t.to(device,non_blocking=True)
-                    ctrl_t=ctrl_t.to(device,non_blocking=True)
-                    path_vec=path_vec.to(device,non_blocking=True).float()
-                if use_cl:seq_t=seq_t.contiguous(memory_format=torch.channels_last)
-                self.model.train()
-                if step%accum_steps==0:self.optimizer.zero_grad(set_to_none=True)
-                protoM,id2idx=self.pool.matrix()
+                    seq_t=torch.from_numpy(np.transpose(seq.numpy(),(0,1,4,2,3))/255.0).to(device,non_blocking=True);act_t=act.to(device,non_blocking=True);atype_t=atype_t.to(device,non_blocking=True);ctrl_t=ctrl_t.to(device,non_blocking=True);path_vec=path_vec.to(device,non_blocking=True).float();success=success.to(device,non_blocking=True).long();texts=list(texts)
                 with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
                     logits,values,atype_logits,elem_emb,path_pred=self.model(seq_t)
                     loss_policy=F.mse_loss(logits,act_t)
                     with torch.no_grad():
                         seq_np=(seq_t.detach().float().cpu().numpy()*255.0).transpose(0,1,3,4,2)
-                        rewards=np.array([self._compute_reward(s,self.perception.last_text) for s in seq_np],dtype=np.float32)
+                        rewards=np.array([self._compute_reward(s,(texts[i] if i<len(texts) else "")) for i,s in enumerate(seq_np)],dtype=np.float32)
                         returns=torch.from_numpy(rewards).to(device)
                     loss_value=F.mse_loss(values,returns)
                     at_mask=(atype_t>=0)&(atype_t<=2)
                     loss_atype=F.cross_entropy(atype_logits[at_mask],atype_t[at_mask]) if at_mask.any() else torch.zeros((),device=device)
+                    protoM,id2idx=self.pool.matrix()
                     if protoM is not None and protoM.shape[0]>0:
                         if ctrl_t.dim()==0:ctrl_t=ctrl_t.unsqueeze(0)
                         map_idx=torch.full_like(ctrl_t,-1)
@@ -1242,90 +1244,44 @@ class App:
                                 cid=int(ctrl_t[i].item())
                                 if cid in id2idx:map_idx[i]=id2idx[cid]
                         c_mask=map_idx>=0
+                        loss_ctrl=torch.zeros((),device=device)
                         if c_mask.any():
                             sim=torch.matmul(elem_emb[c_mask],protoM.T)
                             loss_ctrl=F.cross_entropy(sim,map_idx[c_mask])
-                        else:
-                            loss_ctrl=torch.zeros((),device=device)
                     else:
                         loss_ctrl=torch.zeros((),device=device)
                     loss_path=F.mse_loss(path_pred,path_vec) if path_vec is not None else torch.zeros((),device=device)
-                    seq_prev=torch.cat([seq_t[:,:-1],seq_t[:,:1]],1)
-                    logits_prev,_,_,_,_=self.model(seq_prev)
-                    loss_cons=F.mse_loss(logits,logits_prev)
-                    loss=loss_policy+0.2*loss_value+0.5*loss_atype+0.5*loss_ctrl+0.2*loss_path+0.1*loss_cons
+                    goal_weight=torch.ones_like(values)
+                    try:
+                        gscores=self.goal_graph.granger()
+                        for i in range(ctrl_t.shape[0]):
+                            pid=int(ctrl_t[i].item())
+                            if pid in gscores:goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,gscores[pid])))
+                        c_scores=gscores
+                    except Exception:
+                        pass
+                    loss_value=(loss_value*goal_weight.mean()).mean()
+                    loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path
+                self.optimizer.zero_grad(set_to_none=True)
                 if scaler is not None:
-                    scaler.scale(loss/accum_steps).backward()
-                    if step%accum_steps==accum_steps-1:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(),1.0);scaler.step(self.optimizer);scaler.update()
+                    scaler.scale(loss).step(self.optimizer);scaler.update()
                 else:
-                    (loss/accum_steps).backward()
-                    if step%accum_steps==accum_steps-1:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(),1.0);self.optimizer.step()
-                gsum=0.0
-                for p in self.model.parameters():
-                    if p.grad is not None:gsum+=float(p.grad.detach().abs().sum().item())
-                zero_grad_steps=zero_grad_steps+1 if (gsum==0.0 and step%accum_steps==accum_steps-1) else 0
-                if zero_grad_steps>=5:
-                    if backup is not None:
-                        try:self.model.load_state_dict(backup,strict=False)
-                        except Exception:pass
-                    self.schedule(lambda:messagebox.showerror("优化中止","检测到连续零梯度，已回退至上次权重"));self.schedule(self._reset_after_opt_cancel);return
-                step+=1;progress=min(100.0,(step/max(total,1))*100.0);self.schedule(lambda v=progress:(self.progress_var.set(v),self.progress_text.set(f"{v:.0f}%")))
-        if not self.optimize_event.is_set():
-            try:torch.save(self.model.state_dict(),model_path)
-            except Exception:pass
-            self.optimize_thread=None;self.schedule(self._show_optimize_done)
-        else:
-            if backup is not None:
-                try:self.model.load_state_dict(backup,strict=False)
-                except Exception:pass
-            self.optimize_thread=None;self.schedule(self._reset_after_opt_cancel)
-    def _show_optimize_done(self):
-        dialog=tk.Toplevel(self.root);dialog.title("Optimization");ttk.Label(dialog,text="Optimization complete.").grid(row=0,column=0,sticky="ew")
-        def confirm():
-            dialog.destroy();self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self.set_mode("learn");self.optimize_event=None;self.optimize_thread=None;self.pause_var.set("")
-        ttk.Button(dialog,text="Confirm",command=confirm).grid(row=1,column=0,sticky="ew");dialog.grab_set()
-    def _reset_after_opt_cancel(self):
-        self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self._mouse_up_safety();self.set_mode("learn");self.optimize_event=None;self.optimize_thread=None;self.pause_var.set("")
+                    loss.backward();self.optimizer.step()
+                done_steps+=1;prog=100.0*min(1.0,done_steps/max(1,total));self.progress_var.set(prog)
+                if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
+                if self.optimize_event.is_set():break
+        try:torch.save(self.model.state_dict(),model_path)
+        except Exception:pass
+        self.progress_var.set(100.0);self._confirm_dialog();self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self.set_mode("learn");self.schedule(lambda:self.pause_var.set(""))
     def stop(self):
-        if not self.running:return
-        self.running=False;self._stop_ai()
-        if self.optimize_event is not None:self.optimize_event.set()
-        try:self._mouse_up_safety()
-        except Exception:pass
-        try:self.listener_mouse.stop()
-        except Exception:pass
-        try:self.listener_keyboard.stop()
+        self.running=False
+        try:self._stop_ai()
         except Exception:pass
         try:self.root.destroy()
         except Exception:pass
-        for t in [self.capture_thread,self.prep_thread,self.write_thread,self.monitor_thread,self.ai_thread,self.optimize_thread]:
-            try:
-                if t is not None and t.is_alive():t.join(timeout=1.5)
-            except Exception:
-                pass
-        try:self.mss_ctx.close()
-        except Exception:pass
-        try:sys.exit(0)
-        except Exception:os._exit(0)
-    def reload_perception(self):
-        global yolo_model,sam_predictor,ocr_engine,resnet_model,clip_model,vision_preprocess
-        yolo_model,sam_predictor,ocr_engine,resnet_model,clip_model,vision_preprocess=_safe_imports()
-        self.perception=PerceptionEngine()
-        self.pool=UIElementPool(clip_model,vision_preprocess)
-    def models_ready(self):
-        ok=os.path.exists(resnet_path) and os.path.exists(yolo_path) and os.path.exists(sam_path)
-        ok=ok and (self.perception is not None)
-        return bool(ok)
-    def update_model_ready_ui(self):
-        if self.models_ready():
-            self.pause_var.set("")
-            if self.window_obj is not None:self.sleep_btn.configure(state="normal")
-        else:
-            self.pause_var.set("模型未就绪，已暂停且 10 秒切换规则失效")
-            self.sleep_btn.configure(state="disabled")
     def run(self):
         self.root.mainloop()
+def main():
+    app=App();app.run()
 if __name__=="__main__":
-    App().run()
+    main()
