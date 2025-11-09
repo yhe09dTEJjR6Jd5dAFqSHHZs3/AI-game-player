@@ -64,7 +64,7 @@ os.makedirs(models_dir,exist_ok=True)
 os.makedirs(experience_dir,exist_ok=True)
 model_path=os.path.join(models_dir,"policy.pt")
 resnet_path=os.path.join(models_dir,"resnet18-f37072fd.pth")
-yolo_path=os.path.join(models_dir,"yolov8n.pt")
+yolo_path=os.path.join(models_dir,"yolo12n.pt")
 sam_path=os.path.join(models_dir,"sam_vit_b_01ec64.pth")
 device="cuda" if torch.cuda.is_available() else "cpu"
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
@@ -403,18 +403,6 @@ class PolicyNet(nn.Module):
         dy=torch.tanh(logits[:,1])
         click=torch.sigmoid(logits[:,2])
         return torch.stack([dx,dy,click],1),value,atype_logits,elem_emb,path_pred
-def generate_policy(path):
-    try:
-        net=PolicyNet()
-        torch.save(net.state_dict(),path)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-        return False
 class ModelSpec:
     def __init__(self,name,path,urls,generator,sha256=None,expected_size=None,max_retries=3):
         self.name=name
@@ -427,7 +415,7 @@ class ModelSpec:
 class ModelManager:
     def __init__(self,app):
         self.app=app
-        self.specs=[ModelSpec("policy",model_path,None,generate_policy,None,None,0),ModelSpec("resnet18",resnet_path,"https://download.pytorch.org/models/resnet18-f37072fd.pth",None,None,None,3),ModelSpec("yolov8n",yolo_path,["https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt","https://cdn.jsdelivr.net/gh/ultralytics/assets@main/yolov8/yolov8n.pt"],None,None,None,3),ModelSpec("sam_vit_b",sam_path,["https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth","https://huggingface.co/facebook/sam/resolve/main/sam_vit_b_01ec64.pth?download=true"],None,None,None,3)]
+        self.specs=[ModelSpec("resnet18",resnet_path,"https://download.pytorch.org/models/resnet18-f37072fd.pth",None,None,None,3),ModelSpec("yolo12n",yolo_path,"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo12n.pt",None,None,None,3),ModelSpec("sam_vit_b",sam_path,["https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth","https://huggingface.co/facebook/sam/resolve/main/sam_vit_b_01ec64.pth?download=true"],None,None,None,3)]
         self.retry_counts={}
     def ensure(self):
         threading.Thread(target=self._worker,daemon=True).start()
@@ -444,7 +432,7 @@ class ModelManager:
         try:
             if spec.name=="resnet18":
                 _=torch.load(spec.path,map_location="cpu");return True
-            if spec.name=="yolov8n":
+            if spec.name=="yolo12n":
                 from ultralytics import YOLO;_=YOLO(spec.path);return True
             if spec.name=="sam_vit_b":
                 from segment_anything import sam_model_registry;_=sam_model_registry.get("vit_b")(checkpoint=spec.path);return True
@@ -460,8 +448,8 @@ class ModelManager:
             messagebox.showerror("Error",msg)
         except Exception:
             pass
-    def _download(self,url,path,max_retries):
-        tmp=path+".download"
+    def _download(self,spec,url):
+        tmp=spec.path+".download"
         try:
             from requests.adapters import HTTPAdapter
             try:
@@ -469,7 +457,7 @@ class ModelManager:
             except Exception:
                 from urllib3.util import Retry
             sess=requests.Session()
-            retry=Retry(total=max(0,int(max_retries)),read=max(0,int(max_retries)),connect=max(0,int(max_retries)),backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=frozenset(["GET","HEAD"]))
+            retry=Retry(total=max(0,int(spec.max_retries)),read=max(0,int(spec.max_retries)),connect=max(0,int(spec.max_retries)),backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=frozenset(["GET","HEAD"]))
             sess.mount("http://",HTTPAdapter(max_retries=retry))
             sess.mount("https://",HTTPAdapter(max_retries=retry))
             headers={}
@@ -481,35 +469,69 @@ class ModelManager:
                         headers["Range"]=f"bytes={exist}-"
                 except Exception:
                     exist=0
-            t0=time.time();bytes0=exist
-            with sess.get(url,timeout=45,stream=True,headers=headers) as r:
+            start_total=time.time()
+            self.app.schedule(lambda n=spec.name,f=os.path.basename(spec.path):self.app.start_download_ui(n,f,0.0))
+            with sess.get(url,timeout=(10,180),stream=True,headers=headers) as r:
                 if r.status_code in (200,206):
                     mode="ab" if "Range" in headers and r.status_code==206 else "wb"
                     if mode=="wb" and os.path.exists(tmp):
                         try:os.remove(tmp)
                         except Exception:pass
+                    total_size=None
+                    if "Content-Range" in r.headers:
+                        try:
+                            total_size=int(r.headers["Content-Range"].rsplit("/",1)[-1])
+                        except Exception:
+                            total_size=None
+                    if total_size is None and "Content-Length" in r.headers:
+                        try:
+                            part=int(r.headers["Content-Length"])
+                            total_size=(exist if r.status_code==206 and exist>0 else 0)+part
+                        except Exception:
+                            total_size=None
+                    if total_size is None and spec.expected_size:total_size=spec.expected_size
+                    downloaded=exist
+                    last_time=time.time()
+                    last_mark=downloaded
+                    if total_size and total_size>0:
+                        percent=min(100.0,downloaded*100.0/total_size)
+                        self.app.schedule(lambda n=spec.name,p=percent:self.app.update_download_ui(n,p,0.0))
                     with open(tmp,mode) as f:
                         for chunk in r.iter_content(65536):
-                            if chunk:
-                                f.write(chunk)
-                                t=time.time()
-                                if t-t0>=1.0:
-                                    sz=os.path.getsize(tmp);spd=(sz-bytes0)/(t-t0);self.app.schedule(lambda s=int(spd):self.app.pause_var.set(f"下载中 {os.path.basename(path)} {s}B/s(超时45秒)"));t0=t;bytes0=sz
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded+=len(chunk)
+                            now=time.time()
+                            if now-start_total>180:
+                                raise TimeoutError("下载超时180秒")
+                            if total_size and total_size>0:
+                                percent=min(100.0,downloaded*100.0/total_size)
+                                if now-last_time>=0.2:
+                                    speed=(downloaded-last_mark)/(now-last_time) if now>last_time else 0.0
+                                    last_time=now
+                                    last_mark=downloaded
+                                    self.app.schedule(lambda n=spec.name,p=percent,s=speed:self.app.update_download_ui(n,p,s))
                     size=os.path.getsize(tmp)
                     if size<=0:
                         try:os.remove(tmp)
                         except Exception:pass
                         return False,"下载大小为0"
-                    os.replace(tmp,path)
+                    if total_size and total_size>0:
+                        self.app.schedule(lambda n=spec.name:self.app.update_download_ui(n,100.0,0.0))
+                    os.replace(tmp,spec.path)
                     return True,""
-                else:
-                    return False,f"HTTP {r.status_code}"
+                return False,f"HTTP {r.status_code}"
         except Exception as e:
             try:
                 if os.path.exists(tmp):os.remove(tmp)
             except Exception:
                 pass
+            if isinstance(e,TimeoutError):
+                return False,"下载超时180秒"
             return False,str(e)
+        finally:
+            self.app.schedule(self.app.finish_download_ui)
     def prompt_retry_or_local(self,name,url,reason,path_hint):
         result=queue.Queue(maxsize=1)
         def dialog():
@@ -519,7 +541,7 @@ class ModelManager:
             link=tk.Entry(top);link.insert(0,url);link.configure(state="readonly");link.grid(row=1,column=1,columnspan=2,sticky="ew")
             ttk.Label(top,text=f"请将文件放到:").grid(row=2,column=0,sticky="w")
             path=tk.Entry(top);path.insert(0,path_hint);path.configure(state="readonly");path.grid(row=2,column=1,columnspan=2,sticky="ew")
-            ttk.Label(top,text=f"超时45秒，最大重试{3}次").grid(row=3,column=0,columnspan=3,sticky="w")
+            ttk.Label(top,text=f"超时180秒，最大重试{3}次").grid(row=3,column=0,columnspan=3,sticky="w")
             top.columnconfigure(1,weight=1)
             def choose(val):
                 if result.empty():result.put(val);top.destroy()
@@ -554,8 +576,8 @@ class ModelManager:
                 ok_any=False;last_reason=""
                 for url in spec.urls:
                     try:
-                        self.app.schedule(lambda n=spec.name,a=attempt,m=spec.max_retries:self.app.pause_var.set(f"正在下载 {n} 第{a}次尝试"))
-                        ok,reason=self._download(url,spec.path,spec.max_retries)
+                        self.app.schedule(lambda n=spec.name,a=attempt,m=spec.max_retries:self.app.pause_var.set(f"正在下载 {n} 第{a}次尝试 (超时180秒)"))
+                        ok,reason=self._download(spec,url)
                         if ok:
                             if spec.expected_size and os.path.getsize(spec.path)!=spec.expected_size:
                                 raise RuntimeError("文件大小校验失败")
@@ -694,6 +716,27 @@ class App:
     def __init__(self):
         self.root=tk.Tk()
         self.root.title("Game AI")
+        self.colors={"bg":"#0b1120","panel":"#111c2f","accent":"#38bdf8","text":"#e2e8f0","muted":"#64748b"}
+        self.style=ttk.Style(self.root)
+        try:self.style.theme_use("clam")
+        except Exception:pass
+        self.root.configure(bg=self.colors["bg"])
+        for s in ["TFrame","Main.TFrame","Panel.TFrame","Stats.TFrame"]:
+            self.style.configure(s,background=self.colors["panel"])
+        self.style.configure("Panel.TLabelframe",background=self.colors["panel"],foreground=self.colors["accent"],bordercolor=self.colors["panel"],lightcolor=self.colors["panel"],darkcolor=self.colors["panel"])
+        self.style.configure("Panel.TLabelframe.Label",background=self.colors["panel"],foreground=self.colors["accent"],font=("Segoe UI",11,"bold"))
+        self.style.configure("TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=("Segoe UI",10))
+        self.style.configure("Stats.TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=("Segoe UI",10))
+        self.style.configure("Title.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=("Segoe UI",12,"bold"))
+        self.style.configure("Accent.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=("Segoe UI",10,"bold"))
+        self.style.configure("Muted.TLabel",background=self.colors["panel"],foreground=self.colors["muted"],font=("Segoe UI",9))
+        self.style.configure("Secondary.TButton",background="#1f2937",foreground=self.colors["text"],padding=6)
+        self.style.map("Secondary.TButton",background=[("active","#334155"),("disabled","#1e293b")],foreground=[("disabled","#475569")])
+        self.style.configure("Accent.TButton",background=self.colors["accent"],foreground="#0f172a",padding=6)
+        self.style.map("Accent.TButton",background=[("active","#0ea5e9"),("disabled","#1e293b")],foreground=[("disabled","#1f2937")])
+        self.style.configure("Accent.Horizontal.TProgressbar",background=self.colors["accent"],troughcolor="#1f2937",bordercolor="#1f2937",lightcolor=self.colors["accent"],darkcolor=self.colors["accent"])
+        self.style.configure("TCombobox",fieldbackground=self.colors["panel"],background=self.colors["panel"],foreground=self.colors["text"])
+        self.style.map("TCombobox",fieldbackground=[("readonly",self.colors["panel"])],foreground=[("readonly",self.colors["text"])])
         if device!="cuda":
             try:self.root.after(100,lambda:messagebox.showwarning("GPU不可用","未检测到可用的GPU，将使用CPU运行"))
             except Exception:pass
@@ -738,6 +781,8 @@ class App:
         self.freq_var=tk.StringVar(value="Capture:0.0 Hz")
         self.progress_var=tk.DoubleVar(value=0.0)
         self.progress_text=tk.StringVar(value="0%")
+        self.current_download=None
+        self.download_title=""
         self.last_user_input=time.time()
         self.window_obj=None
         self.window_rect=None
@@ -792,10 +837,7 @@ class App:
         try:self.perception=PerceptionEngine()
         except Exception:pass
     def models_ready(self):
-        ok=True
-        for p in [model_path]:
-            ok=ok and os.path.exists(p)
-        return ok
+        return all(os.path.exists(p) for p in [resnet_path,yolo_path,sam_path])
     def update_model_ready_ui(self):
         try:
             if self.models_ready():
@@ -806,32 +848,97 @@ class App:
             pass
     def _build_ui(self):
         self.root.columnconfigure(0,weight=1)
-        top=tk.Frame(self.root);top.grid(row=0,column=0,sticky="nsew");top.columnconfigure(1,weight=1)
-        ttk.Label(top,text="Window:").grid(row=0,column=0,sticky="w")
-        self.window_combo=ttk.Combobox(top,textvariable=self.selected_title,state="readonly",width=50);self.window_combo.grid(row=0,column=1,sticky="ew")
-        ttk.Button(top,text="Refresh",command=self.refresh_windows).grid(row=0,column=2,sticky="ew")
-        ttk.Button(top,text="Select",command=self.select_window).grid(row=0,column=3,sticky="ew")
-        ttk.Label(top,textvariable=self.window_state).grid(row=1,column=0,columnspan=2,sticky="w")
-        ttk.Label(top,textvariable=self.visible_var).grid(row=1,column=2,sticky="e")
-        ttk.Label(top,textvariable=self.full_var).grid(row=1,column=3,sticky="e")
-        mid=tk.Frame(self.root);mid.grid(row=1,column=0,sticky="nsew");mid.rowconfigure(0,weight=1);mid.columnconfigure(0,weight=1)
-        self.frame_label=tk.Label(mid);self.frame_label.grid(row=0,column=0,sticky="nsew")
-        stats=tk.Frame(self.root);stats.grid(row=2,column=0,sticky="ew")
-        for i in range(6):stats.columnconfigure(i,weight=1)
-        ttk.Label(stats,textvariable=self.cpu_var).grid(row=0,column=0,sticky="w")
-        ttk.Label(stats,textvariable=self.mem_var).grid(row=0,column=1,sticky="w")
-        ttk.Label(stats,textvariable=self.gpu_var).grid(row=0,column=2,sticky="w")
-        ttk.Label(stats,textvariable=self.vram_var).grid(row=0,column=3,sticky="w")
-        ttk.Label(stats,textvariable=self.gpu_src_var).grid(row=0,column=4,sticky="e");ttk.Label(stats,textvariable=self.freq_var).grid(row=0,column=5,sticky="e")
-        control=tk.Frame(self.root);control.grid(row=3,column=0,sticky="ew");control.columnconfigure(0,weight=1);control.columnconfigure(1,weight=1)
-        ttk.Label(control,textvariable=self.mode_var).grid(row=0,column=0,columnspan=2,sticky="w")
-        self.sleep_btn=ttk.Button(control,text="Sleep",command=self.on_sleep,state="disabled");self.sleep_btn.grid(row=1,column=0,sticky="ew")
-        self.getup_btn=ttk.Button(control,text="Get Up",command=self.on_getup,state="disabled");self.getup_btn.grid(row=1,column=1,sticky="ew")
-        prog_row=tk.Frame(control);prog_row.grid(row=2,column=0,columnspan=2,sticky="ew");prog_row.columnconfigure(0,weight=1)
-        self.progress=ttk.Progressbar(prog_row,variable=self.progress_var,maximum=100);self.progress.grid(row=0,column=0,sticky="ew")
-        ttk.Label(prog_row,textvariable=self.progress_text,width=6).grid(row=0,column=1,sticky="e")
-        ttk.Label(self.root,textvariable=self.pause_var,foreground="#888").grid(row=4,column=0,sticky="w")
+        self.root.rowconfigure(0,weight=1)
+        container=ttk.Frame(self.root,style="Main.TFrame",padding=16)
+        container.grid(row=0,column=0,sticky="nsew")
+        container.columnconfigure(0,weight=1)
+        container.rowconfigure(1,weight=1)
+        header=ttk.Frame(container,style="Panel.TFrame")
+        header.grid(row=0,column=0,sticky="ew")
+        header.columnconfigure(1,weight=1)
+        ttk.Label(header,text="目标窗口",style="Title.TLabel").grid(row=0,column=0,sticky="w")
+        state_row=ttk.Frame(header,style="Panel.TFrame")
+        state_row.grid(row=1,column=0,columnspan=4,sticky="ew",pady=(6,0))
+        state_row.columnconfigure(0,weight=1)
+        state_row.columnconfigure(1,weight=1)
+        state_row.columnconfigure(2,weight=1)
+        ttk.Label(state_row,textvariable=self.window_state,style="Stats.TLabel").grid(row=0,column=0,sticky="w")
+        ttk.Label(state_row,textvariable=self.visible_var,style="Stats.TLabel").grid(row=0,column=1,sticky="e")
+        ttk.Label(state_row,textvariable=self.full_var,style="Stats.TLabel").grid(row=0,column=2,sticky="e")
+        control_row=ttk.Frame(header,style="Panel.TFrame")
+        control_row.grid(row=2,column=0,columnspan=4,sticky="ew",pady=(8,0))
+        control_row.columnconfigure(1,weight=1)
+        ttk.Label(control_row,text="窗口列表",style="Stats.TLabel").grid(row=0,column=0,sticky="w")
+        self.window_combo=ttk.Combobox(control_row,textvariable=self.selected_title,state="readonly",width=45)
+        self.window_combo.grid(row=0,column=1,sticky="ew",padx=(8,8))
+        ttk.Button(control_row,text="刷新",command=self.refresh_windows,style="Secondary.TButton").grid(row=0,column=2,sticky="ew")
+        ttk.Button(control_row,text="选择",command=self.select_window,style="Accent.TButton").grid(row=0,column=3,sticky="ew",padx=(8,0))
+        preview=ttk.Labelframe(container,text="窗口画面",style="Panel.TLabelframe",padding=12)
+        preview.grid(row=1,column=0,sticky="nsew",pady=(12,12))
+        preview.columnconfigure(0,weight=1)
+        preview.rowconfigure(0,weight=1)
+        self.frame_label=tk.Label(preview,background=self.colors["panel"],borderwidth=0,highlightthickness=0)
+        self.frame_label.grid(row=0,column=0,sticky="nsew")
+        bottom=ttk.Frame(container,style="Panel.TFrame")
+        bottom.grid(row=2,column=0,sticky="ew")
+        bottom.columnconfigure(0,weight=2)
+        bottom.columnconfigure(1,weight=1)
+        stats=ttk.Frame(bottom,style="Stats.TFrame")
+        stats.grid(row=0,column=0,sticky="ew",padx=(0,12))
+        for i in range(3):stats.columnconfigure(i,weight=1)
+        ttk.Label(stats,textvariable=self.cpu_var,style="Stats.TLabel").grid(row=0,column=0,sticky="w")
+        ttk.Label(stats,textvariable=self.mem_var,style="Stats.TLabel").grid(row=0,column=1,sticky="w")
+        ttk.Label(stats,textvariable=self.gpu_var,style="Stats.TLabel").grid(row=0,column=2,sticky="w")
+        ttk.Label(stats,textvariable=self.vram_var,style="Stats.TLabel").grid(row=1,column=0,sticky="w",pady=(6,0))
+        ttk.Label(stats,textvariable=self.gpu_src_var,style="Muted.TLabel").grid(row=1,column=1,sticky="w",pady=(6,0))
+        ttk.Label(stats,textvariable=self.freq_var,style="Accent.TLabel").grid(row=1,column=2,sticky="e",pady=(6,0))
+        control=ttk.Labelframe(bottom,text="AI 控制",style="Panel.TLabelframe",padding=12)
+        control.grid(row=0,column=1,sticky="ew")
+        control.columnconfigure(0,weight=1)
+        control.columnconfigure(1,weight=1)
+        ttk.Label(control,textvariable=self.mode_var,style="Title.TLabel").grid(row=0,column=0,columnspan=2,sticky="w")
+        self.sleep_btn=ttk.Button(control,text="Sleep",command=self.on_sleep,state="disabled",style="Accent.TButton")
+        self.sleep_btn.grid(row=1,column=0,sticky="ew",pady=(10,0))
+        self.getup_btn=ttk.Button(control,text="Get Up",command=self.on_getup,state="disabled",style="Secondary.TButton")
+        self.getup_btn.grid(row=1,column=1,sticky="ew",padx=(10,0),pady=(10,0))
+        prog_row=ttk.Frame(control,style="Panel.TFrame")
+        prog_row.grid(row=2,column=0,columnspan=2,sticky="ew",pady=(12,0))
+        prog_row.columnconfigure(0,weight=1)
+        self.progress=ttk.Progressbar(prog_row,variable=self.progress_var,maximum=100,style="Accent.Horizontal.TProgressbar")
+        self.progress.grid(row=0,column=0,sticky="ew")
+        ttk.Label(prog_row,textvariable=self.progress_text,style="Accent.TLabel",width=6).grid(row=0,column=1,sticky="e",padx=(8,0))
+        footer=ttk.Frame(container,style="Panel.TFrame")
+        footer.grid(row=3,column=0,sticky="ew",pady=(10,0))
+        ttk.Label(footer,textvariable=self.pause_var,style="Muted.TLabel").grid(row=0,column=0,sticky="w")
         self.refresh_windows()
+    def _format_speed(self,speed):
+        try:
+            v=float(speed)
+            units=["B/s","KB/s","MB/s","GB/s"]
+            idx=0
+            while v>=1024.0 and idx<len(units)-1:
+                v/=1024.0
+                idx+=1
+            return f"{v:.1f} {units[idx]}" if v>0 else "0 B/s"
+        except Exception:
+            return "0 B/s"
+    def start_download_ui(self,name,filename,percent):
+        self.current_download=name
+        self.download_title=f"{name} - {filename}"
+        self.progress_var.set(max(0.0,min(100.0,float(percent))))
+        self.progress_text.set(f"{self.progress_var.get():.0f}%")
+        self.pause_var.set(f"下载 {self.download_title} (超时180秒)")
+    def update_download_ui(self,name,percent,speed):
+        if getattr(self,"current_download",None)!=name:return
+        p=max(0.0,min(100.0,float(percent)))
+        self.progress_var.set(p)
+        self.progress_text.set(f"{p:.0f}%")
+        self.pause_var.set(f"下载 {self.download_title} {p:.1f}% {self._format_speed(speed)} (超时180秒)")
+    def finish_download_ui(self):
+        self.current_download=None
+        self.download_title=""
+        self.progress_var.set(0.0)
+        self.progress_text.set("0%")
     def refresh_windows(self):
         titles=[w.title for w in gw.getAllWindows() if w.title.strip()]
         self.window_combo["values"]=titles
