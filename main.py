@@ -31,6 +31,10 @@ LWA_ALPHA=0x2
 GWL_EXSTYLE=-20
 GW_HWNDPREV=3
 PW_RENDERFULLCONTENT=0x00000002
+class WINDOWINFO(ctypes.Structure):
+    _fields_=[("cbSize",ctypes.wintypes.DWORD),("rcWindow",ctypes.wintypes.RECT),("rcClient",ctypes.wintypes.RECT),("dwStyle",ctypes.wintypes.DWORD),("dwExStyle",ctypes.wintypes.DWORD),("dwWindowStatus",ctypes.wintypes.DWORD),("cxWindowBorders",ctypes.wintypes.UINT),("cyWindowBorders",ctypes.wintypes.UINT),("atomWindowType",ctypes.wintypes.ATOM),("wCreatorVersion",ctypes.wintypes.WORD)]
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_=[("length",ctypes.wintypes.UINT),("flags",ctypes.wintypes.UINT),("showCmd",ctypes.wintypes.UINT),("ptMinPosition",ctypes.wintypes.POINT),("ptMaxPosition",ctypes.wintypes.POINT),("rcNormalPosition",ctypes.wintypes.RECT)]
 pyautogui.FAILSAFE=False
 pyautogui.PAUSE=0.0
 pyautogui.MINIMUM_DURATION=0.0
@@ -853,27 +857,47 @@ class App:
         try:
             if hwnd is None:
                 return None
+            hwnd_int=int(hwnd)
             rect=ctypes.wintypes.RECT()
+            h=ctypes.wintypes.HWND(hwnd_int)
             if dwmapi is not None:
                 try:
                     DWMWA_EXTENDED_FRAME_BOUNDS=9
-                    if dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(int(hwnd)),ctypes.c_int(DWMWA_EXTENDED_FRAME_BOUNDS),ctypes.byref(rect),ctypes.sizeof(rect))==0:
+                    if dwmapi.DwmGetWindowAttribute(h,ctypes.c_int(DWMWA_EXTENDED_FRAME_BOUNDS),ctypes.byref(rect),ctypes.sizeof(rect))==0 and rect.right>rect.left and rect.bottom>rect.top:
                         return (rect.left,rect.top,rect.right,rect.bottom)
                 except Exception:
                     pass
             try:
-                if user32 is not None and user32.GetWindowRect(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(rect))!=0:
+                if user32 is not None and user32.GetWindowRect(h,ctypes.byref(rect))!=0 and rect.right>rect.left and rect.bottom>rect.top:
                     return (rect.left,rect.top,rect.right,rect.bottom)
             except Exception:
                 pass
             try:
+                info=WINDOWINFO()
+                info.cbSize=ctypes.sizeof(info)
+                if user32 is not None and user32.GetWindowInfo(h,ctypes.byref(info))!=0:
+                    left=int(info.rcWindow.left);top=int(info.rcWindow.top);right=int(info.rcWindow.right);bottom=int(info.rcWindow.bottom)
+                    if right>left and bottom>top:
+                        return (left,top,right,bottom)
+            except Exception:
+                pass
+            try:
+                placement=WINDOWPLACEMENT()
+                placement.length=ctypes.sizeof(placement)
+                if user32 is not None and user32.GetWindowPlacement(h,ctypes.byref(placement))!=0:
+                    rc=placement.rcNormalPosition
+                    left=int(rc.left);top=int(rc.top);right=int(rc.right);bottom=int(rc.bottom)
+                    if right>left and bottom>top:
+                        return (left,top,right,bottom)
+            except Exception:
+                pass
+            try:
                 rc=ctypes.wintypes.RECT()
-                if user32 is not None and user32.GetClientRect(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(rc))!=0:
-                    pt1=ctypes.wintypes.POINT(rc.left,rc.top)
-                    pt2=ctypes.wintypes.POINT(rc.right,rc.bottom)
-                    user32.ClientToScreen(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(pt1))
-                    user32.ClientToScreen(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(pt2))
-                    return (pt1.x,pt1.y,pt2.x,pt2.y)
+                if user32 is not None and user32.GetClientRect(h,ctypes.byref(rc))!=0:
+                    pt1=ctypes.wintypes.POINT(rc.left,rc.top);pt2=ctypes.wintypes.POINT(rc.right,rc.bottom)
+                    user32.ClientToScreen(h,ctypes.byref(pt1));user32.ClientToScreen(h,ctypes.byref(pt2))
+                    if pt2.x>pt1.x and pt2.y>pt1.y:
+                        return (pt1.x,pt1.y,pt2.x,pt2.y)
             except Exception:
                 pass
             try:
