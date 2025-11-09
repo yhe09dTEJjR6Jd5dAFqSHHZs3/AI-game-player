@@ -64,6 +64,50 @@ else:
     dwmapi=None
     user32=None
     gdi32=None
+
+def _list_visible_windows():
+    windows=[]
+    seen=set()
+    if user32 is not None:
+        EnumProc=ctypes.WINFUNCTYPE(ctypes.c_bool,ctypes.wintypes.HWND,ctypes.wintypes.LPARAM)
+        def callback(hwnd,_):
+            if user32.IsWindowVisible(hwnd)==0:
+                return True
+            length=user32.GetWindowTextLengthW(hwnd)
+            if length==0:
+                return True
+            buf=ctypes.create_unicode_buffer(length+1)
+            user32.GetWindowTextW(hwnd,buf,length+1)
+            title=buf.value.strip()
+            if not title:
+                return True
+            rect=ctypes.wintypes.RECT()
+            if user32.GetWindowRect(hwnd,ctypes.byref(rect))==0:
+                return True
+            if rect.right<=rect.left or rect.bottom<=rect.top:
+                return True
+            handle=int(hwnd)
+            if handle not in seen:
+                seen.add(handle)
+                windows.append((title,handle))
+            return True
+        try:
+            user32.EnumWindows(EnumProc(callback),0)
+        except Exception:
+            windows=[]
+    if not windows:
+        try:
+            for w in gw.getAllWindows():
+                title=w.title.strip()
+                if title:
+                    handle=int(getattr(w,"_hWnd",0))
+                    if handle not in seen:
+                        seen.add(handle)
+                        windows.append((title,handle))
+        except Exception:
+            pass
+    windows.sort(key=lambda x:x[0].lower())
+    return windows
 home=os.path.expanduser("~")
 base_dir=os.path.join(home,"Desktop","GameAI")
 models_dir=os.path.join(base_dir,"models")
@@ -210,6 +254,8 @@ class ExperienceWriter:
         os.makedirs(self.train_dir,exist_ok=True)
         self.lock=threading.Lock()
         self.max_bytes=int(max_bytes)
+        self.latest_learn=os.path.join(root_dir,"latest_learn.jpg")
+        self.latest_train=os.path.join(root_dir,"latest_train.jpg")
     def _subdir(self,base,ts_ms):
         dt=datetime.datetime.fromtimestamp(ts_ms/1000.0)
         d=os.path.join(base,dt.strftime("%Y%m%d"),dt.strftime("%H"))
@@ -221,8 +267,10 @@ class ExperienceWriter:
             files=[]
             for root,_,fns in os.walk(self.root_dir):
                 for fn in fns:
-                    if fn.endswith(".npz"):
+                    if fn.endswith(".npz") or fn.endswith(".jpg"):
                         p=os.path.join(root,fn)
+                        if p in (self.latest_learn,self.latest_train):
+                            continue
                         try:
                             s=os.path.getsize(p)
                             total+=s
@@ -258,9 +306,18 @@ class ExperienceWriter:
         name=os.path.join(target_dir,f"{data['time']}_{int(source)}.npz")
         with self.lock:
             try:
-                ok,buf=cv2.imencode(".jpg",arr,[int(cv2.IMWRITE_JPEG_QUALITY),85])
+                ok,buf=cv2.imencode(".jpg",arr,[int(cv2.IMWRITE_JPEG_QUALITY),90])
                 if ok:
                     np.savez_compressed(name,frame_jpg=buf,meta=json.dumps(data,ensure_ascii=False))
+                    jpg_bytes=buf.tobytes()
+                    try:
+                        with open(name.replace(".npz",".jpg"),"wb") as jf:
+                            jf.write(jpg_bytes)
+                        preview_path=self.latest_learn if int(source)==1 else self.latest_train
+                        with open(preview_path,"wb") as pf:
+                            pf.write(jpg_bytes)
+                    except Exception:
+                        pass
                 else:
                     np.savez_compressed(name,frame=arr,meta=json.dumps(data,ensure_ascii=False))
                 self._ensure_quota()
@@ -793,8 +850,10 @@ class App:
         self.download_title=""
         self.last_user_input=time.time()
         self.window_obj=None
+        self.window_entries=[]
         self.window_rect=None
         self.window_hwnd=None
+        self.window_title=""
         self.window_visible=False
         self.window_full=False
         self.window_occ_state=0
@@ -853,7 +912,7 @@ class App:
     def update_model_ready_ui(self):
         try:
             if self.models_ready():
-                self.sleep_btn.configure(state="normal" if self.window_obj is not None else "disabled")
+                self.sleep_btn.configure(state="normal" if self.window_hwnd is not None else "disabled")
             else:
                 self.sleep_btn.configure(state="disabled")
         except Exception:
@@ -952,26 +1011,51 @@ class App:
         self.progress_var.set(0.0)
         self.progress_text.set("0%")
     def refresh_windows(self):
-        titles=[w.title for w in gw.getAllWindows() if w.title.strip()]
-        self.window_combo["values"]=titles
-        if titles and not self.selected_title.get():
-            self.selected_title.set(titles[0])
+        entries=_list_visible_windows()
+        self.window_entries=[{"title":title,"hwnd":hwnd,"display":f"{title} (0x{hwnd:08X})"} for title,hwnd in entries]
+        values=[entry["display"] for entry in self.window_entries]
+        self.window_combo["values"]=values
+        if values:
+            current_display=None
+            if self.window_hwnd is not None:
+                for entry in self.window_entries:
+                    if entry["hwnd"]==self.window_hwnd:
+                        current_display=entry["display"]
+                        break
+            if current_display:
+                self.selected_title.set(current_display)
+            elif self.selected_title.get() not in values:
+                self.selected_title.set(values[0])
+        else:
+            self.selected_title.set("")
     def select_window(self):
-        title=self.selected_title.get()
-        windows=[w for w in gw.getAllWindows() if w.title==title]
-        if windows:
-            self.window_obj=windows[0]
-            try:self.window_hwnd=int(self.window_obj._hWnd)
-            except Exception:self.window_hwnd=None
-            self.window_state.set(f"Selected:{title}")
-            self._update_window_status(force=True)
-            self.buffer.clear()
-            self.capture_enabled=True
-            self.recording_enabled=True
-            self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
-            self.getup_btn.configure(state="disabled")
-            self.pause_var.set("" if self.models_ready() else "模型未就绪，已暂停且 10 秒切换规则失效")
-            self.set_mode("learn")
+        display=self.selected_title.get()
+        entry=None
+        for item in self.window_entries:
+            if item["display"]==display:
+                entry=item
+                break
+        if entry is None:
+            self.pause_var.set("未找到选定窗口")
+            return
+        self.window_title=entry["title"]
+        self.window_hwnd=entry["hwnd"]
+        self.window_obj=None
+        try:
+            matches=[w for w in gw.getAllWindows() if int(getattr(w,"_hWnd",0))==self.window_hwnd]
+            if matches:
+                self.window_obj=matches[0]
+        except Exception:
+            self.window_obj=None
+        self.window_state.set(f"Selected:{self.window_title}")
+        self._update_window_status()
+        self.buffer.clear()
+        self.capture_enabled=True
+        self.recording_enabled=True
+        self.sleep_btn.configure(state="normal" if (self.models_ready() and self.window_hwnd is not None) else "disabled")
+        self.getup_btn.configure(state="disabled")
+        self.pause_var.set("" if self.models_ready() else "模型未就绪，已暂停且 10 秒切换规则失效")
+        self.set_mode("learn")
     def _get_ext_frame_rect(self,hwnd):
         try:
             if hwnd is None:
@@ -1028,7 +1112,7 @@ class App:
             except Exception:
                 pass
             try:
-                title=getattr(self.window_obj,'title','') or self.selected_title.get()
+                title=self._window_title()
                 if title:
                     wins=[w for w in gw.getAllWindows() if w.title==title or title in w.title]
                     if wins:
@@ -1041,23 +1125,33 @@ class App:
         except Exception:
             return None
     def _resolve_window_handle(self):
-        if self.window_obj is None:
-            return None
-        try:
-            self.window_obj.refresh()
-            return int(self.window_obj._hWnd)
-        except Exception:
-            pass
-        try:
-            title=getattr(self.window_obj,'title','') or self.selected_title.get()
-            if title:
-                windows=[w for w in gw.getAllWindows() if w.title==title]
-                if windows:
-                    self.window_obj=windows[0]
-                    self.window_obj.refresh()
-                    return int(self.window_obj._hWnd)
-        except Exception:
-            pass
+        if self.window_hwnd is not None and user32 is not None:
+            try:
+                if user32.IsWindow(ctypes.wintypes.HWND(int(self.window_hwnd)))!=0:
+                    return int(self.window_hwnd)
+            except Exception:
+                pass
+        title=self._window_title().strip()
+        if title:
+            for entry in self.window_entries:
+                if entry.get("title","")==title:
+                    handle=entry.get("hwnd")
+                    if handle is not None:
+                        if user32 is None or user32.IsWindow(ctypes.wintypes.HWND(int(handle)))!=0:
+                            self.window_hwnd=int(handle)
+                            return int(handle)
+            for win_title,handle in _list_visible_windows():
+                if win_title==title or title.lower() in win_title.lower():
+                    self.window_hwnd=int(handle)
+                    return int(handle)
+            if user32 is not None:
+                try:
+                    found=user32.FindWindowW(None,title)
+                    if found:
+                        self.window_hwnd=int(found)
+                        return int(found)
+                except Exception:
+                    pass
         return None
     def _dwm_occlusion_state(self,hwnd):
         if dwmapi is None or hwnd is None:
@@ -1234,22 +1328,35 @@ class App:
         except Exception:
             return 0.0,0.0
     def _refresh_window_geometry(self):
-        if self.window_obj is None:
+        title=self._window_title().strip()
+        if not title and self.window_hwnd is None:
             self.window_rect=None
-            self.window_hwnd=None
             return False
         try:
             hwnd=self._resolve_window_handle()
             self.window_hwnd=hwnd
             rect=self._get_ext_frame_rect(hwnd) if hwnd is not None else None
+            if rect is None and self.window_obj is not None:
+                try:
+                    self.window_obj.refresh()
+                    rect=(int(getattr(self.window_obj,'left',0)),int(getattr(self.window_obj,'top',0)),int(getattr(self.window_obj,'right',0)),int(getattr(self.window_obj,'bottom',0)))
+                    if rect[2]<=rect[0] or rect[3]<=rect[1]:
+                        rect=None
+                except Exception:
+                    rect=None
             self.window_rect=rect
             return rect is not None and hwnd is not None
         except Exception:
             self.window_rect=None
-            self.window_hwnd=None
+            if user32 is not None and self.window_hwnd is not None:
+                try:
+                    if user32.IsWindow(ctypes.wintypes.HWND(int(self.window_hwnd)))==0:
+                        self.window_hwnd=None
+                except Exception:
+                    self.window_hwnd=None
             return False
     def _evaluate_visibility(self,frame):
-        if self.window_obj is None:
+        if self.window_hwnd is None:
             self.window_visible=False
             self.window_full=False
             self.window_visible_reason='未选择窗口'
@@ -1259,6 +1366,9 @@ class App:
             self.window_coverage=0.0
             self.window_edge_ratio=0.0
             self.window_core_ratio=0.0
+            title=self._window_title()
+            label='未选择窗口' if not title else f"{title} (未找到)"
+            self.schedule(lambda txt=label:self.window_state.set(f"Selected:{txt}"))
             self.schedule(lambda:self.visible_var.set('可见: 否(未选择窗口)'))
             self.schedule(lambda:self.full_var.set('完整: 否(未选择窗口)'))
             return
@@ -1267,15 +1377,29 @@ class App:
         if rect is None or hwnd is None:
             self.window_visible=False
             self.window_full=False
-            self.window_visible_reason='无法获取窗口区域'
-            self.window_full_reason='无法获取窗口区域'
+            reason='无法获取窗口区域'
+            if hwnd is not None and user32 is not None:
+                try:
+                    h=ctypes.wintypes.HWND(int(hwnd))
+                    if user32.IsWindow(h)==0:
+                        reason='窗口句柄无效'
+                    elif user32.IsIconic(h)!=0:
+                        reason='窗口已最小化'
+                    elif user32.IsWindowVisible(h)==0:
+                        reason='窗口不可见'
+                except Exception:
+                    pass
+            self.window_visible_reason=reason
+            self.window_full_reason=reason
             self.window_occ_state=0
             self.window_occ_ratio=1.0
             self.window_coverage=0.0
             self.window_edge_ratio=0.0
             self.window_core_ratio=0.0
-            self.schedule(lambda:self.visible_var.set('可见: 否(无法获取窗口区域)'))
-            self.schedule(lambda:self.full_var.set('完整: 否(无法获取窗口区域)'))
+            title=self._window_title()
+            self.schedule(lambda txt=title or '未选择窗口':self.window_state.set(f"Selected:{txt}"))
+            self.schedule(lambda:self.visible_var.set(f"可见: 否({self.window_visible_reason})"))
+            self.schedule(lambda:self.full_var.set(f"完整: 否({self.window_full_reason})"))
             return
         if frame is None:
             self.window_visible=False
@@ -1296,56 +1420,62 @@ class App:
         occ_state=self._dwm_occlusion_state(hwnd)
         occ_ratio=self._pixel_occlusion_ratio(frame,hwnd,rect)
         if occ_ratio is None:
-            occ_ratio=1.0
+            occ_ratio=0.0
         occ_ratio=max(0.0,min(1.0,float(occ_ratio)))
         self.window_occ_state=occ_state
         self.window_occ_ratio=occ_ratio
         self.window_coverage=coverage
         self.window_edge_ratio=edge_ratio
         self.window_core_ratio=core_ratio
-        visible=True
-        vis_reason='通过'
-        if user32 is None:
-            visible=False
-            vis_reason='系统不支持'
-        else:
-            h=ctypes.wintypes.HWND(int(hwnd))
+        sample_good=frame.size>0 and np.std(frame)>3.0
+        h=ctypes.wintypes.HWND(int(hwnd)) if user32 is not None else None
+        base_visible=False
+        base_reason='系统不支持'
+        if user32 is not None and h:
             if user32.IsWindow(h)==0:
-                visible=False
-                vis_reason='窗口句柄无效'
+                base_reason='窗口句柄无效'
             elif user32.IsWindowVisible(h)==0:
-                visible=False
-                vis_reason='窗口不可见'
+                base_reason='窗口不可见'
             elif user32.IsIconic(h)!=0:
-                visible=False
-                vis_reason='窗口最小化'
+                base_reason='窗口最小化'
             elif occ_state==1:
-                visible=False
-                vis_reason='窗口被遮挡'
-            elif coverage<0.65:
-                visible=False
-                vis_reason=f'显示区域{coverage*100:.1f}%'
-            elif core_ratio<0.65:
-                visible=False
-                vis_reason=f'采样可见{core_ratio*100:.1f}%'
-            elif occ_ratio>0.35:
-                visible=False
-                vis_reason=f'遮挡率{occ_ratio*100:.1f}%'
+                base_reason='窗口被遮挡'
+            else:
+                base_visible=True
+                base_reason='窗口活动'
+        elif sample_good:
+            base_visible=True
+            base_reason='捕获成功'
+        if sample_good and coverage>=0.5 and core_ratio>=0.4:
+            base_visible=True
+            if base_reason!='窗口活动':
+                base_reason='捕获成功'
+        if occ_ratio>0.75:
+            base_visible=False
+            base_reason=f'遮挡率{occ_ratio*100:.1f}%'
+        if base_visible and coverage<0.5:
+            base_visible=False
+            base_reason=f'显示区域{coverage*100:.1f}%'
+        visible=base_visible and sample_good
+        vis_reason=base_reason
+        if sample_good is False:
+            visible=False
+            vis_reason='画面不足'
         full=False
         full_reason=vis_reason
         if visible:
             full=True
             full_reason='采样通过'
-            if coverage<0.96:
+            if coverage<0.88:
                 full=False
                 full_reason=f'覆盖{coverage*100:.1f}%'
-            elif edge_ratio<0.9:
+            elif edge_ratio<0.75:
                 full=False
                 full_reason=f'边缘可见{edge_ratio*100:.1f}%'
-            elif core_ratio<0.9:
+            elif core_ratio<0.75:
                 full=False
                 full_reason=f'采样可见{core_ratio*100:.1f}%'
-            elif occ_ratio>0.08:
+            elif occ_ratio>0.2:
                 full=False
                 full_reason=f'遮挡率{occ_ratio*100:.1f}%'
             elif occ_state==2 and occ_ratio<=0.02:
@@ -1356,11 +1486,19 @@ class App:
         self.window_full_reason=full_reason
         self.schedule(lambda v=visible,r=vis_reason:self.visible_var.set(f"可见: {'是' if v else '否'}({r})"))
         self.schedule(lambda f=full,t=full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
-    def _update_window_status(self,frame=None,force=False):
+        title=self._window_title()
+        state_title=title if title else '未选择窗口'
+        handle_text=f"0x{int(hwnd):08X}" if hwnd is not None else "N/A"
+        suffix=f" {handle_text}"
+        if not visible:
+            suffix+=f" [{vis_reason}]"
+        elif not full:
+            suffix+=f" [{full_reason}]"
+        self.schedule(lambda txt=state_title,suf=suffix:self.window_state.set(f"Selected:{txt}{suf}"))
+    def _update_window_status(self,frame=None):
         if frame is None:
-            updated=self._refresh_window_geometry()
-            if force or not updated:
-                self._evaluate_visibility(None)
+            self._refresh_window_geometry()
+            self._evaluate_visibility(None)
         else:
             self._evaluate_visibility(frame)
     def schedule(self,func):
@@ -1429,8 +1567,8 @@ class App:
             else:
                 if self.resource_paused:
                     self.resource_paused=False;self.recording_enabled=True;self.pause_var.set("")
-                    if self.mode=="init" and self.window_obj is not None:self.set_mode("learn")
-                    if self.window_obj is not None:self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
+                    if self.mode=="init" and self.window_hwnd is not None:self.set_mode("learn")
+                    if self.window_hwnd is not None:self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
             try:
                 if os.cpu_count():
                     target_threads=max(1,int(min(os.cpu_count(),max(1,int((1.0-M)*os.cpu_count())))))
@@ -1455,7 +1593,7 @@ class App:
         while self.running:
             start=time.time();f=self.metrics.get("freq",0.0)
             if f<=0.0 or not self.capture_enabled or self.resource_paused:time.sleep(0.05);continue
-            if self.window_obj is not None:
+            if self.window_hwnd is not None:
                 self._update_window_status()
                 rect=self.window_rect
                 if rect is not None:
@@ -1502,7 +1640,7 @@ class App:
                 rect=self.window_rect;center=((rect[0]+rect[2])/2.0,(rect[1]+rect[3])/2.0)
                 action=[0.0,0.0,0.0]
                 pos=[(center[0]-rect[0])/(rect[2]-rect[0]),(center[1]-rect[1])/(rect[3]-rect[1])]
-                source=1 if self.mode=="learn" else 2;title=self.window_obj.title if self.window_obj else ""
+                source=1 if self.mode=="learn" else 2;title=self._window_title()
                 try:self.writer.record(frame,action,pos,source,rect,title,self.mode,"frame");self.buffer.add(frame,action,source,0,0,-1,self.perception.last_text)
                 except Exception:pass
             try:self.prep_queue.task_done()
@@ -1537,7 +1675,7 @@ class App:
             if rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3]:
                 width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,0.0]
                 frame=self._current_frame_copy()
-                if frame is not None:self.writer.record(frame,action,[norm_x,norm_y],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"move");self.buffer.add(frame,action,1,1,0,-1,self.perception.last_text)
+                if frame is not None:self.writer.record(frame,action,[norm_x,norm_y],1,rect,self._window_title(),self.mode,"move");self.buffer.add(frame,action,1,1,0,-1,self.perception.last_text)
     def _on_mouse_click(self,x,y,button,pressed):
         self.last_user_input=time.time()
         inside=False;rect=self.window_rect
@@ -1546,7 +1684,7 @@ class App:
             self.drag_active=True;self.drag_points=[(x,y,time.time())];self.drag_start=time.time()
             width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,1.0];frame=self._current_frame_copy()
             if frame is not None:
-                pid=self.pool.add_click(frame,rect,norm_x,norm_y);self._save_click_patches(frame,norm_x,norm_y);self.writer.record(frame,action,[norm_x,norm_y],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"press",{"proto":int(pid)});self.buffer.add(frame,action,1,2,1,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,1,np.zeros((64,),np.float32))
+                pid=self.pool.add_click(frame,rect,norm_x,norm_y);self._save_click_patches(frame,norm_x,norm_y);self.writer.record(frame,action,[norm_x,norm_y],1,rect,self._window_title(),self.mode,"press",{"proto":int(pid)});self.buffer.add(frame,action,1,2,1,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,1,np.zeros((64,),np.float32))
         if (not pressed) and self.drag_active:
             self.drag_active=False
             if self.window_rect is not None:
@@ -1556,7 +1694,7 @@ class App:
                     path=[((px-rect[0])/width,(py-rect[1])/height) for px,py in simp]
                     frame=self._current_frame_copy()
                     if frame is not None:
-                        pid=self.pool.add_drag(frame,rect,path);self.writer.record(frame,[0.0,0.0,0.0],path[-1],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"drag",{"path":path,"duration":time.time()-self.drag_start,"proto":int(pid)});self.buffer.add(frame,[0.0,0.0,0.0],1,5,2,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,2,np.zeros((64,),np.float32))
+                        pid=self.pool.add_drag(frame,rect,path);self.writer.record(frame,[0.0,0.0,0.0],path[-1],1,rect,self._window_title(),self.mode,"drag",{"path":path,"duration":time.time()-self.drag_start,"proto":int(pid)});self.buffer.add(frame,[0.0,0.0,0.0],1,5,2,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,2,np.zeros((64,),np.float32))
     def _on_key_press(self,key):
         self.last_user_input=time.time()
         if key==keyboard.Key.esc:self.schedule(self.stop)
@@ -1566,6 +1704,15 @@ class App:
         with self.frame_lock:
             if self.frame is None:return None
             return self.frame.copy()
+    def _window_title(self):
+        if self.window_title:
+            return self.window_title
+        if self.window_obj is not None:
+            try:
+                return self.window_obj.title
+            except Exception:
+                return ""
+        return self.selected_title.get() or ""
     def _update_ui(self):
         while not self.ui_queue.empty():
             func=self.ui_queue.get()
@@ -1628,7 +1775,7 @@ class App:
             if not self.hold_state and 0.5<click_prob<=0.7:pyautogui.click()
             frame=self._current_frame_copy()
             if frame is not None and self.recording_enabled and not self.resource_paused:
-                norm_x=(target_x-rect[0])/width;norm_y=(target_y-rect[1])/height;self.writer.record(frame,[dx,dy,click_prob],[norm_x,norm_y],2,rect,self.window_obj.title if self.window_obj else "",self.mode,"ai");self.buffer.add(frame,[dx,dy,click_prob],2,3,0,-1,self.perception.last_text)
+                norm_x=(target_x-rect[0])/width;norm_y=(target_y-rect[1])/height;self.writer.record(frame,[dx,dy,click_prob],[norm_x,norm_y],2,rect,self._window_title(),self.mode,"ai");self.buffer.add(frame,[dx,dy,click_prob],2,3,0,-1,self.perception.last_text)
             time.sleep(self.ai_interval)
     def _analyze_ui_async(self,frame):
         def worker(img):
@@ -1637,7 +1784,7 @@ class App:
                 if dets and self.window_rect is not None:
                     rect=self.window_rect
                     for cx,cy,label,score in dets[:8]:
-                        self.writer.record(img,[0.0,0.0,0.0],[cx,cy],1,rect,self.window_obj.title if self.window_obj else "",self.mode,"ui",{"label":label,"score":float(score)});self.buffer.add(img,[0.0,0.0,0.0],1,4,0,-1,txt)
+                        self.writer.record(img,[0.0,0.0,0.0],[cx,cy],1,rect,self._window_title(),self.mode,"ui",{"label":label,"score":float(score)});self.buffer.add(img,[0.0,0.0,0.0],1,4,0,-1,txt)
                 if txt:self.rule_text=txt
             except Exception:
                 pass
