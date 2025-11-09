@@ -1287,11 +1287,12 @@ class App:
             pass
     def _on_mouse_move(self,x,y):
         self.last_user_input=time.time()
-        if self.drag_active and self.window_rect is not None:
-            if self.window_rect[0]<=x<=self.window_rect[2] and self.window_rect[1]<=y<=self.window_rect[3]:
+        rect=getattr(self,"window_rect",None)
+        if getattr(self,"drag_active",False) and rect is not None:
+            if rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3]:
+                if not hasattr(self,"drag_points") or self.drag_points is None:self.drag_points=[]
                 self.drag_points.append((x,y,time.time()))
-        if self.mode=="learn" and self.window_visible and self.window_full and self.window_rect is not None and self.recording_enabled and not self.resource_paused and self.capture_enabled:
-            rect=self.window_rect
+        if self.mode=="learn" and self.window_visible and self.window_full and rect is not None and self.recording_enabled and not self.resource_paused and self.capture_enabled:
             if rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3]:
                 width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,0.0]
                 frame=self._current_frame_copy()
