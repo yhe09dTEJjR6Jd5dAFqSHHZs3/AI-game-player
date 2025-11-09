@@ -258,9 +258,14 @@ class ExperienceWriter:
         name=os.path.join(target_dir,f"{data['time']}_{int(source)}.npz")
         with self.lock:
             try:
-                ok,buf=cv2.imencode(".jpg",arr,[int(cv2.IMWRITE_JPEG_QUALITY),85])
+                ok,buf=cv2.imencode(".jpg",arr,[int(cv2.IMWRITE_JPEG_QUALITY),90])
                 if ok:
                     np.savez_compressed(name,frame_jpg=buf,meta=json.dumps(data,ensure_ascii=False))
+                    try:
+                        with open(name.replace(".npz",".jpg"),"wb") as jf:
+                            jf.write(buf.tobytes())
+                    except Exception:
+                        pass
                 else:
                     np.savez_compressed(name,frame=arr,meta=json.dumps(data,ensure_ascii=False))
                 self._ensure_quota()
@@ -1296,56 +1301,62 @@ class App:
         occ_state=self._dwm_occlusion_state(hwnd)
         occ_ratio=self._pixel_occlusion_ratio(frame,hwnd,rect)
         if occ_ratio is None:
-            occ_ratio=1.0
+            occ_ratio=0.0
         occ_ratio=max(0.0,min(1.0,float(occ_ratio)))
         self.window_occ_state=occ_state
         self.window_occ_ratio=occ_ratio
         self.window_coverage=coverage
         self.window_edge_ratio=edge_ratio
         self.window_core_ratio=core_ratio
-        visible=True
-        vis_reason='通过'
-        if user32 is None:
-            visible=False
-            vis_reason='系统不支持'
-        else:
-            h=ctypes.wintypes.HWND(int(hwnd))
+        sample_good=frame.size>0 and np.std(frame)>3.0
+        h=ctypes.wintypes.HWND(int(hwnd)) if user32 is not None else None
+        base_visible=False
+        base_reason='系统不支持'
+        if user32 is not None and h:
             if user32.IsWindow(h)==0:
-                visible=False
-                vis_reason='窗口句柄无效'
+                base_reason='窗口句柄无效'
             elif user32.IsWindowVisible(h)==0:
-                visible=False
-                vis_reason='窗口不可见'
+                base_reason='窗口不可见'
             elif user32.IsIconic(h)!=0:
-                visible=False
-                vis_reason='窗口最小化'
+                base_reason='窗口最小化'
             elif occ_state==1:
-                visible=False
-                vis_reason='窗口被遮挡'
-            elif coverage<0.65:
-                visible=False
-                vis_reason=f'显示区域{coverage*100:.1f}%'
-            elif core_ratio<0.65:
-                visible=False
-                vis_reason=f'采样可见{core_ratio*100:.1f}%'
-            elif occ_ratio>0.35:
-                visible=False
-                vis_reason=f'遮挡率{occ_ratio*100:.1f}%'
+                base_reason='窗口被遮挡'
+            else:
+                base_visible=True
+                base_reason='窗口活动'
+        elif sample_good:
+            base_visible=True
+            base_reason='捕获成功'
+        if sample_good and coverage>=0.5 and core_ratio>=0.4:
+            base_visible=True
+            if base_reason!='窗口活动':
+                base_reason='捕获成功'
+        if occ_ratio>0.75:
+            base_visible=False
+            base_reason=f'遮挡率{occ_ratio*100:.1f}%'
+        if base_visible and coverage<0.5:
+            base_visible=False
+            base_reason=f'显示区域{coverage*100:.1f}%'
+        visible=base_visible and sample_good
+        vis_reason=base_reason
+        if sample_good is False:
+            visible=False
+            vis_reason='画面不足'
         full=False
         full_reason=vis_reason
         if visible:
             full=True
             full_reason='采样通过'
-            if coverage<0.96:
+            if coverage<0.88:
                 full=False
                 full_reason=f'覆盖{coverage*100:.1f}%'
-            elif edge_ratio<0.9:
+            elif edge_ratio<0.75:
                 full=False
                 full_reason=f'边缘可见{edge_ratio*100:.1f}%'
-            elif core_ratio<0.9:
+            elif core_ratio<0.75:
                 full=False
                 full_reason=f'采样可见{core_ratio*100:.1f}%'
-            elif occ_ratio>0.08:
+            elif occ_ratio>0.2:
                 full=False
                 full_reason=f'遮挡率{occ_ratio*100:.1f}%'
             elif occ_state==2 and occ_ratio<=0.02:
