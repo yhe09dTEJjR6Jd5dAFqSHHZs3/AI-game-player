@@ -749,6 +749,9 @@ class App:
         self.mss_ctx=mss.mss()
         self.cap_queue=queue.Queue(maxsize=2)
         self.prep_queue=queue.Queue(maxsize=2)
+        self.drag_active=False
+        self.drag_points=[]
+        self.drag_start=None
         self.capture_thread=threading.Thread(target=self._capture_loop,daemon=True)
         self.prep_thread=threading.Thread(target=self._preprocess_loop,daemon=True)
         self.write_thread=threading.Thread(target=self._writer_loop,daemon=True)
@@ -767,9 +770,6 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW",self.stop)
         self.root.after(50,self._update_ui)
         self.root.after(200,self._check_mode_switch)
-        self.drag_active=False
-        self.drag_points=[]
-        self.drag_start=None
         self.perception=PerceptionEngine()
         try:
             import clip as openai_clip
