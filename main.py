@@ -850,51 +850,53 @@ class App:
             self.pause_var.set("" if self.models_ready() else "模型未就绪，已暂停且 10 秒切换规则失效")
             self.set_mode("learn")
     def _get_ext_frame_rect(self,hwnd):
-    try:
-        if hwnd is None:
-            return None
-        rect=ctypes.wintypes.RECT()
-        if dwmapi is not None:
+        try:
+            if hwnd is None:
+                return None
+            rect=ctypes.wintypes.RECT()
+            if dwmapi is not None:
+                try:
+                    DWMWA_EXTENDED_FRAME_BOUNDS=9
+                    if dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(int(hwnd)),ctypes.c_int(DWMWA_EXTENDED_FRAME_BOUNDS),ctypes.byref(rect),ctypes.sizeof(rect))==0:
+                        return (rect.left,rect.top,rect.right,rect.bottom)
+                except Exception:
+                    pass
             try:
-                DWMWA_EXTENDED_FRAME_BOUNDS=9
-                if dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(int(hwnd)),ctypes.c_int(DWMWA_EXTENDED_FRAME_BOUNDS),ctypes.byref(rect),ctypes.sizeof(rect))==0:
+                if user32 is not None and user32.GetWindowRect(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(rect))!=0:
                     return (rect.left,rect.top,rect.right,rect.bottom)
             except Exception:
                 pass
-        try:
-            if user32 is not None and user32.GetWindowRect(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(rect))!=0:
-                return (rect.left,rect.top,rect.right,rect.bottom)
-        except Exception:
-            pass
-        try:
-            rc=ctypes.wintypes.RECT()
-            if user32 is not None and user32.GetClientRect(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(rc))!=0:
-                pt1=ctypes.wintypes.POINT(rc.left,rc.top)
-                pt2=ctypes.wintypes.POINT(rc.right,rc.bottom)
-                user32.ClientToScreen(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(pt1))
-                user32.ClientToScreen(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(pt2))
-                return (pt1.x,pt1.y,pt2.x,pt2.y)
-        except Exception:
-            pass
-        try:
-            if self.window_obj is not None:
-                self.window_obj.refresh()
-                left=int(getattr(self.window_obj,'left',0));top=int(getattr(self.window_obj,'top',0));right=int(getattr(self.window_obj,'right',left+int(getattr(self.window_obj,'width',0))));bottom=int(getattr(self.window_obj,'bottom',top+int(getattr(self.window_obj,'height',0))))
-                if right>left and bottom>top:
-                    return (left,top,right,bottom)
-        except Exception:
-            pass
-        try:
-            title=getattr(self.window_obj,'title','') or self.selected_title.get()
-            if title:
-                wins=[w for w in gw.getAllWindows() if w.title==title or title in w.title]
-                if wins:
-                    w=wins[0];w.refresh();left=int(getattr(w,'left',0));top=int(getattr(w,'top',0));right=int(getattr(w,'right',left+int(getattr(w,'width',0))));bottom=int(getattr(w,'bottom',top+int(getattr(w,'height',0))))
+            try:
+                rc=ctypes.wintypes.RECT()
+                if user32 is not None and user32.GetClientRect(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(rc))!=0:
+                    pt1=ctypes.wintypes.POINT(rc.left,rc.top)
+                    pt2=ctypes.wintypes.POINT(rc.right,rc.bottom)
+                    user32.ClientToScreen(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(pt1))
+                    user32.ClientToScreen(ctypes.wintypes.HWND(int(hwnd)),ctypes.byref(pt2))
+                    return (pt1.x,pt1.y,pt2.x,pt2.y)
+            except Exception:
+                pass
+            try:
+                if self.window_obj is not None:
+                    self.window_obj.refresh()
+                    left=int(getattr(self.window_obj,'left',0));top=int(getattr(self.window_obj,'top',0));right=int(getattr(self.window_obj,'right',left+int(getattr(self.window_obj,'width',0))));bottom=int(getattr(self.window_obj,'bottom',top+int(getattr(self.window_obj,'height',0))))
                     if right>left and bottom>top:
                         return (left,top,right,bottom)
+            except Exception:
+                pass
+            try:
+                title=getattr(self.window_obj,'title','') or self.selected_title.get()
+                if title:
+                    wins=[w for w in gw.getAllWindows() if w.title==title or title in w.title]
+                    if wins:
+                        w=wins[0];w.refresh();left=int(getattr(w,'left',0));top=int(getattr(w,'top',0));right=int(getattr(w,'right',left+int(getattr(w,'width',0))));bottom=int(getattr(w,'bottom',top+int(getattr(w,'height',0))))
+                        if right>left and bottom>top:
+                            return (left,top,right,bottom)
+            except Exception:
+                pass
+            return None
         except Exception:
-            pass
-        return None
+            return None
     def _resolve_window_handle(self):
         if self.window_obj is None:
             return None
@@ -1516,9 +1518,14 @@ class App:
                 done_steps+=1;prog=100.0*min(1.0,done_steps/max(1,total));self.progress_var.set(prog)
                 if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
                 if self.optimize_event.is_set():break
-        try:torch.save(self.model.state_dict(),model_path)
-        except Exception:pass
-        self.progress_var.set(100.0);self._confirm_dialog();self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self.set_mode("learn");self.schedule(lambda:self.pause_var.set(""))
+        interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
+        if not interrupted:
+            try:torch.save(self.model.state_dict(),model_path)
+            except Exception:pass
+            self.progress_var.set(100.0);self._confirm_dialog();self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self.set_mode("learn")
+        else:
+            self.progress_var.set(0.0);self.progress_text.set("0%")
+        self.schedule(lambda:self.pause_var.set(""))
     def stop(self):
         self.running=False
         try:self._stop_ai()
