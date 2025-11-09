@@ -1233,114 +1233,136 @@ class App:
             return core_ratio,edge_ratio
         except Exception:
             return 0.0,0.0
-    def _resolve_full_status(self,coverage,edge_ratio,core_ratio,occ,occ_ratio):
-        occ_val=occ_ratio if occ_ratio is not None else 0.0
-        metrics=[]
-        if coverage<0.98:
-            metrics.append(f"覆盖{coverage*100:.1f}%")
-        if edge_ratio<0.98:
-            metrics.append(f"边缘可见{edge_ratio*100:.1f}%")
-        if core_ratio<0.98:
-            metrics.append(f"采样可见{core_ratio*100:.1f}%")
-        if occ==1:
-            metrics.append("窗口被遮挡")
-        if occ_val>OCCLUSION_THR:
-            metrics.append(f"遮挡率{occ_val*100:.2f}%")
-        if metrics:
-            return False,"，".join(metrics)
-        if occ==2:
-            return True,"完全可见"
-        return True,"采样通过"
-    def _check_window_visible(self,hwnd,rect):
-        try:
-            if user32 is None or hwnd is None:
-                return False,'系统不支持',0,0.0,0.0,0.0,1.0
-            h=ctypes.wintypes.HWND(int(hwnd))
-            if user32.IsWindow(h)==0:
-                return False,'窗口句柄无效',0,0.0,0.0,0.0,1.0
-            if user32.IsWindowVisible(h)==0:
-                return False,'窗口不可见',0,0.0,0.0,0.0,1.0
-            if user32.IsIconic(h)!=0:
-                return False,'窗口最小化',0,self._monitor_coverage(rect) if rect else 0.0,0.0,0.0,1.0
-            occ=self._dwm_occlusion_state(hwnd)
-            if dwmapi is not None:
-                cloaked=ctypes.c_int(0)
-                try:
-                    DWMWA_CLOAKED=14
-                    dwmapi.DwmGetWindowAttribute(h,ctypes.c_int(DWMWA_CLOAKED),ctypes.byref(cloaked),ctypes.sizeof(cloaked))
-                    if cloaked.value!=0:
-                        return False,'窗口被系统隐藏',occ,self._monitor_coverage(rect) if rect else 0.0,0.0,0.0,1.0
-                except Exception:
-                    pass
-            coverage=self._monitor_coverage(rect) if rect else 0.0
-            core_ratio,edge_ratio=self._sample_window_visibility(hwnd,rect)
-            occ_ratio=self._pixel_occlusion_ratio(None,hwnd,rect)
-            if coverage<=0.05:
-                return False,'窗口大部分不在显示区域',occ,coverage,edge_ratio,core_ratio,occ_ratio
-            if occ==1:
-                return False,'窗口被遮挡',occ,coverage,edge_ratio,core_ratio,occ_ratio
-            if core_ratio<0.4:
-                return False,f"采样可见{core_ratio*100:.1f}%",occ,coverage,edge_ratio,core_ratio,occ_ratio
-            if occ==2 and coverage>=0.95 and edge_ratio>=0.95 and (occ_ratio is None or occ_ratio<=OCCLUSION_THR):
-                return True,'完全可见',occ,coverage,edge_ratio,core_ratio,occ_ratio
-            reason=f"采样可见{core_ratio*100:.1f}%"
-            if edge_ratio<0.8:
-                reason=f"边缘可见{edge_ratio*100:.1f}%"
-            return True,reason,occ,coverage,edge_ratio,core_ratio,occ_ratio
-        except Exception:
-            return False,'检测异常',0,0.0,0.0,0.0,1.0
-    def _update_window_status(self,force=False):
+    def _refresh_window_geometry(self):
         if self.window_obj is None:
-            self.window_rect=None;self.window_hwnd=None;self.window_visible=False;self.window_full=False;self.window_occ_state=0;self.window_visible_reason='未选择窗口';self.window_full_reason='未选择窗口';self.schedule(lambda:self.visible_var.set('可见: 否(未选择窗口)'));self.schedule(lambda:self.full_var.set('完整: 否(未选择窗口)'));return
+            self.window_rect=None
+            self.window_hwnd=None
+            return False
         try:
             hwnd=self._resolve_window_handle()
             self.window_hwnd=hwnd
             rect=self._get_ext_frame_rect(hwnd) if hwnd is not None else None
             self.window_rect=rect
-            visible=False
-            full=False
-            vis_reason='无法检测'
-            full_reason='无法检测'
-            if rect:
-                visible,vis_reason,occ,coverage,edge_ratio,core_ratio,occ_ratio=self._check_window_visible(hwnd,rect)
-                self.window_occ_state=occ
-                self.window_coverage=coverage
-                self.window_edge_ratio=edge_ratio
-                self.window_core_ratio=core_ratio
-                self.window_occ_ratio=occ_ratio if occ_ratio is not None else 0.0
-                if visible:
-                    full,full_reason=self._resolve_full_status(self.window_coverage,self.window_edge_ratio,self.window_core_ratio,self.window_occ_state,self.window_occ_ratio)
-                else:
-                    full=False
-                    full_reason=vis_reason
-            else:
-                self.window_occ_state=0
-                self.window_coverage=0.0
-                self.window_edge_ratio=0.0
-                self.window_core_ratio=0.0
-                self.window_occ_ratio=1.0
-                vis_reason='无法获取窗口区域'
-                full_reason=vis_reason
-            self.window_visible=visible
-            self.window_full=full
-            self.window_visible_reason=vis_reason
-            self.window_full_reason=full_reason
-            self.schedule(lambda v=visible,r=vis_reason:self.visible_var.set(f"可见: {'是' if v else '否'}({r})"))
-            self.schedule(lambda f=full,t=full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
+            return rect is not None and hwnd is not None
         except Exception:
             self.window_rect=None
             self.window_hwnd=None
+            return False
+    def _evaluate_visibility(self,frame):
+        if self.window_obj is None:
             self.window_visible=False
             self.window_full=False
+            self.window_visible_reason='未选择窗口'
+            self.window_full_reason='未选择窗口'
             self.window_occ_state=0
+            self.window_occ_ratio=1.0
             self.window_coverage=0.0
             self.window_edge_ratio=0.0
             self.window_core_ratio=0.0
+            self.schedule(lambda:self.visible_var.set('可见: 否(未选择窗口)'))
+            self.schedule(lambda:self.full_var.set('完整: 否(未选择窗口)'))
+            return
+        rect=self.window_rect
+        hwnd=self.window_hwnd
+        if rect is None or hwnd is None:
+            self.window_visible=False
+            self.window_full=False
+            self.window_visible_reason='无法获取窗口区域'
+            self.window_full_reason='无法获取窗口区域'
+            self.window_occ_state=0
             self.window_occ_ratio=1.0
-            self.window_visible_reason='检测异常'
-            self.window_full_reason='检测异常'
-            self.schedule(lambda:self.visible_var.set('可见: 否(检测异常)'))
-            self.schedule(lambda:self.full_var.set('完整: 否(检测异常)'))
+            self.window_coverage=0.0
+            self.window_edge_ratio=0.0
+            self.window_core_ratio=0.0
+            self.schedule(lambda:self.visible_var.set('可见: 否(无法获取窗口区域)'))
+            self.schedule(lambda:self.full_var.set('完整: 否(无法获取窗口区域)'))
+            return
+        if frame is None:
+            self.window_visible=False
+            self.window_full=False
+            self.window_visible_reason='等待截图'
+            self.window_full_reason='等待截图'
+            self.window_occ_state=self._dwm_occlusion_state(hwnd)
+            self.window_occ_ratio=1.0
+            self.window_coverage=self._monitor_coverage(rect)
+            core_ratio,edge_ratio=self._sample_window_visibility(hwnd,rect)
+            self.window_core_ratio=core_ratio
+            self.window_edge_ratio=edge_ratio
+            self.schedule(lambda:self.visible_var.set('可见: 否(等待截图)'))
+            self.schedule(lambda:self.full_var.set('完整: 否(等待截图)'))
+            return
+        coverage=self._monitor_coverage(rect)
+        core_ratio,edge_ratio=self._sample_window_visibility(hwnd,rect)
+        occ_state=self._dwm_occlusion_state(hwnd)
+        occ_ratio=self._pixel_occlusion_ratio(frame,hwnd,rect)
+        if occ_ratio is None:
+            occ_ratio=1.0
+        occ_ratio=max(0.0,min(1.0,float(occ_ratio)))
+        self.window_occ_state=occ_state
+        self.window_occ_ratio=occ_ratio
+        self.window_coverage=coverage
+        self.window_edge_ratio=edge_ratio
+        self.window_core_ratio=core_ratio
+        visible=True
+        vis_reason='通过'
+        if user32 is None:
+            visible=False
+            vis_reason='系统不支持'
+        else:
+            h=ctypes.wintypes.HWND(int(hwnd))
+            if user32.IsWindow(h)==0:
+                visible=False
+                vis_reason='窗口句柄无效'
+            elif user32.IsWindowVisible(h)==0:
+                visible=False
+                vis_reason='窗口不可见'
+            elif user32.IsIconic(h)!=0:
+                visible=False
+                vis_reason='窗口最小化'
+            elif occ_state==1:
+                visible=False
+                vis_reason='窗口被遮挡'
+            elif coverage<0.65:
+                visible=False
+                vis_reason=f'显示区域{coverage*100:.1f}%'
+            elif core_ratio<0.65:
+                visible=False
+                vis_reason=f'采样可见{core_ratio*100:.1f}%'
+            elif occ_ratio>0.35:
+                visible=False
+                vis_reason=f'遮挡率{occ_ratio*100:.1f}%'
+        full=False
+        full_reason=vis_reason
+        if visible:
+            full=True
+            full_reason='采样通过'
+            if coverage<0.96:
+                full=False
+                full_reason=f'覆盖{coverage*100:.1f}%'
+            elif edge_ratio<0.9:
+                full=False
+                full_reason=f'边缘可见{edge_ratio*100:.1f}%'
+            elif core_ratio<0.9:
+                full=False
+                full_reason=f'采样可见{core_ratio*100:.1f}%'
+            elif occ_ratio>0.08:
+                full=False
+                full_reason=f'遮挡率{occ_ratio*100:.1f}%'
+            elif occ_state==2 and occ_ratio<=0.02:
+                full_reason='完全可见'
+        self.window_visible=visible
+        self.window_full=full
+        self.window_visible_reason=vis_reason
+        self.window_full_reason=full_reason
+        self.schedule(lambda v=visible,r=vis_reason:self.visible_var.set(f"可见: {'是' if v else '否'}({r})"))
+        self.schedule(lambda f=full,t=full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
+    def _update_window_status(self,frame=None,force=False):
+        if frame is None:
+            updated=self._refresh_window_geometry()
+            if force or not updated:
+                self._evaluate_visibility(None)
+        else:
+            self._evaluate_visibility(frame)
     def schedule(self,func):
         if self.running:self.ui_queue.put(func)
     def _gpu_metrics_nvml(self):
@@ -1435,31 +1457,22 @@ class App:
             if f<=0.0 or not self.capture_enabled or self.resource_paused:time.sleep(0.05);continue
             if self.window_obj is not None:
                 self._update_window_status()
-                if self.window_visible and self.window_rect is not None:
-                    left,top,right,bottom=self.window_rect;width=right-left;height=bottom-top
+                rect=self.window_rect
+                if rect is not None:
+                    left,top,right,bottom=rect;width=right-left;height=bottom-top
                     if width>0 and height>0:
                         try:
                             shot=self.mss_ctx.grab({"left":left,"top":top,"width":width,"height":height});frame=np.array(shot);frame=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
                             now=time.time()
-                            if (now-self.last_occl_check>1.0 or not self.window_full) and self.window_visible:
-                                ratio=self._pixel_occlusion_ratio(frame,self.window_hwnd,self.window_rect)
-                                if ratio is not None:
-                                    self.window_occ_ratio=ratio
-                                coverage=self._monitor_coverage(self.window_rect)
-                                self.window_coverage=coverage
-                                core_ratio,edge_ratio=self._sample_window_visibility(self.window_hwnd,self.window_rect)
-                                self.window_core_ratio=core_ratio
-                                self.window_edge_ratio=edge_ratio
-                                if self.window_visible:
-                                    full,full_reason=self._resolve_full_status(self.window_coverage,self.window_edge_ratio,self.window_core_ratio,self.window_occ_state,self.window_occ_ratio)
-                                    self.window_full=full
-                                    self.window_full_reason=full_reason
-                                    self.schedule(lambda f=self.window_full,t=self.window_full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
+                            self._update_window_status(frame=frame)
                             self._enqueue_drop(self.cap_queue,(frame,now))
                         except Exception:
-                            pass
+                            self._evaluate_visibility(None)
                 else:
                     with self.frame_lock:self.frame=None
+                    self._evaluate_visibility(None)
+            else:
+                with self.frame_lock:self.frame=None
             elapsed=time.time()-start;wait=max(self.capture_interval-elapsed,0.001) if self.metrics.get("freq",0.0)>0 else 0.05;time.sleep(wait)
     def _preprocess_loop(self):
         while self.running:
