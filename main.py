@@ -316,6 +316,9 @@ class ExperienceWriter:
                         preview_path=self.latest_learn if int(source)==1 else self.latest_train
                         with open(preview_path,"wb") as pf:
                             pf.write(jpg_bytes)
+                    try:
+                        with open(name.replace(".npz",".jpg"),"wb") as jf:
+                            jf.write(buf.tobytes())
                     except Exception:
                         pass
                 else:
