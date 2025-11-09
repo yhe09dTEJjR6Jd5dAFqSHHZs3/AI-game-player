@@ -30,6 +30,7 @@ WS_EX_LAYERED=0x00080000
 LWA_ALPHA=0x2
 GWL_EXSTYLE=-20
 GW_HWNDPREV=3
+GA_ROOT=2
 PW_RENDERFULLCONTENT=0x00000002
 class WINDOWINFO(ctypes.Structure):
     _fields_=[("cbSize",ctypes.wintypes.DWORD),("rcWindow",ctypes.wintypes.RECT),("rcClient",ctypes.wintypes.RECT),("dwStyle",ctypes.wintypes.DWORD),("dwExStyle",ctypes.wintypes.DWORD),("dwWindowStatus",ctypes.wintypes.DWORD),("cxWindowBorders",ctypes.wintypes.UINT),("cyWindowBorders",ctypes.wintypes.UINT),("atomWindowType",ctypes.wintypes.ATOM),("wCreatorVersion",ctypes.wintypes.WORD)]
@@ -51,6 +52,13 @@ if os.name=="nt":
     except Exception:
         dwmapi=None
     user32=ctypes.windll.user32
+    try:
+        user32.WindowFromPoint.restype=ctypes.wintypes.HWND
+        user32.WindowFromPoint.argtypes=[ctypes.wintypes.POINT]
+        user32.GetAncestor.restype=ctypes.wintypes.HWND
+        user32.GetAncestor.argtypes=[ctypes.wintypes.HWND,ctypes.wintypes.UINT]
+    except Exception:
+        pass
     gdi32=ctypes.windll.gdi32
 else:
     dwmapi=None
@@ -790,6 +798,10 @@ class App:
         self.window_visible=False
         self.window_full=False
         self.window_occ_state=0
+        self.window_coverage=0.0
+        self.window_core_ratio=0.0
+        self.window_edge_ratio=0.0
+        self.window_occ_ratio=0.0
         self.window_visible_reason='未知'
         self.window_full_reason='未知'
         self.last_occl_check=0.0
@@ -1170,17 +1182,86 @@ class App:
             if inter:
                 covered+=_rect_area(inter)
         return covered/area if area>0 else 0.0
+    def _sample_window_visibility(self,hwnd,rect):
+        try:
+            if user32 is None or hwnd is None or rect is None:
+                return 0.0,0.0
+            target=int(hwnd)
+            left,top,right,bottom=rect
+            w=max(1,right-left)
+            h=max(1,bottom-top)
+            core=[]
+            edge=[]
+            core_pos=[0.25,0.5,0.75]
+            edge_pos=[0.02,0.5,0.98]
+            for fx in core_pos:
+                for fy in core_pos:
+                    px=int(left+min(max(fx,0.0),1.0)*(w-1))
+                    py=int(top+min(max(fy,0.0),1.0)*(h-1))
+                    core.append((px,py))
+            for fx in edge_pos:
+                for fy in edge_pos:
+                    px=int(left+min(max(fx,0.0),1.0)*(w-1))
+                    py=int(top+min(max(fy,0.0),1.0)*(h-1))
+                    edge.append((px,py))
+            core_hit=0
+            edge_hit=0
+            for px,py in core:
+                pt=ctypes.wintypes.POINT(px,py)
+                win=user32.WindowFromPoint(pt)
+                if win:
+                    win_int=int(win)
+                    root=user32.GetAncestor(ctypes.wintypes.HWND(win),ctypes.c_uint(GA_ROOT))
+                    root_int=int(root) if root else 0
+                    if root_int==0:
+                        root_int=win_int
+                    if root_int==target or win_int==target:
+                        core_hit+=1
+            for px,py in edge:
+                pt=ctypes.wintypes.POINT(px,py)
+                win=user32.WindowFromPoint(pt)
+                if win:
+                    win_int=int(win)
+                    root=user32.GetAncestor(ctypes.wintypes.HWND(win),ctypes.c_uint(GA_ROOT))
+                    root_int=int(root) if root else 0
+                    if root_int==0:
+                        root_int=win_int
+                    if root_int==target or win_int==target:
+                        edge_hit+=1
+            core_ratio=core_hit/len(core) if core else 0.0
+            edge_ratio=edge_hit/len(edge) if edge else 0.0
+            return core_ratio,edge_ratio
+        except Exception:
+            return 0.0,0.0
+    def _resolve_full_status(self,coverage,edge_ratio,core_ratio,occ,occ_ratio):
+        occ_val=occ_ratio if occ_ratio is not None else 0.0
+        metrics=[]
+        if coverage<0.98:
+            metrics.append(f"覆盖{coverage*100:.1f}%")
+        if edge_ratio<0.98:
+            metrics.append(f"边缘可见{edge_ratio*100:.1f}%")
+        if core_ratio<0.98:
+            metrics.append(f"采样可见{core_ratio*100:.1f}%")
+        if occ==1:
+            metrics.append("窗口被遮挡")
+        if occ_val>OCCLUSION_THR:
+            metrics.append(f"遮挡率{occ_val*100:.2f}%")
+        if metrics:
+            return False,"，".join(metrics)
+        if occ==2:
+            return True,"完全可见"
+        return True,"采样通过"
     def _check_window_visible(self,hwnd,rect):
         try:
             if user32 is None or hwnd is None:
-                return False,'系统不支持',0,0.0
+                return False,'系统不支持',0,0.0,0.0,0.0,1.0
             h=ctypes.wintypes.HWND(int(hwnd))
             if user32.IsWindow(h)==0:
-                return False,'窗口句柄无效',0,0.0
+                return False,'窗口句柄无效',0,0.0,0.0,0.0,1.0
             if user32.IsWindowVisible(h)==0:
-                return False,'窗口不可见',0,0.0
+                return False,'窗口不可见',0,0.0,0.0,0.0,1.0
             if user32.IsIconic(h)!=0:
-                return False,'窗口最小化',0,self._monitor_coverage(rect) if rect else 0.0
+                return False,'窗口最小化',0,self._monitor_coverage(rect) if rect else 0.0,0.0,0.0,1.0
             occ=self._dwm_occlusion_state(hwnd)
             if dwmapi is not None:
                 cloaked=ctypes.c_int(0)
@@ -1188,19 +1269,26 @@ class App:
                     DWMWA_CLOAKED=14
                     dwmapi.DwmGetWindowAttribute(h,ctypes.c_int(DWMWA_CLOAKED),ctypes.byref(cloaked),ctypes.sizeof(cloaked))
                     if cloaked.value!=0:
-                        return False,'窗口被系统隐藏',occ,self._monitor_coverage(rect) if rect else 0.0
+                        return False,'窗口被系统隐藏',occ,self._monitor_coverage(rect) if rect else 0.0,0.0,0.0,1.0
                 except Exception:
                     pass
             coverage=self._monitor_coverage(rect) if rect else 0.0
-            if coverage<=0.01:
-                return False,'窗口不在显示器范围',occ,coverage
+            core_ratio,edge_ratio=self._sample_window_visibility(hwnd,rect)
+            occ_ratio=self._pixel_occlusion_ratio(None,hwnd,rect)
+            if coverage<=0.05:
+                return False,'窗口大部分不在显示区域',occ,coverage,edge_ratio,core_ratio,occ_ratio
             if occ==1:
-                return False,'窗口被遮挡',occ,coverage
-            if occ==2:
-                return True,'完全可见',occ,coverage
-            return True,'检测到窗口',occ,coverage
+                return False,'窗口被遮挡',occ,coverage,edge_ratio,core_ratio,occ_ratio
+            if core_ratio<0.4:
+                return False,f"采样可见{core_ratio*100:.1f}%",occ,coverage,edge_ratio,core_ratio,occ_ratio
+            if occ==2 and coverage>=0.95 and edge_ratio>=0.95 and (occ_ratio is None or occ_ratio<=OCCLUSION_THR):
+                return True,'完全可见',occ,coverage,edge_ratio,core_ratio,occ_ratio
+            reason=f"采样可见{core_ratio*100:.1f}%"
+            if edge_ratio<0.8:
+                reason=f"边缘可见{edge_ratio*100:.1f}%"
+            return True,reason,occ,coverage,edge_ratio,core_ratio,occ_ratio
         except Exception:
-            return False,'检测异常',0,0.0
+            return False,'检测异常',0,0.0,0.0,0.0,1.0
     def _update_window_status(self,force=False):
         if self.window_obj is None:
             self.window_rect=None;self.window_hwnd=None;self.window_visible=False;self.window_full=False;self.window_occ_state=0;self.window_visible_reason='未选择窗口';self.window_full_reason='未选择窗口';self.schedule(lambda:self.visible_var.set('可见: 否(未选择窗口)'));self.schedule(lambda:self.full_var.set('完整: 否(未选择窗口)'));return
@@ -1214,25 +1302,23 @@ class App:
             vis_reason='无法检测'
             full_reason='无法检测'
             if rect:
-                visible,vis_reason,occ,coverage=self._check_window_visible(hwnd,rect)
+                visible,vis_reason,occ,coverage,edge_ratio,core_ratio,occ_ratio=self._check_window_visible(hwnd,rect)
                 self.window_occ_state=occ
+                self.window_coverage=coverage
+                self.window_edge_ratio=edge_ratio
+                self.window_core_ratio=core_ratio
+                self.window_occ_ratio=occ_ratio if occ_ratio is not None else 0.0
                 if visible:
-                    if coverage>=0.99:
-                        ratio=self._pixel_occlusion_ratio(None,hwnd,rect)
-                        if ratio is not None:
-                            full=ratio<=OCCLUSION_THR
-                            full_reason=f"遮挡率:{ratio*100:.2f}%"
-                        else:
-                            full=False
-                            full_reason='遮挡检测失败'
-                    else:
-                        full=False
-                        full_reason=f"覆盖率:{coverage*100:.2f}%"
+                    full,full_reason=self._resolve_full_status(self.window_coverage,self.window_edge_ratio,self.window_core_ratio,self.window_occ_state,self.window_occ_ratio)
                 else:
                     full=False
                     full_reason=vis_reason
             else:
                 self.window_occ_state=0
+                self.window_coverage=0.0
+                self.window_edge_ratio=0.0
+                self.window_core_ratio=0.0
+                self.window_occ_ratio=1.0
                 vis_reason='无法获取窗口区域'
                 full_reason=vis_reason
             self.window_visible=visible
@@ -1247,6 +1333,10 @@ class App:
             self.window_visible=False
             self.window_full=False
             self.window_occ_state=0
+            self.window_coverage=0.0
+            self.window_edge_ratio=0.0
+            self.window_core_ratio=0.0
+            self.window_occ_ratio=1.0
             self.window_visible_reason='检测异常'
             self.window_full_reason='检测异常'
             self.schedule(lambda:self.visible_var.set('可见: 否(检测异常)'))
@@ -1354,10 +1444,17 @@ class App:
                             if (now-self.last_occl_check>1.0 or not self.window_full) and self.window_visible:
                                 ratio=self._pixel_occlusion_ratio(frame,self.window_hwnd,self.window_rect)
                                 if ratio is not None:
-                                    coverage=self._monitor_coverage(self.window_rect)
-                                    self.window_full=bool(coverage>=0.99 and ratio<=OCCLUSION_THR)
-                                else:
-                                    self.window_full=False
+                                    self.window_occ_ratio=ratio
+                                coverage=self._monitor_coverage(self.window_rect)
+                                self.window_coverage=coverage
+                                core_ratio,edge_ratio=self._sample_window_visibility(self.window_hwnd,self.window_rect)
+                                self.window_core_ratio=core_ratio
+                                self.window_edge_ratio=edge_ratio
+                                if self.window_visible:
+                                    full,full_reason=self._resolve_full_status(self.window_coverage,self.window_edge_ratio,self.window_core_ratio,self.window_occ_state,self.window_occ_ratio)
+                                    self.window_full=full
+                                    self.window_full_reason=full_reason
+                                    self.schedule(lambda f=self.window_full,t=self.window_full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
                             self._enqueue_drop(self.cap_queue,(frame,now))
                         except Exception:
                             pass
