@@ -311,14 +311,12 @@ class ExperienceWriter:
                     np.savez_compressed(name,frame_jpg=buf,meta=json.dumps(data,ensure_ascii=False))
                     jpg_bytes=buf.tobytes()
                     try:
-                        with open(name.replace(".npz",".jpg"),"wb") as jf:
+                        jpg_path=name.replace(".npz",".jpg")
+                        with open(jpg_path,"wb") as jf:
                             jf.write(jpg_bytes)
                         preview_path=self.latest_learn if int(source)==1 else self.latest_train
                         with open(preview_path,"wb") as pf:
                             pf.write(jpg_bytes)
-                    try:
-                        with open(name.replace(".npz",".jpg"),"wb") as jf:
-                            jf.write(buf.tobytes())
                     except Exception:
                         pass
                 else:
