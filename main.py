@@ -864,6 +864,17 @@ class App:
                 return (rect.left,rect.top,rect.right,rect.bottom)
         except Exception:
             pass
+        try:
+            if self.window_obj is not None:
+                self.window_obj.refresh()
+                left=int(getattr(self.window_obj,"left",0))
+                top=int(getattr(self.window_obj,"top",0))
+                right=int(getattr(self.window_obj,"right",left+int(getattr(self.window_obj,"width",0))))
+                bottom=int(getattr(self.window_obj,"bottom",top+int(getattr(self.window_obj,"height",0))))
+                if right>left and bottom>top:
+                    return (left,top,right,bottom)
+        except Exception:
+            pass
         return None
     def _resolve_window_handle(self):
         if self.window_obj is None:
