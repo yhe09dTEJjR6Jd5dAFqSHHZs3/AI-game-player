@@ -1199,11 +1199,11 @@ class App:
             if frame is not None and ratio<=1.0:
                 capture=self._print_window(hwnd_int,w,h)
                 if capture is not None:
-                    if capture.shape[0]!=frame.shape[0] or capture.shape[1]!=frame.shape[1]:
-                        sample=cv2.resize(frame,(capture.shape[1],capture.shape[0]))
-                    else:
-                        sample=frame
-                    diff=cv2.absdiff(cv2.cvtColor(sample,cv2.COLOR_BGR2GRAY),cv2.cvtColor(capture,cv2.COLOR_BGR2GRAY));mask=(diff>18).astype(np.uint8);ratio=max(ratio,float(np.count_nonzero(mask))/mask.size)
+                    gray_cap=cv2.cvtColor(capture,cv2.COLOR_BGR2GRAY)
+                    intensity=float(gray_cap.mean())
+                    visible_pixels=float(np.count_nonzero(gray_cap>8))/max(gray_cap.size,1)
+                    if intensity<4.0 or visible_pixels<0.1:
+                        ratio=max(ratio,0.95)
             if occ_state==2:
                 ratio=min(ratio,0.05)
             self.last_occl_check=time.time()
@@ -1289,16 +1289,24 @@ class App:
             edge=[]
             core_pos=[0.25,0.5,0.75]
             edge_pos=[0.02,0.5,0.98]
+            margin_x=max(1,int(w*0.02))
+            margin_y=max(1,int(h*0.02))
+            safe_left=left+margin_x
+            safe_right=max(safe_left,right-margin_x-1)
+            safe_top=top+margin_y
+            safe_bottom=max(safe_top,bottom-margin_y-1)
+            def _sample_point(fx,fy):
+                px=float(left+min(max(fx,0.0),1.0)*(w-1))
+                py=float(top+min(max(fy,0.0),1.0)*(h-1))
+                ix=int(min(max(px,safe_left),safe_right))
+                iy=int(min(max(py,safe_top),safe_bottom))
+                return ix,iy
             for fx in core_pos:
                 for fy in core_pos:
-                    px=int(left+min(max(fx,0.0),1.0)*(w-1))
-                    py=int(top+min(max(fy,0.0),1.0)*(h-1))
-                    core.append((px,py))
+                    core.append(_sample_point(fx,fy))
             for fx in edge_pos:
                 for fy in edge_pos:
-                    px=int(left+min(max(fx,0.0),1.0)*(w-1))
-                    py=int(top+min(max(fy,0.0),1.0)*(h-1))
-                    edge.append((px,py))
+                    edge.append(_sample_point(fx,fy))
             core_hit=0
             edge_hit=0
             for px,py in core:
@@ -1430,57 +1438,55 @@ class App:
         self.window_core_ratio=core_ratio
         sample_good=frame.size>0 and np.std(frame)>3.0
         h=ctypes.wintypes.HWND(int(hwnd)) if user32 is not None else None
-        base_visible=False
-        base_reason='系统不支持'
-        if user32 is not None and h:
-            if user32.IsWindow(h)==0:
-                base_reason='窗口句柄无效'
-            elif user32.IsWindowVisible(h)==0:
-                base_reason='窗口不可见'
-            elif user32.IsIconic(h)!=0:
-                base_reason='窗口最小化'
-            elif occ_state==1:
-                base_reason='窗口被遮挡'
-            else:
-                base_visible=True
-                base_reason='窗口活动'
-        elif sample_good:
-            base_visible=True
-            base_reason='捕获成功'
-        if sample_good and coverage>=0.5 and core_ratio>=0.4:
-            base_visible=True
-            if base_reason!='窗口活动':
-                base_reason='捕获成功'
-        if occ_ratio>0.75:
-            base_visible=False
-            base_reason=f'遮挡率{occ_ratio*100:.1f}%'
-        if base_visible and coverage<0.5:
-            base_visible=False
-            base_reason=f'显示区域{coverage*100:.1f}%'
-        visible=base_visible and sample_good
-        vis_reason=base_reason
-        if sample_good is False:
+        visible=True
+        vis_reason='采样通过' if sample_good else '画面不足'
+        if not sample_good:
             visible=False
-            vis_reason='画面不足'
-        full=False
-        full_reason=vis_reason
-        if visible:
+        if visible and user32 is not None and h:
+            if user32.IsWindow(h)==0:
+                visible=False
+                vis_reason='窗口句柄无效'
+            elif user32.IsWindowVisible(h)==0:
+                visible=False
+                vis_reason='窗口不可见'
+            elif user32.IsIconic(h)!=0:
+                visible=False
+                vis_reason='窗口最小化'
+        if visible and occ_state==1:
+            visible=False
+            vis_reason='窗口被遮挡'
+        if visible and occ_ratio>=0.85:
+            visible=False
+            vis_reason=f'遮挡率{occ_ratio*100:.1f}%'
+        if visible and coverage<0.35:
+            visible=False
+            vis_reason=f'显示区域{coverage*100:.1f}%'
+        if visible and core_ratio<0.25:
+            visible=False
+            vis_reason=f'采样可见{core_ratio*100:.1f}%'
+        if visible and edge_ratio<0.2:
+            visible=False
+            vis_reason=f'边缘可见{edge_ratio*100:.1f}%'
+        if not visible and sample_good and occ_state!=1 and occ_ratio<0.5 and core_ratio>=0.4:
+            visible=True
+            vis_reason='捕获成功'
+        full=visible
+        full_reason='完全可见' if full else vis_reason
+        if full and coverage<0.85:
+            full=False
+            full_reason=f'覆盖{coverage*100:.1f}%'
+        if full and edge_ratio<0.55:
+            full=False
+            full_reason=f'边缘可见{edge_ratio*100:.1f}%'
+        if full and core_ratio<0.55:
+            full=False
+            full_reason=f'采样可见{core_ratio*100:.1f}%'
+        if full and occ_ratio>0.2:
+            full=False
+            full_reason=f'遮挡率{occ_ratio*100:.1f}%'
+        if occ_state==2 and occ_ratio<=0.05 and visible:
             full=True
-            full_reason='采样通过'
-            if coverage<0.88:
-                full=False
-                full_reason=f'覆盖{coverage*100:.1f}%'
-            elif edge_ratio<0.75:
-                full=False
-                full_reason=f'边缘可见{edge_ratio*100:.1f}%'
-            elif core_ratio<0.75:
-                full=False
-                full_reason=f'采样可见{core_ratio*100:.1f}%'
-            elif occ_ratio>0.2:
-                full=False
-                full_reason=f'遮挡率{occ_ratio*100:.1f}%'
-            elif occ_state==2 and occ_ratio<=0.02:
-                full_reason='完全可见'
+            full_reason='完全可见'
         self.window_visible=visible
         self.window_full=full
         self.window_visible_reason=vis_reason
@@ -1620,21 +1626,23 @@ class App:
             except Exception:
                 time.sleep(0.01);continue
             frame,_=item
+            raw_frame=frame
+            proc_frame=frame
             scale=1.0
             if self.metrics["temp"]>=80 or self.metrics["pwr"]>=0.95 or self.metrics["vram"]>=90.0:scale=0.75
             if self.metrics["vram"]>=96.0:scale=0.5
             if scale!=1.0:
-                h,w=frame.shape[:2];nw=max(64,int(w*scale));nh=max(64,int(h*scale));frame=cv2.resize(frame,(nw,nh))
-            with self.frame_lock:self.frame=frame
-            self._append_history(frame)
-            if self.mode=="learn" and not self.resource_paused and self.window_visible and self.window_full:self._analyze_ui_async(frame)
-            self._enqueue_drop(self.prep_queue,(frame,time.time()))
+                h,w=proc_frame.shape[:2];nw=max(64,int(w*scale));nh=max(64,int(h*scale));proc_frame=cv2.resize(proc_frame,(nw,nh))
+            with self.frame_lock:self.frame=raw_frame
+            self._append_history(proc_frame)
+            if self.mode=="learn" and not self.resource_paused and self.window_visible and self.window_full:self._analyze_ui_async(proc_frame)
+            self._enqueue_drop(self.prep_queue,(raw_frame,proc_frame,time.time()))
             try:self.cap_queue.task_done()
             except Exception:pass
     def _writer_loop(self):
         while self.running:
             try:
-                frame,_=self.prep_queue.get(timeout=0.1)
+                raw_frame,proc_frame,_=self.prep_queue.get(timeout=0.1)
             except Exception:
                 time.sleep(0.01);continue
             if self.recording_enabled and not self.resource_paused and self.capture_enabled and self.window_visible and self.window_full and self.window_rect is not None and self.mode in ("learn","train"):
@@ -1642,7 +1650,7 @@ class App:
                 action=[0.0,0.0,0.0]
                 pos=[(center[0]-rect[0])/(rect[2]-rect[0]),(center[1]-rect[1])/(rect[3]-rect[1])]
                 source=1 if self.mode=="learn" else 2;title=self._window_title()
-                try:self.writer.record(frame,action,pos,source,rect,title,self.mode,"frame");self.buffer.add(frame,action,source,0,0,-1,self.perception.last_text)
+                try:self.writer.record(raw_frame,action,pos,source,rect,title,self.mode,"frame");self.buffer.add(proc_frame,action,source,0,0,-1,self.perception.last_text)
                 except Exception:pass
             try:self.prep_queue.task_done()
             except Exception:pass
@@ -1722,8 +1730,8 @@ class App:
         with self.frame_lock:frame=self.frame.copy() if self.frame is not None else None
         if frame is not None:
             rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);image=Image.fromarray(rgb);w=min(640,image.width);h=int(image.height*float(w)/float(image.width));image=image.resize((w,h))
-            self.photo=ImageTk.PhotoImage(image=image);self.frame_label.configure(image=self.photo)
-        else:self.frame_label.configure(image="")
+            self.photo=ImageTk.PhotoImage(image=image);self.frame_label.configure(image=self.photo);self.frame_label.image=self.photo
+        else:self.frame_label.configure(image="");self.frame_label.image=None
         self.cpu_var.set(f"CPU:{self.metrics['cpu']:.1f}%");self.mem_var.set(f"Memory:{self.metrics['mem']:.1f}%");self.gpu_var.set(f"GPU:{self.metrics['gpu']:.1f}%");self.vram_var.set(f"VRAM:{self.metrics['vram']:.1f}%");self.freq_var.set(f"Capture:{self.metrics['freq']:.1f} Hz");self.progress_text.set(f"{self.progress_var.get():.0f}%")
         self.root.after(50,self._update_ui)
     def _check_mode_switch(self):
