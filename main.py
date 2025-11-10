@@ -1756,6 +1756,11 @@ class App:
                 return ""
         return self.selected_title.get() or ""
     def _update_ui(self):
+        try:
+            if not self.root.winfo_exists():
+                return
+        except Exception:
+            return
         while not self.ui_queue.empty():
             func=self.ui_queue.get()
             try:func()
@@ -1763,7 +1768,8 @@ class App:
         with self.frame_lock:frame=self.frame.copy() if self.frame is not None else None
         if frame is not None:
             rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);image=Image.fromarray(rgb);w=min(640,image.width);h=int(image.height*float(w)/float(image.width));image=image.resize((w,h))
-            self.photo=ImageTk.PhotoImage(image=image);self.frame_label.configure(image=self.photo);self.frame_label.image=self.photo
+            try:self.photo=ImageTk.PhotoImage(image=image,master=self.root);self.frame_label.configure(image=self.photo);self.frame_label.image=self.photo
+            except Exception:self.frame_label.configure(image="");self.frame_label.image=None
         else:self.frame_label.configure(image="");self.frame_label.image=None
         self.cpu_var.set(f"CPU:{self.metrics['cpu']:.1f}%");self.mem_var.set(f"Memory:{self.metrics['mem']:.1f}%");self.gpu_var.set(f"GPU:{self.metrics['gpu']:.1f}%");self.vram_var.set(f"VRAM:{self.metrics['vram']:.1f}%");self.freq_var.set(f"Capture:{self.metrics['freq']:.1f} Hz");self.progress_text.set(f"{self.progress_var.get():.0f}%")
         self.root.after(50,self._update_ui)
