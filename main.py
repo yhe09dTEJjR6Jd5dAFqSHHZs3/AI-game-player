@@ -864,6 +864,7 @@ class App:
         self.window_occ_ratio=0.0
         self.window_visible_reason='未知'
         self.window_full_reason='未知'
+        self.last_print_frame=None
         self.last_occl_check=0.0
         self.status_lock=threading.Lock()
         self.monitor_bounds=[(m.x,m.y,m.width,m.height) for m in get_monitors()]
@@ -1197,7 +1198,7 @@ class App:
                 cur=user32.GetWindow(cur_hwnd,ctypes.c_int(GW_HWNDPREV))
             occ=float(_rect_union_area(overlaps));ratio=occ/area if area>0 else 1.0
             if frame is not None and ratio<=1.0:
-                capture=self._print_window(hwnd_int,w,h)
+                capture=self.last_print_frame if self.last_print_frame is not None else self._print_window(hwnd_int,w,h)
                 if capture is not None:
                     gray_cap=cv2.cvtColor(capture,cv2.COLOR_BGR2GRAY)
                     intensity=float(gray_cap.mean())
@@ -1436,7 +1437,12 @@ class App:
         self.window_coverage=coverage
         self.window_edge_ratio=edge_ratio
         self.window_core_ratio=core_ratio
-        sample_good=frame.size>0 and np.std(frame)>3.0
+        print_frame=self.last_print_frame
+        if print_frame is not None and print_frame.size>0:
+            if frame is None or frame.size==0:
+                frame=print_frame
+        sample_frames=[f for f in (frame,print_frame) if f is not None and getattr(f,"size",0)>0]
+        sample_good=any(np.std(f)>1.5 for f in sample_frames)
         h=ctypes.wintypes.HWND(int(hwnd)) if user32 is not None else None
         visible=True
         vis_reason='采样通过' if sample_good else '画面不足'
@@ -1455,33 +1461,33 @@ class App:
         if visible and occ_state==1:
             visible=False
             vis_reason='窗口被遮挡'
-        if visible and occ_ratio>=0.85:
+        if visible and occ_ratio>=0.7:
             visible=False
             vis_reason=f'遮挡率{occ_ratio*100:.1f}%'
-        if visible and coverage<0.35:
+        if visible and coverage<0.2:
             visible=False
             vis_reason=f'显示区域{coverage*100:.1f}%'
-        if visible and core_ratio<0.25:
+        if visible and core_ratio<0.18:
             visible=False
             vis_reason=f'采样可见{core_ratio*100:.1f}%'
-        if visible and edge_ratio<0.2:
+        if visible and edge_ratio<0.12:
             visible=False
             vis_reason=f'边缘可见{edge_ratio*100:.1f}%'
-        if not visible and sample_good and occ_state!=1 and occ_ratio<0.5 and core_ratio>=0.4:
+        if not visible and sample_good and occ_state!=1 and coverage>=0.2 and occ_ratio<0.75:
             visible=True
             vis_reason='捕获成功'
         full=visible
         full_reason='完全可见' if full else vis_reason
-        if full and coverage<0.85:
+        if full and coverage<0.75:
             full=False
             full_reason=f'覆盖{coverage*100:.1f}%'
-        if full and edge_ratio<0.55:
+        if full and edge_ratio<0.45:
             full=False
             full_reason=f'边缘可见{edge_ratio*100:.1f}%'
-        if full and core_ratio<0.55:
+        if full and core_ratio<0.45:
             full=False
             full_reason=f'采样可见{core_ratio*100:.1f}%'
-        if full and occ_ratio>0.2:
+        if full and occ_ratio>0.35:
             full=False
             full_reason=f'遮挡率{occ_ratio*100:.1f}%'
         if occ_state==2 and occ_ratio<=0.05 and visible:
@@ -1596,23 +1602,50 @@ class App:
                 q.put_nowait(item)
             except Exception:
                 pass
+    def _capture_window_frame(self,rect):
+        try:
+            self.last_print_frame=None
+            hwnd=self.window_hwnd
+            if rect is None or hwnd is None:
+                return None
+            left,top,right,bottom=rect
+            width=max(1,int(right-left))
+            height=max(1,int(bottom-top))
+            frame=None
+            if user32 is not None and gdi32 is not None:
+                capture=self._print_window(int(hwnd),width,height)
+                if capture is not None and capture.size>0:
+                    if capture.shape[0]!=height or capture.shape[1]!=width:
+                        capture=cv2.resize(capture,(width,height))
+                    if float(np.std(capture))>1.5:
+                        self.last_print_frame=capture
+                        frame=capture
+            if frame is None:
+                shot=self.mss_ctx.grab({"left":int(left),"top":int(top),"width":width,"height":height})
+                arr=np.array(shot)
+                if arr.shape[-1]==4:
+                    arr=cv2.cvtColor(arr,cv2.COLOR_BGRA2BGR)
+                frame=arr
+            return frame
+        except Exception:
+            self.last_print_frame=None
+            return None
     def _capture_loop(self):
         while self.running:
             start=time.time();f=self.metrics.get("freq",0.0)
             if f<=0.0 or not self.capture_enabled or self.resource_paused:time.sleep(0.05);continue
             if self.window_hwnd is not None:
-                self._update_window_status()
+                self._refresh_window_geometry()
                 rect=self.window_rect
                 if rect is not None:
-                    left,top,right,bottom=rect;width=right-left;height=bottom-top
-                    if width>0 and height>0:
-                        try:
-                            shot=self.mss_ctx.grab({"left":left,"top":top,"width":width,"height":height});frame=np.array(shot);frame=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
-                            now=time.time()
-                            self._update_window_status(frame=frame)
-                            self._enqueue_drop(self.cap_queue,(frame,now))
-                        except Exception:
-                            self._evaluate_visibility(None)
+                    frame=self._capture_window_frame(rect)
+                    if frame is not None and frame.size>0:
+                        now=time.time()
+                        self._evaluate_visibility(frame)
+                        self._enqueue_drop(self.cap_queue,(frame,now))
+                    else:
+                        with self.frame_lock:self.frame=None
+                        self._evaluate_visibility(None)
                 else:
                     with self.frame_lock:self.frame=None
                     self._evaluate_visibility(None)
