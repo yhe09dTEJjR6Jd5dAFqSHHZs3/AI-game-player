@@ -1508,7 +1508,7 @@ class App:
             self.window_visible_reason='未选择窗口'
             self.window_full_reason='未选择窗口'
             self.window_occ_state=0
-        self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
+            self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
             self.window_occ_ratio=1.0
             self.window_coverage=0.0
             self.window_edge_ratio=0.0
@@ -1539,7 +1539,7 @@ class App:
             self.window_visible_reason=reason
             self.window_full_reason=reason
             self.window_occ_state=0
-        self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
+            self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
             self.window_occ_ratio=1.0
             self.window_coverage=0.0
             self.window_edge_ratio=0.0
@@ -1983,7 +1983,14 @@ class App:
             target_x=rect[0]+width*(0.5+dx*0.25);target_y=rect[1]+height*(0.5+dy*0.25)
             if click_prob>0.7 and not self.hold_state:self.hold_state=True;pyautogui.mouseDown()
             if click_prob<0.3 and self.hold_state:self.hold_state=False;pyautogui.mouseUp()
-            pyautogui.moveTo(target_x,target_y,duration=0.01)
+            cur=pyautogui.position();
+            dxp=abs(float(target_x)-float(cur[0]));dyp=abs(float(target_y)-float(cur[1]));
+            if dxp>=1 or dyp>=1:
+                dur=max(0.02,min(0.1,self.ai_interval*0.5 if hasattr(self,'ai_interval') else 0.05))
+                try:pyautogui.moveTo(target_x,target_y,duration=dur)
+                except ZeroDivisionError:pyautogui.moveTo(target_x,target_y,duration=0)
+            else:
+                pass
             if not self.hold_state and 0.5<click_prob<=0.7:pyautogui.click()
             frame=self._current_frame_copy()
             if frame is not None and self.recording_enabled and not self.resource_paused:
@@ -2048,10 +2055,15 @@ class App:
         bs=max(4,int(8+64*(1.0-M)));lr=1e-4*(0.5 if hot else 1.0)
         for g in self.optimizer.param_groups:g["lr"]=lr
         prefetch_factor=4
-        dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=True,drop_last=True,persistent_workers=(num_workers>0,persistent_workers=True,pin_memory=True,persistent_workers=True,pin_memory=(device=='cuda')),prefetch_factor=prefetch_factor if num_workers>0 else None)
-        epochs=3;total=max(1,(len(ds)//max(1,bs))*epochs);done_steps=0
-        self.model.train();best_loss=None;c_scores={}
-        start_time=time.time();self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
+        dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=True,persistent_workers=(num_workers>0),prefetch_factor=prefetch_factor if num_workers>0 else None)
+        epochs=3
+        total=max(1,(len(ds)//max(1,bs))*epochs)
+        done_steps=0
+        self.model.train()
+        best_loss=None
+        c_scores={}
+        start_time=time.time()
+        self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
         for ep in range(epochs):
             if self.optimize_event.is_set():break
             it=iter(dl)
@@ -2060,6 +2072,9 @@ class App:
                 except StopIteration:break
                 if self.optimize_event.is_set():break
                 if isinstance(item,tuple) and len(item)>=7:
+                    seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=item if len(item)==8 else (item[0],item[1],item[2],item[3],torch.full_like(item[3],-1),item[4],item[5],item[6])
+                else:
+                    if isinstance(item,tuple) and len(item)>=7:
                     seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=item if len(item)==8 else (item[0],item[1],item[2],item[3],torch.full_like(item[3],-1),item[4],item[5],item[6])
                 else:
                     seq,act=item;atype_t=torch.zeros((seq.shape[0],),dtype=torch.long);ctrl_t=torch.full((seq.shape[0],),-1,dtype=torch.long);path_vec=torch.zeros((seq.shape[0],64),dtype=torch.float32);texts=[""]*seq.shape[0];success=torch.zeros((seq.shape[0],),dtype=torch.long)
