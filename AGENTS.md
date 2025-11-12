@@ -1,5 +1,3 @@
-优化代码。
-
 要求：
 
 仅用一个没有注释的Python程序实现所有功能。
@@ -60,3 +58,6 @@ FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `t
 
 YOLO12n下载链接：
 https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo12n.pt
+
+
+
