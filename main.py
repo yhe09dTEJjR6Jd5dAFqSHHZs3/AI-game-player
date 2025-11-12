@@ -245,6 +245,86 @@ class UIElementPool:
         T=T/torch.clamp(T.norm(dim=1,keepdim=True),min=1e-6)
         id2idx={pid:i for i,pid in enumerate(ids)}
         return T.to(device),id2idx
+
+class ActionTemplateLibrary:
+    def __init__(self,dim=64,max_k=32):
+        self.dim=int(dim)
+        self.max_k=int(max_k)
+        self.next_id=1
+        self.templates=[]
+        self.lock=threading.Lock()
+    def _resample(self,path,L=32):
+        if not path or len(path)<2:
+            return np.zeros((L,2),dtype=np.float32)
+        pts=np.array(path,dtype=np.float32)
+        d=np.sqrt(((pts[1:]-pts[:-1])**2).sum(1))+1e-6
+        s=np.concatenate([[0.0],np.cumsum(d)])
+        t=np.linspace(0.0,s[-1],L)
+        x=np.interp(t,s,pts[:,0])
+        y=np.interp(t,s,pts[:,1])
+        return np.stack([x,y],1)
+    def _quad(self,p0,p1,p2,t):
+        return (1-t)**2*p0+2*(1-t)*t*p1+t**2*p2
+    def _bezier_feat(self,path):
+        L=32
+        pts=self._resample(path,max(8,L//2+1))
+        mid=pts[len(pts)//2]
+        p0=pts[0];p2=pts[-1]
+        c1=2*mid-0.5*(p0+p2)
+        t=np.linspace(0,1,L//2,endpoint=False)
+        seg1=self._quad(p0,c1,(p0+mid)/2.0,t)
+        seg2=self._quad((p0+mid)/2.0,c1,p2,t)
+        curve=np.vstack([seg1,seg2])
+        dv=np.diff(np.vstack([curve[:1],curve]),axis=0)
+        feat=dv.reshape(-1)
+        if feat.shape[0]<self.dim:
+            feat=np.pad(feat,(0,self.dim-feat.shape[0]))
+        return feat[:self.dim].astype(np.float32),curve.astype(np.float32)
+    def _dtw(self,a,b):
+        n=len(a);m=len(b)
+        D=np.full((n+1,m+1),1e9,dtype=np.float32);D[0,0]=0.0
+        for i in range(1,n+1):
+            for j in range(1,m+1):
+                cost=np.linalg.norm(a[i-1]-b[j-1])
+                D[i,j]=cost+min(D[i-1,j],D[i,j-1],D[i-1,j-1])
+        return float(D[n,m])
+    def add_path(self,path):
+        feat,curve=self._bezier_feat(path)
+        with self.lock:
+            if not self.templates:
+                tid=self.next_id;self.next_id+=1
+                self.templates.append({"id":tid,"mean":feat.copy(),"var":np.ones_like(feat)*0.1,"count":1,"curve":curve})
+                return tid
+            best_id=None;best_score=None;best_idx=-1
+            for i,tpl in enumerate(self.templates):
+                pw=np.maximum(tpl["var"],1e-3)
+                ll=-0.5*np.sum((feat-tpl["mean"])**2/pw)-0.5*np.sum(np.log(pw+1e-6))
+                try:
+                    d=self._dtw(curve,tpl["curve"])
+                except Exception:
+                    d=0.0
+                s=ll-0.1*d
+                if best_score is None or s>best_score:
+                    best_score=s;best_id=tpl["id"];best_idx=i
+            if best_score is None or best_score<-50.0 or len(self.templates)<self.max_k and random.random()<0.2:
+                tid=self.next_id;self.next_id+=1
+                self.templates.append({"id":tid,"mean":feat.copy(),"var":np.ones_like(feat)*0.1,"count":1,"curve":curve})
+                return tid
+            tpl=self.templates[best_idx];c=tpl["count"]
+            new_mean=(tpl["mean"]*c+feat)/(c+1.0)
+            new_var=0.9*tpl["var"]+0.1*np.square(feat-new_mean)
+            tpl["mean"]=new_mean;tpl["var"]=new_var;tpl["count"]=c+1;tpl["curve"]=0.8*tpl["curve"]+0.2*curve
+            return best_id
+    def matrix(self):
+        with self.lock:
+            if not self.templates:
+                return None,{}
+            M=np.stack([t["mean"] for t in self.templates],0).astype(np.float32)
+            ids=[t["id"] for t in self.templates]
+        T=torch.from_numpy(M)
+        T=T/torch.clamp(T.norm(dim=1,keepdim=True),min=1e-6)
+        id2idx={tid:i for i,tid in enumerate(ids)}
+        return T.to(device),id2idx
 class ExperienceWriter:
     def __init__(self,root_dir,max_bytes=8589934592):
         self.root_dir=root_dir
@@ -413,7 +493,7 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
             blank=np.zeros((256,256,3),np.uint8)
             seq=np.stack([blank]*self.seq,0)
             act=np.zeros(3,np.float32)
-            return seq,act,np.array(0,dtype=np.int64),np.array(-1,dtype=np.int64),np.zeros((64,),np.float32),"",0
+            return seq,act,np.array(0,dtype=np.int64),np.array(-1,dtype=np.int64),np.array(-1,dtype=np.int64),np.zeros((64,),np.float32),"",0
         i=random.randint(0,len(self.files)-1)
         try:
             arr=np.load(self.files[i],allow_pickle=True)
@@ -431,13 +511,14 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
             elif ev=="drag":
                 atype=2
             ctrl=int(extra.get("proto",-1)) if isinstance(extra,dict) else -1
+            tmpl=int(extra.get("tmpl",-1)) if isinstance(extra,dict) else -1
             path_vec=self._encode_path(extra)
             text=str(meta.get("event_text",""))
             success=1 if any(k in text.lower() for k in ["win","victory","success","complete"]) else 0
         except Exception:
             frame=np.zeros((256,256,3),np.uint8);act=np.zeros(3,np.float32);atype=0;ctrl=-1;path_vec=np.zeros((64,),np.float32);text="";success=0
         seq=np.stack([self._aug(frame.copy()) for _ in range(self.seq)],0)
-        return seq,act,np.array(atype,dtype=np.int64),np.array(ctrl,dtype=np.int64),path_vec,text,success
+        return seq,act,np.array(atype,dtype=np.int64),np.array(ctrl,dtype=np.int64),np.array(tmpl,dtype=np.int64),path_vec,text,success
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -732,6 +813,55 @@ class PerceptionEngine:
             x1,y1,x2,y2=d["bbox"];cx=(x1+x2)/2/W;cy=(y1+y2)/2/H
             out.append((cx,cy,d.get("label","0"),d.get("score",0.0)))
         return out,txt
+
+class StateGraph:
+    def __init__(self):
+        self.nodes=set()
+        self.edges={} 
+        self.last_state=None
+        self.pending=None
+    def _normalize(self,txt):
+        if not txt: return "EMPTY|0"
+        t=str(txt).lower()
+        nums=[int(x) for x in re.findall(r"\d+",t)]
+        score=nums[-1] if nums else 0
+        if score<10:b="0-9"
+        elif score<50:b="10-49"
+        elif score<100:b="50-99"
+        else:b="100+"
+        return f"{t[:64]}|{b}"
+    def observe(self,txt):
+        s=self._normalize(txt)
+        self.nodes.add(s)
+        if self.pending is not None:
+            prev,action=self.pending
+            self.edges.setdefault(prev,{}).setdefault(action,{})
+            self.edges[prev][action][s]=self.edges[prev][action].get(s,0)+1
+            self.pending=None
+        self.last_state=s
+    def note_action(self,txt,ctrl,atype):
+        s=self._normalize(txt)
+        self.nodes.add(s)
+        self.pending=(s,(int(ctrl),int(atype)))
+    def reachability(self,ctrl):
+        ctrl=int(ctrl)
+        good=set([n for n in self.nodes if n.endswith("100+")])
+        if not good: return 0.0
+        dist={n:(0 if n in good else 1e9) for n in self.nodes}
+        for _ in range(3):
+            updated=False
+            for u,acts in self.edges.items():
+                for (c,a),vs in acts.items():
+                    if c!=ctrl: continue
+                    for v,w in vs.items():
+                        if dist[v]+1<dist[u]:
+                            dist[u]=dist[v]+1;updated=True
+            if not updated: break
+        cur=self.last_state or next(iter(self.nodes)) if self.nodes else None
+        if cur is None: return 0.0
+        d=dist.get(cur,1e9)
+        if d>=1e9: return 0.0
+        return max(0.0,1.0/(1.0+d))
 class GoalGraph:
     def __init__(self):
         self.lock=threading.Lock()
@@ -816,6 +946,9 @@ class App:
             except Exception:pass
         self.optimizer=optim.Adam(self.model.parameters(),lr=1e-4)
         self.capture_interval=0.05
+        self._cap_interval_ema=self.capture_interval
+        self._ai_interval_ema=0.05
+        self._paused_hysteresis=False
         self.metrics={"cpu":0.0,"mem":0.0,"gpu":0.0,"vram":0.0,"freq":20.0,"temp":0.0,"pwr":0.0}
         self.gpu_source="不可用"
         self.frame=None
@@ -858,6 +991,7 @@ class App:
         self.window_visible=False
         self.window_full=False
         self.window_occ_state=0
+        self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
         self.window_coverage=0.0
         self.window_core_ratio=0.0
         self.window_edge_ratio=0.0
@@ -899,8 +1033,10 @@ class App:
         except Exception:
             self.clip_model=None;self.clip_preprocess=None
         self.pool=UIElementPool(self.clip_model,self.clip_preprocess)
+        self.templates=ActionTemplateLibrary()
         self.rule_text=""
         self.goal_graph=GoalGraph()
+        self.state_graph=StateGraph()
         try:
             if os.cpu_count():
                 torch.set_num_threads(max(1,min(os.cpu_count(),8)))
@@ -1372,6 +1508,7 @@ class App:
             self.window_visible_reason='未选择窗口'
             self.window_full_reason='未选择窗口'
             self.window_occ_state=0
+        self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
             self.window_occ_ratio=1.0
             self.window_coverage=0.0
             self.window_edge_ratio=0.0
@@ -1402,6 +1539,7 @@ class App:
             self.window_visible_reason=reason
             self.window_full_reason=reason
             self.window_occ_state=0
+        self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
             self.window_occ_ratio=1.0
             self.window_coverage=0.0
             self.window_edge_ratio=0.0
@@ -1493,12 +1631,25 @@ class App:
         if occ_state==2 and occ_ratio<=0.05 and visible:
             full=True
             full_reason='完全可见'
-        self.window_visible=visible
-        self.window_full=full
+        v_raw=visible;f_raw=full
+        if v_raw:self._vis_pass=self._vis_pass+1;self._vis_fail=0
+        else:self._vis_fail=self._vis_fail+1;self._vis_pass=0
+        if f_raw:self._full_pass=self._full_pass+1;self._full_fail=0
+        else:self._full_fail=self._full_fail+1;self._full_pass=0
+        if not getattr(self,'_vis_state',False) and self._vis_fail>=3:self._vis_state=False
+        if getattr(self,'_vis_state',False) and self._vis_pass>=2:self._vis_state=True
+        if not getattr(self,'_vis_state',False) and self._vis_pass>=2:self._vis_state=True
+        if getattr(self,'_vis_state',False) and self._vis_fail>=3:self._vis_state=False
+        if not getattr(self,'_full_state',False) and self._full_fail>=3:self._full_state=False
+        if getattr(self,'_full_state',False) and self._full_pass>=2:self._full_state=True
+        if not getattr(self,'_full_state',False) and self._full_pass>=2:self._full_state=True
+        if getattr(self,'_full_state',False) and self._full_fail>=3:self._full_state=False
+        self.window_visible=bool(self._vis_state)
+        self.window_full=bool(self._full_state)
         self.window_visible_reason=vis_reason
         self.window_full_reason=full_reason
-        self.schedule(lambda v=visible,r=vis_reason:self.visible_var.set(f"可见: {'是' if v else '否'}({r})"))
-        self.schedule(lambda f=full,t=full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
+        self.schedule(lambda v=self.window_visible,r=vis_reason:self.visible_var.set(f"可见: {'是' if v else '否'}({r})"))
+        self.schedule(lambda f=self.window_full,t=full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
         title=self._window_title()
         state_title=title if title else '未选择窗口'
         handle_text=f"0x{int(hwnd):08X}" if hwnd is not None else "N/A"
@@ -1568,11 +1719,23 @@ class App:
             cpu=float(psutil.cpu_percent(interval=None));mem=float(psutil.virtual_memory().percent);gpu,mem_gpu,temp,pwr_ratio=self._gpu_metrics_ext()
             if self.gpu_source=="不可用":M=max(cpu,mem)/100.0
             else:M=max(cpu,mem,gpu,mem_gpu)/100.0
-            freq=max(0.0,100.0*(1.0-M))
+            paused_next=self._paused_hysteresis
+            if not paused_next and M>=0.95:paused_next=True
+            if paused_next and M<=0.90:paused_next=False
+            self._paused_hysteresis=paused_next
+            if paused_next:freq=0.0
+            else:freq=max(0.0,100.0*(1.0-M))
             self.metrics={"cpu":cpu,"mem":mem,"gpu":gpu,"vram":mem_gpu,"freq":freq,"temp":temp,"pwr":pwr_ratio}
-            if freq>0:self.capture_interval=1.0/freq
-            self.ai_interval=0.02+0.08*min(max(M,0.0),1.0)
-            if temp>=80 or pwr_ratio>=0.95:self.ai_interval*=2.0
+            if freq>0:
+                target_ci=1.0/freq
+            else:
+                target_ci=0.05
+            self._cap_interval_ema=0.8*self._cap_interval_ema+0.2*target_ci
+            self.capture_interval=max(0.005,float(self._cap_interval_ema))
+            target_ai=0.02+0.08*min(max(M,0.0),1.0)
+            if temp>=80 or pwr_ratio>=0.95:target_ai*=2.0
+            self._ai_interval_ema=0.8*self._ai_interval_ema+0.2*target_ai
+            self.ai_interval=float(self._ai_interval_ema)
             self.schedule(lambda s=self.gpu_source:self.gpu_src_var.set(f"GPU指标来源: {s}"))
             if freq<=0:
                 if not self.resource_paused:
@@ -1726,7 +1889,8 @@ class App:
             self.drag_active=True;self.drag_points=[(x,y,time.time())];self.drag_start=time.time()
             width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,1.0];frame=self._current_frame_copy()
             if frame is not None:
-                pid=self.pool.add_click(frame,rect,norm_x,norm_y);self._save_click_patches(frame,norm_x,norm_y);self.writer.record(frame,action,[norm_x,norm_y],1,rect,self._window_title(),self.mode,"press",{"proto":int(pid)});self.buffer.add(frame,action,1,2,1,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,1,np.zeros((64,),np.float32))
+                pid=self.pool.add_click(frame,rect,norm_x,norm_y);self._save_click_patches(frame,norm_x,norm_y);self.writer.record(frame,action,[norm_x,norm_y],1,rect,self._window_title(),self.mode,"press",{"proto":int(pid)});self.buffer.add(frame,action,1,2,1,int(pid),self.perception.last_text);self.state_graph.note_action(self.perception.last_text,int(pid),1)
+                self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,1,np.zeros((64,),np.float32))
         if (not pressed) and self.drag_active:
             self.drag_active=False
             if self.window_rect is not None:
@@ -1736,7 +1900,7 @@ class App:
                     path=[((px-rect[0])/width,(py-rect[1])/height) for px,py in simp]
                     frame=self._current_frame_copy()
                     if frame is not None:
-                        pid=self.pool.add_drag(frame,rect,path);self.writer.record(frame,[0.0,0.0,0.0],path[-1],1,rect,self._window_title(),self.mode,"drag",{"path":path,"duration":time.time()-self.drag_start,"proto":int(pid)});self.buffer.add(frame,[0.0,0.0,0.0],1,5,2,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,2,np.zeros((64,),np.float32))
+                        pid=self.pool.add_drag(frame,rect,path);tid=self.templates.add_path(path);self.state_graph.note_action(self.perception.last_text,int(pid),2);self.writer.record(frame,[0.0,0.0,0.0],path[-1],1,rect,self._window_title(),self.mode,"drag",{"path":path,"tmpl":int(tid),"duration":time.time()-self.drag_start,"proto":int(pid)});self.buffer.add(frame,[0.0,0.0,0.0],1,tid,2,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,2,np.zeros((64,),np.float32))
     def _on_key_press(self,key):
         self.last_user_input=time.time()
         if key==keyboard.Key.esc:self.schedule(self.stop)
@@ -1833,6 +1997,7 @@ class App:
                     rect=self.window_rect
                     for cx,cy,label,score in dets[:8]:
                         self.writer.record(img,[0.0,0.0,0.0],[cx,cy],1,rect,self._window_title(),self.mode,"ui",{"label":label,"score":float(score)});self.buffer.add(img,[0.0,0.0,0.0],1,4,0,-1,txt)
+                self.state_graph.observe(txt)
                 if txt:self.rule_text=txt
             except Exception:
                 pass
@@ -1883,7 +2048,7 @@ class App:
         bs=max(4,int(8+64*(1.0-M)));lr=1e-4*(0.5 if hot else 1.0)
         for g in self.optimizer.param_groups:g["lr"]=lr
         prefetch_factor=4
-        dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=True,drop_last=True,persistent_workers=(num_workers>0),prefetch_factor=prefetch_factor if num_workers>0 else None)
+        dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=True,drop_last=True,persistent_workers=(num_workers>0,persistent_workers=True,pin_memory=True,persistent_workers=True,pin_memory=(device=='cuda')),prefetch_factor=prefetch_factor if num_workers>0 else None)
         epochs=3;total=max(1,(len(ds)//max(1,bs))*epochs);done_steps=0
         self.model.train();best_loss=None;c_scores={}
         start_time=time.time();self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
@@ -1894,18 +2059,19 @@ class App:
                 try:item=next(it)
                 except StopIteration:break
                 if self.optimize_event.is_set():break
-                if isinstance(item,tuple) and len(item)==7:
-                    seq,act,atype_t,ctrl_t,path_vec,texts,success=item
+                if isinstance(item,tuple) and len(item)>=7:
+                    seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=item if len(item)==8 else (item[0],item[1],item[2],item[3],torch.full_like(item[3],-1),item[4],item[5],item[6])
                 else:
                     seq,act=item;atype_t=torch.zeros((seq.shape[0],),dtype=torch.long);ctrl_t=torch.full((seq.shape[0],),-1,dtype=torch.long);path_vec=torch.zeros((seq.shape[0],64),dtype=torch.float32);texts=[""]*seq.shape[0];success=torch.zeros((seq.shape[0],),dtype=torch.long)
                 sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
                 if sample is not None:
-                    frames_b,actions_b,_,events_b,atypes_b,ctrls_b,txts_b=sample
+                    frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
                     seq_np=frames_b.astype(np.float32)
                     seq_t=torch.from_numpy(np.transpose(seq_np,(0,1,4,2,3))/255.0).to(device,non_blocking=True)
                     act_t=torch.from_numpy(actions_b).to(device,non_blocking=True)
                     atype_t=torch.from_numpy(atypes_b).to(device,non_blocking=True)
                     ctrl_t=torch.from_numpy(ctrls_b).to(device,non_blocking=True)
+                    tmpl_t=torch.from_numpy(tmpls_b).to(device,non_blocking=True)
                     path_vec=torch.zeros((seq_t.shape[0],64),device=device,dtype=torch.float32)
                     texts=list(txts_b);success=torch.tensor([1 if any(k in (t or "").lower() for k in ["win","victory","success","complete"]) else 0 for t in texts],device=device,dtype=torch.long)
                 else:
@@ -1935,6 +2101,39 @@ class App:
                             loss_ctrl=F.cross_entropy(sim,map_idx[c_mask])
                     else:
                         loss_ctrl=torch.zeros((),device=device)
+                    tmplM,tid2idx=self.templates.matrix()
+                    loss_tmpl=torch.zeros((),device=device)
+                    if tmplM is not None:
+                        if (tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,dtype=torch.long,device=device)).dim()==0:
+                            tmpl_t=(tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,dtype=torch.long,device=device))
+                        map_t=torch.full_like((tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,device=device)), -1)
+                        if tid2idx:
+                            for i in range(map_t.shape[0]):
+                                tid=int((tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,device=device))[i].item())
+                                if tid in tid2idx:map_t[i]=tid2idx[tid]
+                        t_mask=map_t>=0
+                        if t_mask.any():
+                            path_n=F.normalize(path_pred,dim=1)
+                            sim_tmpl=path_n[:, :tmplM.shape[1]].matmul(tmplM.T)
+                            loss_tmpl=F.cross_entropy(sim_tmpl[t_mask],map_t[t_mask])
+                    
+                    tmplM,tid2idx=self.templates.matrix()
+                    loss_tmpl=torch.zeros((),device=device)
+                    if tmplM is not None:
+                        tt=(tmpl_t if 'tmpl_t' in locals() else torch.full((path_pred.shape[0],),-1,dtype=torch.long,device=device))
+                        if tt.dim()==0:
+                            tt=tt.unsqueeze(0)
+                        tmap=torch.full_like(tt,-1)
+                        if tid2idx:
+                            for i in range(tt.shape[0]):
+                                ti=int(tt[i].item())
+                                if ti in tid2idx:
+                                    tmap[i]=tid2idx[ti]
+                        tmask=tmap>=0
+                        if tmask.any():
+                            pnorm=F.normalize(path_pred,dim=1)
+                            simt=torch.matmul(pnorm[tmask],tmplM.T)
+                            loss_tmpl=F.cross_entropy(simt,tmap[tmask])
                     loss_path=F.mse_loss(path_pred,path_vec) if path_vec is not None else torch.zeros((),device=device)
                     goal_weight=torch.ones_like(values)
                     try:
@@ -1942,11 +2141,12 @@ class App:
                         for i in range(ctrl_t.shape[0]):
                             pid=int(ctrl_t[i].item())
                             if pid in gscores:goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,gscores[pid])))
+                            goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,self.state_graph.reachability(pid))))
                         c_scores=gscores
                     except Exception:
                         pass
                     loss_value=(loss_value*goal_weight.mean()).mean()
-                    loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path
+                    loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl+0.1*loss_tmpl
                 self.optimizer.zero_grad(set_to_none=True)
                 if scaler is not None:
                     scaler.scale(loss).step(self.optimizer);scaler.update()
