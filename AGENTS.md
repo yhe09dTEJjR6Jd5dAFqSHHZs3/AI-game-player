@@ -13,8 +13,6 @@ UI在主线程处理，耗时或循环任务在后台线程运行，避免阻塞
 当M≥100%时：
 截图频率(Hz)=0；
 
-在CPU、内存、GPU、显存占用率都小于100%的前提下，充分利用电脑硬件资源。
-
 自动检查Desktop\GameAI\models文件夹内的AI模型文件（初始化阶段，严禁本地生成AI模型）。
 
 自动通过网络下载缺失的AI模型文件（通过进度条实时展示下载进度），并在超时（180秒）或下载失败时弹窗提示，告知用户去哪里下载模型文件（链接）。
@@ -58,6 +56,3 @@ FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `t
 
 YOLO12n下载链接：
 https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo12n.pt
-
-
-
