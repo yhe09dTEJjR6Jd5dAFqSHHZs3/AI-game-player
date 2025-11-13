@@ -1713,18 +1713,12 @@ class App:
             except Exception:
                 pass
         self.gpu_source=src;return gpu,mem,temp,pwr_ratio
-    def _monitor_loop(self):
-        last_threads=None
+    def _monitor_loop(self):last_threads=None
         while self.running:
             cpu=float(psutil.cpu_percent(interval=None));mem=float(psutil.virtual_memory().percent);gpu,mem_gpu,temp,pwr_ratio=self._gpu_metrics_ext()
-            if self.gpu_source=="不可用":M=max(cpu,mem)/100.0
-            else:M=max(cpu,mem,gpu,mem_gpu)/100.0
-            paused_next=self._paused_hysteresis
-            if not paused_next and M>=0.95:paused_next=True
-            if paused_next and M<=0.90:paused_next=False
-            self._paused_hysteresis=paused_next
-            if paused_next:freq=0.0
-            else:freq=max(0.0,100.0*(1.0-M))
+            if self.gpu_source=="不可用":M=max(cpu,mem)
+else:M=max(cpu,mem,gpu,mem_gpu)
+freq=0.0 if M>=100.0 else max(0.0,100.0*(1.0-M/100.0))
             self.metrics={"cpu":cpu,"mem":mem,"gpu":gpu,"vram":mem_gpu,"freq":freq,"temp":temp,"pwr":pwr_ratio}
             if freq>0:
                 target_ci=1.0/freq
@@ -1736,6 +1730,13 @@ class App:
             if temp>=80 or pwr_ratio>=0.95:target_ai*=2.0
             self._ai_interval_ema=0.8*self._ai_interval_ema+0.2*target_ai
             self.ai_interval=float(self._ai_interval_ema)
+            try:
+                idle=time.time()-getattr(self,'last_user_input',time.time())
+                if self.mode=="learn" and self.window_visible and self.window_full and not self.resource_paused and self.capture_enabled and idle>=10.0:
+                    self.set_mode("train")
+            except Exception:
+                pass
+
             self.schedule(lambda s=self.gpu_source:self.gpu_src_var.set(f"GPU指标来源: {s}"))
             if freq<=0:
                 if not self.resource_paused:
@@ -1753,7 +1754,8 @@ class App:
             except Exception:
                 pass
             time.sleep(0.5)
-    def _enqueue_drop(self,q,item):
+
+def _enqueue_drop(self,q,item):
         try:
             q.put_nowait(item)
         except queue.Full:
@@ -1919,8 +1921,7 @@ class App:
             except Exception:
                 return ""
         return self.selected_title.get() or ""
-    def _update_ui(self):
-        try:
+    def _update_ui(self):try:
             if not self.root.winfo_exists():
                 return
         except Exception:
@@ -1930,14 +1931,31 @@ class App:
             try:func()
             except Exception:pass
         with self.frame_lock:frame=self.frame.copy() if self.frame is not None else None
-        if frame is not None:
-            rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);image=Image.fromarray(rgb);w=min(640,image.width);h=int(image.height*float(w)/float(image.width));image=image.resize((w,h))
-            try:self.photo=ImageTk.PhotoImage(image=image,master=self.root);self.frame_label.configure(image=self.photo);self.frame_label.image=self.photo
-            except Exception:self.frame_label.configure(image="");self.frame_label.image=None
-        else:self.frame_label.configure(image="");self.frame_label.image=None
+if frame is not None:
+    rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);image=Image.fromarray(rgb);w=min(640,image.width);h=int(image.height*float(w)/float(image.width));image=image.resize((w,h))
+    try:
+        self.photo=ImageTk.PhotoImage(image=image,master=self.root)
+        try:
+            if self.frame_label.winfo_exists():
+                self.frame_label.configure(image=self.photo);self.frame_label.image=self.photo
+        except Exception:
+            pass
+    except Exception:
+        try:
+            if self.frame_label.winfo_exists():
+                self.frame_label.configure(image="");self.frame_label.image=None
+        except Exception:
+            pass
+else:
+    try:
+        if self.frame_label.winfo_exists():
+            self.frame_label.configure(image="");self.frame_label.image=None
+    except Exception:
+        pass
         self.cpu_var.set(f"CPU:{self.metrics['cpu']:.1f}%");self.mem_var.set(f"Memory:{self.metrics['mem']:.1f}%");self.gpu_var.set(f"GPU:{self.metrics['gpu']:.1f}%");self.vram_var.set(f"VRAM:{self.metrics['vram']:.1f}%");self.freq_var.set(f"Capture:{self.metrics['freq']:.1f} Hz");self.progress_text.set(f"{self.progress_var.get():.0f}%")
         self.root.after(50,self._update_ui)
-    def _check_mode_switch(self):
+
+def _check_mode_switch(self):
         if not self.resource_paused and self.mode=="learn" and self.recording_enabled and self.window_visible and self.window_full and self.capture_enabled:
             if time.time()-self.last_user_input>=10.0:self.set_mode("train")
         self.root.after(200,self._check_mode_switch)
@@ -1966,11 +1984,26 @@ class App:
         try:pyautogui.mouseUp()
         except Exception:pass
     def _get_history_tensor(self):
-        with self.history_lock:
-            if len(self.frame_history)<4:return None
-            frames=self.frame_history[-4:]
-        arr=np.stack(frames,0).astype(np.float32)/255.0;arr=np.transpose(arr,(0,3,1,2));arr=np.expand_dims(arr,0);tensor=torch.from_numpy(arr).to(device,non_blocking=True);return tensor
-    def _ai_loop(self):
+    with self.history_lock:
+        if len(self.frame_history)<4:return None
+        frames=[f.copy() for f in self.frame_history[-4:]]
+    bh,bw=frames[0].shape[:2]
+    fixed=[]
+    for f in frames:
+        h,w=f.shape[:2]
+        if h!=bh or w!=bw:
+            try:
+                f=cv2.resize(f,(bw,bh))
+            except Exception:
+                bh,bw=h,w
+        fixed.append(f)
+    arr=np.stack(fixed,0).astype(np.float32)/255.0
+    arr=np.transpose(arr,(0,3,1,2))
+    arr=np.expand_dims(arr,0)
+    tensor=torch.from_numpy(arr).to(device,non_blocking=True)
+    return tensor
+
+def _ai_loop(self):
         while self.running and not self.ai_stop.is_set():
             if self.mode!="train" or not self.window_visible or not self.window_full or self.window_rect is None or self.resource_paused or not self.capture_enabled:time.sleep(0.05);continue
             frames=self._get_history_tensor()
@@ -2071,13 +2104,28 @@ class App:
                 try:item=next(it)
                 except StopIteration:break
                 if self.optimize_event.is_set():break
-                if isinstance(item,tuple) and len(item)>=7:
-                    seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=item if len(item)==8 else (item[0],item[1],item[2],item[3],torch.full_like(item[3],-1),item[4],item[5],item[6])
+                if isinstance(item, tuple):
+                    if len(item) >= 8:
+                        seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts,success = item[:8]
+                    elif len(item) >= 7:
+                        seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts = item[:7]
+                        success = torch.zeros((seq.shape[0],), dtype=torch.long)
+                    else:
+                        seq,act = item[:2]
+                        atype_t = torch.zeros((seq.shape[0],), dtype=torch.long)
+                        ctrl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
+                        tmpl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
+                        path_vec = torch.zeros((seq.shape[0],64), dtype=torch.float32)
+                        texts = ["" for _ in range(seq.shape[0])]
+                        success = torch.zeros((seq.shape[0],), dtype=torch.long)
                 else:
-                    if isinstance(item,tuple) and len(item)>=7:
-                    seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=item if len(item)==8 else (item[0],item[1],item[2],item[3],torch.full_like(item[3],-1),item[4],item[5],item[6])
-                else:
-                    seq,act=item;atype_t=torch.zeros((seq.shape[0],),dtype=torch.long);ctrl_t=torch.full((seq.shape[0],),-1,dtype=torch.long);path_vec=torch.zeros((seq.shape[0],64),dtype=torch.float32);texts=[""]*seq.shape[0];success=torch.zeros((seq.shape[0],),dtype=torch.long)
+                    seq,act = item
+                    atype_t = torch.zeros((seq.shape[0],), dtype=torch.long)
+                    ctrl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
+                    tmpl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
+                    path_vec = torch.zeros((seq.shape[0],64), dtype=torch.float32)
+                    texts = ["" for _ in range(seq.shape[0])]
+                    success = torch.zeros((seq.shape[0],), dtype=torch.long)
                 sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
                 if sample is not None:
                     frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
