@@ -1006,6 +1006,7 @@ class App:
         self.ai_interval=0.05
         self.selected_title=tk.StringVar()
         self.window_state=tk.StringVar(value="No window")
+        self.window_size_var=tk.StringVar(value='尺寸: 未选择窗口')
         self.visible_var=tk.StringVar(value='可见: 未检测')
         self.full_var=tk.StringVar(value='完整: 未检测')
         self.pause_var=tk.StringVar(value="未选择窗口，功能锁定")
@@ -1109,9 +1110,11 @@ class App:
         state_row.columnconfigure(0,weight=1)
         state_row.columnconfigure(1,weight=1)
         state_row.columnconfigure(2,weight=1)
+        state_row.columnconfigure(3,weight=1)
         ttk.Label(state_row,textvariable=self.window_state,style="Stats.TLabel").grid(row=0,column=0,sticky="w")
         ttk.Label(state_row,textvariable=self.visible_var,style="Stats.TLabel").grid(row=0,column=1,sticky="e")
         ttk.Label(state_row,textvariable=self.full_var,style="Stats.TLabel").grid(row=0,column=2,sticky="e")
+        ttk.Label(state_row,textvariable=self.window_size_var,style="Stats.TLabel").grid(row=0,column=3,sticky="e")
         control_row=ttk.Frame(header,style="Panel.TFrame")
         control_row.grid(row=2,column=0,columnspan=4,sticky="ew",pady=(8,0))
         control_row.columnconfigure(1,weight=1)
@@ -1169,6 +1172,18 @@ class App:
             return f"{v:.1f} {units[idx]}" if v>0 else "0 B/s"
         except Exception:
             return "0 B/s"
+    def _set_progress_ui(self,value):
+        v=max(0.0,min(100.0,float(value)))
+        self.progress_var.set(v)
+        self.progress_text.set(f"{v:.0f}%")
+    def _update_window_size_ui(self,rect):
+        if rect is None:
+            text='尺寸: 未选择窗口' if self.window_hwnd is None else '尺寸: 未检测'
+        else:
+            w=max(0,int(rect[2]-rect[0]))
+            h=max(0,int(rect[3]-rect[1]))
+            text=f"尺寸: {w}×{h}"
+        self.schedule(lambda txt=text:self.window_size_var.set(txt))
     def start_download_ui(self,name,filename,percent):
         self.current_download=name
         self.download_title=f"{name} - {filename}"
@@ -1515,6 +1530,7 @@ class App:
         title=self._window_title().strip()
         if not title and self.window_hwnd is None:
             self.window_rect=None
+            self._update_window_size_ui(None)
             return False
         try:
             hwnd=self._resolve_window_handle()
@@ -1529,9 +1545,11 @@ class App:
                 except Exception:
                     rect=None
             self.window_rect=rect
+            self._update_window_size_ui(rect)
             return rect is not None and hwnd is not None
         except Exception:
             self.window_rect=None
+            self._update_window_size_ui(None)
             if user32 is not None and self.window_hwnd is not None:
                 try:
                     if user32.IsWindow(ctypes.wintypes.HWND(int(self.window_hwnd)))==0:
@@ -1556,6 +1574,7 @@ class App:
             self.schedule(lambda txt=label:self.window_state.set(f"Selected:{txt}"))
             self.schedule(lambda:self.visible_var.set('可见: 否(未选择窗口)'))
             self.schedule(lambda:self.full_var.set('完整: 否(未选择窗口)'))
+            self._update_window_size_ui(None)
             return
         rect=self.window_rect
         hwnd=self.window_hwnd
@@ -2119,7 +2138,7 @@ class App:
         threading.Thread(target=worker,args=(frame.copy(),),daemon=True).start()
     def on_sleep(self):
         if self.mode in ("learn","train") and self.recording_enabled and not self.resource_paused and self.models_ready():
-            self._mouse_up_safety();self.recording_enabled=False;self.getup_btn.configure(state="normal");self.sleep_btn.configure(state="disabled");self.progress_var.set(0.0);self.progress_text.set("0%");self.set_mode("optimize");self.optimize_event=threading.Event();self.optimize_thread=threading.Thread(target=self._optimize_loop,daemon=True);self.optimize_thread.start()
+            self._mouse_up_safety();self.recording_enabled=False;self.getup_btn.configure(state="normal");self.sleep_btn.configure(state="disabled");self._set_progress_ui(0.0);self.set_mode("optimize");self.optimize_event=threading.Event();self.optimize_thread=threading.Thread(target=self._optimize_loop,daemon=True);self.optimize_thread.start()
         else:
             self.pause_var.set("模型未就绪或资源受限，已暂停且 10 秒切换规则失效")
     def _confirm_dialog(self):
@@ -2134,7 +2153,7 @@ class App:
         self.schedule(dlg);q.get()
     def on_getup(self):
         if self.mode=="optimize" and self.optimize_event is not None:
-            self.optimize_event.set();self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self._mouse_up_safety();self.set_mode("learn")
+            self.optimize_event.set();self._set_progress_ui(0.0);self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self._mouse_up_safety();self.set_mode("learn")
     def _compute_reward(self,seq_frames,txt):
         try:
             a=seq_frames[-1].astype(np.float32);b=seq_frames[-2].astype(np.float32);diff=np.mean(np.abs(a-b))/255.0
@@ -2287,16 +2306,24 @@ class App:
                     scaler.scale(loss).step(self.optimizer);scaler.update()
                 else:
                     loss.backward();self.optimizer.step()
-                done_steps+=1;prog=100.0*min(1.0,done_steps/max(1,total));self.progress_var.set(prog)
+                done_steps+=1;prog=100.0*min(1.0,done_steps/max(1,total));self.schedule(lambda v=prog:self._set_progress_ui(v))
                 if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
                 if self.optimize_event.is_set():break
         interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
         if not interrupted:
             try:torch.save(self.model.state_dict(),model_path)
             except Exception:pass
-            self.progress_var.set(100.0);self._confirm_dialog();self.progress_var.set(0.0);self.progress_text.set("0%");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self.set_mode("learn")
+            self.schedule(lambda:self._set_progress_ui(100.0))
+            self._confirm_dialog()
+            def _finish_optimize():
+                self._set_progress_ui(0.0)
+                self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
+                self.getup_btn.configure(state="disabled")
+                self.recording_enabled=True
+                self.set_mode("learn")
+            self.schedule(_finish_optimize)
         else:
-            self.progress_var.set(0.0);self.progress_text.set("0%")
+            self.schedule(lambda:self._set_progress_ui(0.0))
         self.schedule(lambda:self.pause_var.set(""))
     def stop(self):
         self.running=False
