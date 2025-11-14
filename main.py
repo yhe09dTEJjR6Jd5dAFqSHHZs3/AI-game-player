@@ -36,6 +36,8 @@ class WINDOWINFO(ctypes.Structure):
     _fields_=[("cbSize",ctypes.wintypes.DWORD),("rcWindow",ctypes.wintypes.RECT),("rcClient",ctypes.wintypes.RECT),("dwStyle",ctypes.wintypes.DWORD),("dwExStyle",ctypes.wintypes.DWORD),("dwWindowStatus",ctypes.wintypes.DWORD),("cxWindowBorders",ctypes.wintypes.UINT),("cyWindowBorders",ctypes.wintypes.UINT),("atomWindowType",ctypes.wintypes.ATOM),("wCreatorVersion",ctypes.wintypes.WORD)]
 class WINDOWPLACEMENT(ctypes.Structure):
     _fields_=[("length",ctypes.wintypes.UINT),("flags",ctypes.wintypes.UINT),("showCmd",ctypes.wintypes.UINT),("ptMinPosition",ctypes.wintypes.POINT),("ptMaxPosition",ctypes.wintypes.POINT),("rcNormalPosition",ctypes.wintypes.RECT)]
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_=[("cbSize",ctypes.wintypes.UINT),("dwTime",ctypes.wintypes.DWORD)]
 pyautogui.FAILSAFE=False
 pyautogui.PAUSE=0.0
 pyautogui.MINIMUM_DURATION=0.0
@@ -52,6 +54,7 @@ if os.name=="nt":
     except Exception:
         dwmapi=None
     user32=ctypes.windll.user32
+    kernel32=ctypes.windll.kernel32
     try:
         user32.WindowFromPoint.restype=ctypes.wintypes.HWND
         user32.WindowFromPoint.argtypes=[ctypes.wintypes.POINT]
@@ -63,6 +66,7 @@ if os.name=="nt":
 else:
     dwmapi=None
     user32=None
+    kernel32=None
     gdi32=None
 
 def _list_visible_windows():
@@ -169,6 +173,22 @@ def _poly_simplify(points,eps=2.0):
     return simp if len(simp)>=2 else points
 def _now_ms():
     return int(time.time()*1000)
+def _system_idle_seconds():
+    if user32 is None or kernel32 is None:
+        return None
+    try:
+        info=LASTINPUTINFO()
+        info.cbSize=ctypes.sizeof(LASTINPUTINFO)
+        if user32.GetLastInputInfo(ctypes.byref(info))==0:
+            return None
+        tick=0
+        try:
+            tick=float(kernel32.GetTickCount64())
+        except AttributeError:
+            tick=float(kernel32.GetTickCount())
+        return max(0.0,(tick-float(info.dwTime))/1000.0)
+    except Exception:
+        return None
 class UIElementPool:
     def __init__(self,embedder=None,pre=None):
         self.embedder=embedder
@@ -449,6 +469,7 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
         self.files.sort()
         self.seq=seq
         self.aug=aug
+        self.target_size=(256,256)
     def __len__(self):
         return max(1,len(self.files))
     def _aug(self,img):
@@ -469,6 +490,22 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
             g=random.uniform(0.9,1.1);b=random.uniform(-10,10)
             img=np.clip(img.astype(np.float32)*g+b,0,255).astype(np.uint8)
         return img
+    def _prepare_frame(self,img):
+        tw,th=self.target_size
+        if not isinstance(img,np.ndarray) or img.ndim!=3 or img.size==0:
+            return np.zeros((th,tw,3),np.uint8)
+        h,w=img.shape[:2]
+        if h<=0 or w<=0:
+            return np.zeros((th,tw,3),np.uint8)
+        scale=min(float(tw)/float(w),float(th)/float(h))
+        nw=max(1,int(round(w*scale)))
+        nh=max(1,int(round(h*scale)))
+        resized=cv2.resize(img,(nw,nh))
+        canvas=np.zeros((th,tw,3),np.uint8)
+        top=max(0,(th-nh)//2)
+        left=max(0,(tw-nw)//2)
+        canvas[top:top+nh,left:left+nw]=resized
+        return canvas
     def _encode_path(self,extra):
         if not isinstance(extra,dict):
             return np.zeros((64,),np.float32)
@@ -501,6 +538,7 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
                 frame=cv2.imdecode(arr["frame_jpg"],cv2.IMREAD_COLOR)
             else:
                 frame=arr["frame"]
+            frame=self._prepare_frame(frame)
             meta=json.loads(str(arr["meta"]))
             act=np.array(meta.get("action",[0,0,0]),dtype=np.float32)
             ev=str(meta.get("event",""))
@@ -516,7 +554,7 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
             text=str(meta.get("event_text",""))
             success=1 if any(k in text.lower() for k in ["win","victory","success","complete"]) else 0
         except Exception:
-            frame=np.zeros((256,256,3),np.uint8);act=np.zeros(3,np.float32);atype=0;ctrl=-1;path_vec=np.zeros((64,),np.float32);text="";success=0
+            frame=self._prepare_frame(None);act=np.zeros(3,np.float32);atype=0;ctrl=-1;tmpl=-1;path_vec=np.zeros((64,),np.float32);text="";success=0
         seq=np.stack([self._aug(frame.copy()) for _ in range(self.seq)],0)
         return seq,act,np.array(atype,dtype=np.int64),np.array(ctrl,dtype=np.int64),np.array(tmpl,dtype=np.int64),path_vec,text,success
 class Encoder(nn.Module):
@@ -1713,6 +1751,12 @@ class App:
             except Exception:
                 pass
         self.gpu_source=src;return gpu,mem,temp,pwr_ratio
+    def _idle_seconds(self):
+        local=time.time()-getattr(self,'last_user_input',time.time())
+        sys_idle=_system_idle_seconds()
+        if sys_idle is None:
+            return max(0.0,float(local))
+        return max(0.0,min(float(local),float(sys_idle)))
     def _monitor_loop(self):
         last_threads=None
         while self.running:
@@ -1734,11 +1778,11 @@ class App:
             self._ai_interval_ema=0.8*self._ai_interval_ema+0.2*target_ai
             self.ai_interval=float(self._ai_interval_ema)
             try:
-                idle=time.time()-getattr(self,'last_user_input',time.time())
-                if self.mode=="learn" and self.window_visible and self.window_full and not self.resource_paused and self.capture_enabled and idle>=10.0:
-                    self.set_mode("train")
+                idle=self._idle_seconds()
             except Exception:
-                pass
+                idle=None
+            if idle is not None and self.mode=="learn" and self.window_visible and self.window_full and not self.resource_paused and self.capture_enabled and idle>=10.0:
+                self.set_mode("train")
 
             self.schedule(lambda s=self.gpu_source:self.gpu_src_var.set(f"GPU指标来源: {s}"))
             if freq<=0:
@@ -1976,7 +2020,8 @@ class App:
 
     def _check_mode_switch(self):
         if not self.resource_paused and self.mode=="learn" and self.recording_enabled and self.window_visible and self.window_full and self.capture_enabled:
-            if time.time()-self.last_user_input>=10.0:
+            idle=self._idle_seconds()
+            if idle is not None and idle>=10.0:
                 self.set_mode("train")
         self.root.after(200,self._check_mode_switch)
     def _mouse_up_safety(self):
