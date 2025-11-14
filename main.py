@@ -2179,28 +2179,25 @@ class App:
                 try:item=next(it)
                 except StopIteration:break
                 if self.optimize_event.is_set():break
-                if isinstance(item, tuple):
-                    if len(item) >= 8:
-                        seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts,success = item[:8]
-                    elif len(item) >= 7:
-                        seq,act,atype_t,ctrl_t,tmpl_t,path_vec,texts = item[:7]
-                        success = torch.zeros((seq.shape[0],), dtype=torch.long)
-                    else:
-                        seq,act = item[:2]
-                        atype_t = torch.zeros((seq.shape[0],), dtype=torch.long)
-                        ctrl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
-                        tmpl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
-                        path_vec = torch.zeros((seq.shape[0],64), dtype=torch.float32)
-                        texts = ["" for _ in range(seq.shape[0])]
-                        success = torch.zeros((seq.shape[0],), dtype=torch.long)
+                if isinstance(item,(tuple,list)):
+                    seq=item[0]
+                    act=item[1]
+                    batch=len(seq)
+                    atype_t=item[2] if len(item)>=3 else torch.zeros((batch,),dtype=torch.long)
+                    ctrl_t=item[3] if len(item)>=4 else torch.full((batch,),-1,dtype=torch.long)
+                    tmpl_t=item[4] if len(item)>=5 else torch.full((batch,),-1,dtype=torch.long)
+                    path_vec=item[5] if len(item)>=6 else torch.zeros((batch,64),dtype=torch.float32)
+                    texts=item[6] if len(item)>=7 else ["" for _ in range(batch)]
+                    success=item[7] if len(item)>=8 else torch.zeros((batch,),dtype=torch.long)
                 else:
-                    seq,act = item
-                    atype_t = torch.zeros((seq.shape[0],), dtype=torch.long)
-                    ctrl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
-                    tmpl_t = torch.full((seq.shape[0],), -1, dtype=torch.long)
-                    path_vec = torch.zeros((seq.shape[0],64), dtype=torch.float32)
-                    texts = ["" for _ in range(seq.shape[0])]
-                    success = torch.zeros((seq.shape[0],), dtype=torch.long)
+                    seq,act=item
+                    batch=len(seq)
+                    atype_t=torch.zeros((batch,),dtype=torch.long)
+                    ctrl_t=torch.full((batch,),-1,dtype=torch.long)
+                    tmpl_t=torch.full((batch,),-1,dtype=torch.long)
+                    path_vec=torch.zeros((batch,64),dtype=torch.float32)
+                    texts=["" for _ in range(batch)]
+                    success=torch.zeros((batch,),dtype=torch.long)
                 sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
                 if sample is not None:
                     frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
