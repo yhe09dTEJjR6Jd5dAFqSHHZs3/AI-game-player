@@ -48,9 +48,11 @@ AI优化过程不属于学习模式，因此在用户点击“Confirm”按钮�
 截图频率；
 用户选择的窗口名称；
 用户选择的窗口是否可见且完整；
-用户选择的窗口大小（在程序运行过程中的任意时刻，用户都有可能会手动调整所选窗口的宽、高）；
+用户选择的窗口大小；
 用户选择的窗口画面；
 电脑硬件资源占用百分比：CPU、内存、GPU、显存；
+
+在程序运行过程中的任意时刻，用户都有可能会手动调整所选窗口的宽、高、位置。
 
 其他：
 FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
