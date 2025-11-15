@@ -16,6 +16,7 @@ from pynput import mouse,keyboard
 from PIL import Image,ImageTk
 import tkinter as tk
 from tkinter import ttk,messagebox
+from tkinter import font as tkfont
 from screeninfo import get_monitors
 import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime,re,traceback
 from pynput import mouse,keyboard
@@ -955,15 +956,24 @@ class App:
         try:self.style.theme_use("clam")
         except Exception:pass
         self.root.configure(bg=self.colors["bg"])
+        self.font_bases={"body":10,"stats":10,"title":12,"accent":10,"muted":9,"labelframe":11}
+        self.fonts={
+            "body":tkfont.Font(family="Segoe UI",size=self.font_bases["body"]),
+            "stats":tkfont.Font(family="Segoe UI",size=self.font_bases["stats"]),
+            "title":tkfont.Font(family="Segoe UI",size=self.font_bases["title"],weight="bold"),
+            "accent":tkfont.Font(family="Segoe UI",size=self.font_bases["accent"],weight="bold"),
+            "muted":tkfont.Font(family="Segoe UI",size=self.font_bases["muted"]),
+            "labelframe":tkfont.Font(family="Segoe UI",size=self.font_bases["labelframe"],weight="bold"),
+        }
         for s in ["TFrame","Main.TFrame","Panel.TFrame","Stats.TFrame"]:
             self.style.configure(s,background=self.colors["panel"])
         self.style.configure("Panel.TLabelframe",background=self.colors["panel"],foreground=self.colors["accent"],bordercolor=self.colors["panel"],lightcolor=self.colors["panel"],darkcolor=self.colors["panel"])
-        self.style.configure("Panel.TLabelframe.Label",background=self.colors["panel"],foreground=self.colors["accent"],font=("Segoe UI",11,"bold"))
-        self.style.configure("TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=("Segoe UI",10))
-        self.style.configure("Stats.TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=("Segoe UI",10))
-        self.style.configure("Title.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=("Segoe UI",12,"bold"))
-        self.style.configure("Accent.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=("Segoe UI",10,"bold"))
-        self.style.configure("Muted.TLabel",background=self.colors["panel"],foreground=self.colors["muted"],font=("Segoe UI",9))
+        self.style.configure("Panel.TLabelframe.Label",background=self.colors["panel"],foreground=self.colors["accent"],font=self.fonts["labelframe"])
+        self.style.configure("TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=self.fonts["body"])
+        self.style.configure("Stats.TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=self.fonts["stats"])
+        self.style.configure("Title.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=self.fonts["title"])
+        self.style.configure("Accent.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=self.fonts["accent"])
+        self.style.configure("Muted.TLabel",background=self.colors["panel"],foreground=self.colors["muted"],font=self.fonts["muted"])
         self.style.configure("Secondary.TButton",background="#1f2937",foreground=self.colors["text"],padding=6)
         self.style.map("Secondary.TButton",background=[("active","#334155"),("disabled","#1e293b")],foreground=[("disabled","#475569")])
         self.style.configure("Accent.TButton",background=self.colors["accent"],foreground="#0f172a",padding=6)
@@ -974,6 +984,8 @@ class App:
         if device!="cuda":
             try:self.root.after(100,lambda:messagebox.showwarning("GPU不可用","未检测到可用的GPU，将使用CPU运行"))
             except Exception:pass
+        self.root.minsize(900,600)
+        self.root.bind("<Configure>",self._on_root_resize)
         self.ui_queue=queue.Queue()
         self.running=True
         self.writer=ExperienceWriter(experience_dir)
@@ -1081,6 +1093,8 @@ class App:
                 torch.set_num_threads(max(1,min(os.cpu_count(),8)))
         except Exception:
             pass
+        self.root.update_idletasks()
+        self._update_font_scale()
     def reload_perception(self):
         try:self.perception=PerceptionEngine()
         except Exception:pass
@@ -1100,7 +1114,10 @@ class App:
         container=ttk.Frame(self.root,style="Main.TFrame",padding=16)
         container.grid(row=0,column=0,sticky="nsew")
         container.columnconfigure(0,weight=1)
-        container.rowconfigure(1,weight=1)
+        container.rowconfigure(0,weight=0)
+        container.rowconfigure(1,weight=4)
+        container.rowconfigure(2,weight=2)
+        container.rowconfigure(3,weight=0)
         header=ttk.Frame(container,style="Panel.TFrame")
         header.grid(row=0,column=0,sticky="ew")
         header.columnconfigure(1,weight=1)
@@ -1119,7 +1136,7 @@ class App:
         control_row.grid(row=2,column=0,columnspan=4,sticky="ew",pady=(8,0))
         control_row.columnconfigure(1,weight=1)
         ttk.Label(control_row,text="窗口列表",style="Stats.TLabel").grid(row=0,column=0,sticky="w")
-        self.window_combo=ttk.Combobox(control_row,textvariable=self.selected_title,state="readonly",width=45)
+        self.window_combo=ttk.Combobox(control_row,textvariable=self.selected_title,state="readonly")
         self.window_combo.grid(row=0,column=1,sticky="ew",padx=(8,8))
         ttk.Button(control_row,text="刷新",command=self.refresh_windows,style="Secondary.TButton").grid(row=0,column=2,sticky="ew")
         ttk.Button(control_row,text="选择",command=self.select_window,style="Accent.TButton").grid(row=0,column=3,sticky="ew",padx=(8,0))
@@ -1130,11 +1147,12 @@ class App:
         self.frame_label=tk.Label(preview,background=self.colors["panel"],borderwidth=0,highlightthickness=0)
         self.frame_label.grid(row=0,column=0,sticky="nsew")
         bottom=ttk.Frame(container,style="Panel.TFrame")
-        bottom.grid(row=2,column=0,sticky="ew")
-        bottom.columnconfigure(0,weight=2)
-        bottom.columnconfigure(1,weight=1)
+        bottom.grid(row=2,column=0,sticky="nsew")
+        bottom.columnconfigure(0,weight=3)
+        bottom.columnconfigure(1,weight=2)
+        bottom.rowconfigure(0,weight=1)
         stats=ttk.Frame(bottom,style="Stats.TFrame")
-        stats.grid(row=0,column=0,sticky="ew",padx=(0,12))
+        stats.grid(row=0,column=0,sticky="nsew",padx=(0,12))
         for i in range(3):stats.columnconfigure(i,weight=1)
         ttk.Label(stats,textvariable=self.cpu_var,style="Stats.TLabel").grid(row=0,column=0,sticky="w")
         ttk.Label(stats,textvariable=self.mem_var,style="Stats.TLabel").grid(row=0,column=1,sticky="w")
@@ -1143,7 +1161,7 @@ class App:
         ttk.Label(stats,textvariable=self.gpu_src_var,style="Muted.TLabel").grid(row=1,column=1,sticky="w",pady=(6,0))
         ttk.Label(stats,textvariable=self.freq_var,style="Accent.TLabel").grid(row=1,column=2,sticky="e",pady=(6,0))
         control=ttk.Labelframe(bottom,text="AI 控制",style="Panel.TLabelframe",padding=12)
-        control.grid(row=0,column=1,sticky="ew")
+        control.grid(row=0,column=1,sticky="nsew")
         control.columnconfigure(0,weight=1)
         control.columnconfigure(1,weight=1)
         ttk.Label(control,textvariable=self.mode_var,style="Title.TLabel").grid(row=0,column=0,columnspan=2,sticky="w")
@@ -1159,8 +1177,26 @@ class App:
         ttk.Label(prog_row,textvariable=self.progress_text,style="Accent.TLabel",width=6).grid(row=0,column=1,sticky="e",padx=(8,0))
         footer=ttk.Frame(container,style="Panel.TFrame")
         footer.grid(row=3,column=0,sticky="ew",pady=(10,0))
-        ttk.Label(footer,textvariable=self.pause_var,style="Muted.TLabel").grid(row=0,column=0,sticky="w")
+        footer.columnconfigure(0,weight=1)
+        ttk.Label(footer,textvariable=self.pause_var,style="Muted.TLabel",anchor="w").grid(row=0,column=0,sticky="ew")
         self.refresh_windows()
+    def _update_font_scale(self):
+        try:
+            w=max(1,self.root.winfo_width())
+            h=max(1,self.root.winfo_height())
+        except Exception:
+            w=900
+            h=600
+        scale=min(max(w/1100.0,0.75),max(h/650.0,0.75))
+        scale=min(scale,1.6)
+        for key,font in self.fonts.items():
+            base=self.font_bases.get(key,10)
+            new_size=max(8,int(round(base*scale)))
+            if font.cget("size")!=new_size:
+                font.configure(size=new_size)
+    def _on_root_resize(self,event):
+        if event.widget is self.root:
+            self._update_font_scale()
     def _format_speed(self,speed):
         try:
             v=float(speed)
@@ -2182,9 +2218,11 @@ class App:
         bs=max(4,int(8+64*(1.0-M)));lr=1e-4*(0.5 if hot else 1.0)
         for g in self.optimizer.param_groups:g["lr"]=lr
         prefetch_factor=4
-        dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=True,persistent_workers=(num_workers>0),prefetch_factor=prefetch_factor if num_workers>0 else None)
+        drop_last=len(ds)>=bs
+        dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=(num_workers>0),prefetch_factor=prefetch_factor if num_workers>0 else None)
         epochs=3
-        total=max(1,(len(ds)//max(1,bs))*epochs)
+        steps_per_epoch=max(1,(len(ds)//max(1,bs)) if drop_last else math.ceil(len(ds)/max(1,bs)))
+        total=max(1,steps_per_epoch*epochs)
         done_steps=0
         self.model.train()
         best_loss=None
