@@ -492,11 +492,14 @@ class DiskExperienceDataset(torch.utils.data.Dataset):
                         if fn.endswith(".npz"):
                             self.files.append(os.path.join(root,fn))
         self.files.sort()
+        self.real_count=len(self.files)
         self.seq=seq
         self.aug=aug
         self.target_size=(256,256)
     def __len__(self):
         return max(1,len(self.files))
+    def has_samples(self):
+        return self.real_count>0
     def _aug(self,img):
         if not self.aug:
             return img
@@ -1055,8 +1058,12 @@ class App:
         self.freq_var=tk.StringVar(value="Capture:0.0 Hz")
         self.progress_var=tk.DoubleVar(value=0.0)
         self.progress_text=tk.StringVar(value="0%")
+        self.progress_stage=tk.StringVar(value="")
         self.progress_lock=threading.Lock()
         self.progress_floor=0.0
+        self.progress_info_lock=threading.Lock()
+        self.progress_info={"active":False,"phase":"","phase_start":0.0,"done":0,"total":1,"epoch":0,"epochs":1,"step":0,"steps":1}
+        self._progress_timer_id=None
         self.current_download=None
         self.download_title=""
         self.last_user_input=time.time()
@@ -1201,6 +1208,7 @@ class App:
         self.progress=ttk.Progressbar(prog_row,variable=self.progress_var,maximum=100,style="Accent.Horizontal.TProgressbar")
         self.progress.grid(row=0,column=0,sticky="ew")
         ttk.Label(prog_row,textvariable=self.progress_text,style="Accent.TLabel",width=6).grid(row=0,column=1,sticky="e",padx=(8,0))
+        ttk.Label(prog_row,textvariable=self.progress_stage,style="Muted.TLabel").grid(row=1,column=0,columnspan=2,sticky="w",pady=(6,0))
         footer=ttk.Frame(container,style="Panel.TFrame")
         footer.grid(row=3,column=0,sticky="ew",pady=(10,0))
         footer.columnconfigure(0,weight=1)
@@ -1243,6 +1251,80 @@ class App:
                 self.progress_floor=0.0
             elif v>self.progress_floor:
                 self.progress_floor=v
+
+    def _start_progress_monitor(self,total,epochs,steps):
+        with self.progress_info_lock:
+            self.progress_info={"active":True,"phase":"准备数据","phase_start":time.time(),"done":0,"total":max(1,int(total)),"epoch":0,"epochs":max(1,int(epochs)),"step":0,"steps":max(1,int(steps))}
+        self.schedule(lambda:self.progress_stage.set("准备数据..."))
+        self.schedule(self._ensure_progress_timer)
+
+    def _ensure_progress_timer(self):
+        if self._progress_timer_id is None:
+            self._progress_timer_id=self.root.after(200,self._progress_timer_tick)
+
+    def _progress_timer_tick(self):
+        with self.progress_info_lock:
+            info=dict(self.progress_info)
+        if not info.get("active",False):
+            self._progress_timer_id=None
+            return
+        now=time.time()
+        phase=info.get("phase","")
+        percent=float(self.progress_var.get())
+        if phase=="准备数据":
+            elapsed=max(0.0,now-info.get("phase_start",now))
+            percent=min(5.0,max(percent,elapsed*1.0))
+            stage_text="准备数据..."
+        elif phase=="训练中":
+            done=float(info.get("done",0))
+            total=max(1,float(info.get("total",1)))
+            frac=max(0.0,min(1.0,done/total))
+            percent=max(percent,5.0+90.0*frac)
+            epoch=int(info.get("epoch",0))+1
+            epochs=max(1,int(info.get("epochs",1)))
+            step=min(int(info.get("step",0)),int(info.get("steps",1)))
+            steps=max(1,int(info.get("steps",1)))
+            step_val=max(0,step)
+            stage_text=f"训练中 第{min(epoch,epochs)}/{epochs}轮 批次 {step_val}/{steps}"
+        elif phase=="保存模型":
+            elapsed=max(0.0,now-info.get("phase_start",now))
+            percent=max(percent,min(99.0,95.0+min(4.0,elapsed*5.0)))
+            stage_text="保存模型..."
+        else:
+            stage_text=phase or ""
+        self._set_progress_ui(percent)
+        self.progress_stage.set(stage_text)
+        self._progress_timer_id=self.root.after(200,self._progress_timer_tick)
+
+    def _update_progress_phase(self,phase):
+        with self.progress_info_lock:
+            self.progress_info["phase"]=phase
+            self.progress_info["phase_start"]=time.time()
+
+    def _update_progress_epoch(self,epoch,epochs,steps):
+        with self.progress_info_lock:
+            self.progress_info["epoch"]=epoch
+            self.progress_info["epochs"]=max(1,epochs)
+            self.progress_info["steps"]=max(1,steps)
+            self.progress_info["step"]=0
+
+    def _update_progress_step(self,step,done,total):
+        with self.progress_info_lock:
+            self.progress_info["step"]=step
+            self.progress_info["done"]=done
+            self.progress_info["total"]=max(1,total)
+
+    def _stop_progress_monitor(self):
+        with self.progress_info_lock:
+            self.progress_info["active"]=False
+        def cancel():
+            if self._progress_timer_id is not None:
+                try:
+                    self.root.after_cancel(self._progress_timer_id)
+                except Exception:
+                    pass
+                self._progress_timer_id=None
+        self.schedule(cancel)
 
     def _ensure_progress_floor(self,value):
         val=max(0.0,min(99.0,float(value)))
@@ -2254,7 +2336,7 @@ class App:
         self.schedule(dlg);q.get()
     def on_getup(self):
         if self.mode=="optimize" and self.optimize_event is not None:
-            self.optimize_event.set();self._set_progress_ui(0.0);self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self._mouse_up_safety();self.set_mode("learn")
+            self.optimize_event.set();self._stop_progress_monitor();self._set_progress_ui(0.0);self.progress_stage.set("优化已中止");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self._mouse_up_safety();self.set_mode("learn")
     def _compute_reward(self,seq_frames,txt):
         try:
             a=seq_frames[-1].astype(np.float32);b=seq_frames[-2].astype(np.float32);diff=np.mean(np.abs(a-b))/255.0
@@ -2278,15 +2360,29 @@ class App:
         hot=self.metrics["temp"]>=80 or self.metrics["pwr"]>=0.95
         seq_len=2 if hot else 4
         ds=DiskExperienceDataset(experience_dir,seq=seq_len,aug=True)
+        if not ds.has_samples():
+            def no_data():
+                self.progress_stage.set("经验数据不足")
+                self.pause_var.set("经验池为空，请先采集数据后再优化")
+                try:messagebox.showwarning("提示","经验池为空，请先在学习或训练模式采集数据")
+                except Exception:pass
+                self._set_progress_ui(0.0)
+                self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
+                self.getup_btn.configure(state="disabled")
+                self.recording_enabled=True
+                self.set_mode("learn")
+            self.schedule(no_data)
+            return
         M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
         num_workers=max(0,min(6,os.cpu_count() or 2)-1)
         bs=max(4,int(8+64*(1.0-M)));lr=1e-4*(0.5 if hot else 1.0)
         for g in self.optimizer.param_groups:g["lr"]=lr
         prefetch_factor=4
-        drop_last=len(ds)>=bs
+        real_len=max(1,ds.real_count)
+        drop_last=real_len>=bs
         dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=(num_workers>0),prefetch_factor=prefetch_factor if num_workers>0 else None)
         epochs=3
-        steps_per_epoch=max(1,(len(ds)//max(1,bs)) if drop_last else math.ceil(len(ds)/max(1,bs)))
+        steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
         total=max(1,steps_per_epoch*epochs)
         done_steps=0
         self.model.train()
@@ -2294,19 +2390,20 @@ class App:
         c_scores={}
         start_time=time.time()
         self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
-        self._ensure_progress_floor(5.0)
+        self._start_progress_monitor(total,epochs,steps_per_epoch)
         for ep in range(epochs):
             if self.optimize_event.is_set():break
-            if epochs>0:
-                start_floor=5.0+85.0*(ep/max(epochs,1))
-                if start_floor>5.0:
-                    self._ensure_progress_floor(min(95.0,start_floor))
+            self._update_progress_epoch(ep,epochs,steps_per_epoch)
             it=iter(dl)
             epoch_steps=0
+            phase_ready=False
             while True:
                 try:item=next(it)
                 except StopIteration:break
                 if self.optimize_event.is_set():break
+                if not phase_ready:
+                    self._update_progress_phase("训练中")
+                    phase_ready=True
                 if isinstance(item,(tuple,list)):
                     seq=item[0]
                     act=item[1]
@@ -2417,30 +2514,31 @@ class App:
                     loss.backward();self.optimizer.step()
                 epoch_steps+=1
                 done_steps+=1
-                with self.progress_lock:
-                    floor=self.progress_floor
-                prog=100.0*min(1.0,done_steps/max(1,total))
-                target=min(100.0,max(prog,floor))
-                self.schedule(lambda v=target:self._set_progress_ui(v))
+                self._update_progress_step(min(epoch_steps,steps_per_epoch),min(done_steps,total),total)
+                prog=5.0+90.0*(min(done_steps,total)/max(1,total))
+                self.schedule(lambda v=prog:self._set_progress_ui(v))
                 if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
                 if self.optimize_event.is_set():break
-            if epoch_steps==0 and not self.optimize_event.is_set():
-                post_floor=5.0+85.0*((ep+1)/max(epochs,1))
-                self._ensure_progress_floor(min(95.0,post_floor))
         interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
         if not interrupted:
+            self._update_progress_phase("保存模型")
             try:torch.save(self.model.state_dict(),model_path)
             except Exception:pass
             self.schedule(lambda:self._set_progress_ui(100.0))
+            self._stop_progress_monitor()
+            self.schedule(lambda:self.progress_stage.set("优化完成，请确认"))
             self._confirm_dialog()
             def _finish_optimize():
                 self._set_progress_ui(0.0)
                 self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
                 self.getup_btn.configure(state="disabled")
                 self.recording_enabled=True
+                self.progress_stage.set("")
                 self.set_mode("learn")
             self.schedule(_finish_optimize)
         else:
+            self._stop_progress_monitor()
+            self.schedule(lambda:self.progress_stage.set("优化已中止"))
             self.schedule(lambda:self._set_progress_ui(0.0))
         self.schedule(lambda:self.pause_var.set(""))
     def stop(self):
