@@ -2452,20 +2452,48 @@ class App:
             hot=self.metrics["temp"]>=80 or self.metrics["pwr"]>=0.95
             seq_len=2 if hot else 4
             ds=DiskExperienceDataset(experience_dir,seq=seq_len,aug=True)
-            if not ds.has_samples():
-                def no_data():
-                    self.progress_stage.set("经验数据不足")
-                    self.pause_var.set("经验池为空，请先采集数据后再优化")
-                    try:messagebox.showwarning("提示","经验池为空，请先在学习或训练模式采集数据")
-                    except Exception:pass
-                    self._set_progress_ui(0.0)
-                    self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
-                    self.getup_btn.configure(state="disabled")
-                    self.recording_enabled=True
-                    self.set_mode("learn")
-                self.schedule(no_data)
-                skip_finalize=True
-                return
+            fallback_mode=not ds.has_samples()
+            if fallback_mode:
+                def warn():
+                    self.progress_stage.set("经验数据稀少")
+                    self.pause_var.set("经验数据不足，使用空白样本优化")
+                self.schedule(warn)
+            def build_fallback_batch():
+                sample=ds.__getitem__(0)
+                if isinstance(sample,(tuple,list)):
+                    seq=sample[0]
+                    act=sample[1] if len(sample)>=2 else np.zeros((3,),np.float32)
+                    atype=sample[2] if len(sample)>=3 else 0
+                    ctrl=sample[3] if len(sample)>=4 else -1
+                    tmpl=sample[4] if len(sample)>=5 else -1
+                    path_vec=sample[5] if len(sample)>=6 else np.zeros((64,),np.float32)
+                    text=sample[6] if len(sample)>=7 else ""
+                    success=sample[7] if len(sample)>=8 else 0
+                else:
+                    seq=sample
+                    act=np.zeros((3,),np.float32)
+                    atype=0
+                    ctrl=-1
+                    tmpl=-1
+                    path_vec=np.zeros((64,),np.float32)
+                    text=""
+                    success=0
+                seq_arr=np.asarray(seq)
+                if seq_arr.ndim==4:
+                    seq_arr=np.expand_dims(seq_arr,0)
+                elif seq_arr.ndim<4:
+                    seq_arr=np.asarray(np.zeros((1,seq_len,256,256,3),np.uint8))
+                act_arr=np.asarray(act,dtype=np.float32)
+                if act_arr.ndim==1:
+                    act_arr=act_arr.reshape(1,-1)
+                atype_arr=np.asarray(atype,dtype=np.int64).reshape(1)
+                ctrl_arr=np.asarray(ctrl,dtype=np.int64).reshape(1)
+                tmpl_arr=np.asarray(tmpl,dtype=np.int64).reshape(1)
+                path_arr=np.asarray(path_vec,dtype=np.float32)
+                if path_arr.ndim==1:
+                    path_arr=path_arr.reshape(1,-1)
+                success_arr=np.asarray(success,dtype=np.int64).reshape(1)
+                return (torch.from_numpy(np.ascontiguousarray(seq_arr)),torch.from_numpy(np.ascontiguousarray(act_arr)),torch.from_numpy(np.ascontiguousarray(atype_arr)),torch.from_numpy(np.ascontiguousarray(ctrl_arr)),torch.from_numpy(np.ascontiguousarray(tmpl_arr)),torch.from_numpy(np.ascontiguousarray(path_arr)),[str(text)],torch.from_numpy(np.ascontiguousarray(success_arr)))
             M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
             base_workers=max(0,min(6,os.cpu_count() or 2)-1)
             if ds.real_count<=2:
@@ -2523,9 +2551,15 @@ class App:
                 it=iter(dl)
                 epoch_steps=0
                 phase_ready=False
+                fallback_provided=False
                 while True:
                     try:item=next(it)
-                    except StopIteration:break
+                    except StopIteration:
+                        if not fallback_provided and epoch_steps==0:
+                            item=build_fallback_batch()
+                            fallback_provided=True
+                        else:
+                            break
                     if self.optimize_event.is_set():break
                     if not phase_ready:
                         self._update_progress_phase("训练中")
