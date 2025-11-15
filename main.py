@@ -426,15 +426,39 @@ class ExperienceWriter:
             except Exception:
                 pass
 class ReplayBuffer:
-    def __init__(self,cap=50000):
+    def __init__(self,cap=50000,target_size=(256,256)):
         self.cap=cap
         self.data=[]
         self.lock=threading.Lock()
+        self.target_size=target_size
+    def _format_frame(self,frame):
+        tw,th=self.target_size
+        if not isinstance(frame,np.ndarray):
+            frame=np.zeros((th,tw,3),np.uint8)
+        if frame.ndim!=3 or frame.size==0:
+            return np.zeros((th,tw,3),np.uint8)
+        if frame.shape[2]>3:
+            frame=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
+        h,w=frame.shape[:2]
+        if h<=0 or w<=0:
+            return np.zeros((th,tw,3),np.uint8)
+        if frame.dtype!=np.uint8:
+            frame=np.clip(frame,0,255).astype(np.uint8)
+        scale=min(float(tw)/float(w),float(th)/float(h))
+        nw=max(1,int(round(w*scale)))
+        nh=max(1,int(round(h*scale)))
+        resized=cv2.resize(frame,(nw,nh))
+        canvas=np.zeros((th,tw,3),np.uint8)
+        top=max(0,(th-nh)//2)
+        left=max(0,(tw-nw)//2)
+        canvas[top:top+nh,left:left+nw]=resized
+        return canvas
     def add(self,frame,action,source,event_id=0,atype=0,ctrl=-1,txt=""):
+        formatted=self._format_frame(frame)
         with self.lock:
             if len(self.data)>=self.cap:
                 self.data.pop(0)
-            self.data.append((frame.astype(np.uint8),np.array(action,dtype=np.float32),int(source),int(event_id),int(atype),int(ctrl),str(txt)))
+            self.data.append((formatted,np.array(action,dtype=np.float32),int(source),int(event_id),int(atype),int(ctrl),str(txt)))
     def size(self):
         with self.lock:
             return len(self.data)
