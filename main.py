@@ -2374,15 +2374,30 @@ class App:
             self.schedule(no_data)
             return
         M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
-        num_workers=max(0,min(6,os.cpu_count() or 2)-1)
-        bs=max(4,int(8+64*(1.0-M)));lr=1e-4*(0.5 if hot else 1.0)
+        base_workers=max(0,min(6,os.cpu_count() or 2)-1)
+        if ds.real_count<=2:
+            num_workers=0
+        else:
+            num_workers=min(base_workers,max(0,ds.real_count-1))
+        bs=max(4,int(8+64*(1.0-M)))
+        if ds.real_count>0 and ds.real_count<bs:
+            bs=max(1,ds.real_count)
+        lr=1e-4*(0.5 if hot else 1.0)
         for g in self.optimizer.param_groups:g["lr"]=lr
-        prefetch_factor=4
-        real_len=max(1,ds.real_count)
-        drop_last=real_len>=bs
-        dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=(num_workers>0),prefetch_factor=prefetch_factor if num_workers>0 else None)
+        prefetch_factor=4 if num_workers>0 else None
+        drop_last=ds.real_count>=bs and bs>0
+        persistent=num_workers>0 and ds.real_count>=num_workers*2
+        try:
+            dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=persistent,prefetch_factor=prefetch_factor)
+        except Exception:
+            num_workers=0
+            dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=0,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=False,prefetch_factor=None)
         epochs=3
-        steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
+        try:
+            steps_per_epoch=max(1,len(dl))
+        except Exception:
+            real_len=max(1,ds.real_count)
+            steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
         total=max(1,steps_per_epoch*epochs)
         done_steps=0
         self.model.train()
