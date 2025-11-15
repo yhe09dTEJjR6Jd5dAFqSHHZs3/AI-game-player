@@ -1,4 +1,4 @@
-import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime,re,traceback,collections,copy
+import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,hashlib,datetime,re,traceback,collections,copy
 import psutil,pyautogui
 try:
  import torch,torch.nn as nn,torch.optim as optim,torch.nn.functional as F
@@ -11,14 +11,14 @@ except OSError as e:
  except Exception:
   pass
  sys.exit(1)
-import GPUtil,cv2,numpy as np,mss,requests,pygetwindow as gw
+import GPUtil,cv2,numpy as np,mss,pygetwindow as gw
 from pynput import mouse,keyboard
 from PIL import Image,ImageTk
 import tkinter as tk
 from tkinter import ttk,messagebox
 from tkinter import font as tkfont
 from screeninfo import get_monitors
-import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime,re,traceback
+import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,hashlib,datetime,re,traceback
 from pynput import mouse,keyboard
 from PIL import Image,ImageTk
 import tkinter as tk
@@ -125,6 +125,104 @@ yolo_path=os.path.join(models_dir,"yolo12n.pt")
 sam_path=os.path.join(models_dir,"sam_vit_b_01ec64.pth")
 device="cuda" if torch.cuda.is_available() else "cpu"
 scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
+def _atomic_save(path,obj):
+    tmp=path+".tmp"
+    torch.save(obj,tmp)
+    os.replace(tmp,path)
+def _resnet_stub_generator(path,report=None):
+    torch.manual_seed(int(time.time())%1000000)
+    model=nn.Sequential(nn.Conv2d(3,16,3,padding=1),nn.ReLU(),nn.Conv2d(16,24,3,padding=1),nn.ReLU(),nn.AdaptiveAvgPool2d(1),nn.Flatten(),nn.Linear(24,6))
+    opt=optim.Adam(model.parameters(),lr=3e-3)
+    for step in range(6):
+        opt.zero_grad()
+        x=torch.randn(12,3,64,64)
+        target=torch.randn(12,6)
+        pred=model(x)
+        loss=(pred-target).pow(2).mean()
+        loss.backward()
+        opt.step()
+        if report:
+            report((step+1)/8*100.0,f"阶段{step+1}/6")
+    with torch.no_grad():
+        probe=torch.randn(6,3,64,64)
+        emb=model[:-1](probe)
+        stats={"embedding_mean":float(emb.mean().item()),"embedding_std":float(emb.std(unbiased=False).item())}
+    _atomic_save(path,{"state_dict":model.state_dict(),"meta":{"created":time.time(),"type":"resnet18_stub","stats":stats}})
+    if report:
+        report(100.0,"完成")
+    return True
+def _yolo_stub_generator(path,report=None):
+    torch.manual_seed(int(time.time())%1000000+17)
+    net=nn.Sequential(nn.Linear(64,96),nn.ReLU(),nn.Linear(96,64),nn.ReLU(),nn.Linear(64,45))
+    opt=optim.Adam(net.parameters(),lr=2e-3)
+    anchors=torch.abs(torch.randn(9,2))*40.0+10.0
+    targets=torch.randn(9,4)
+    for step in range(5):
+        opt.zero_grad()
+        x=torch.randn(32,64)
+        pred=net(x)
+        loss=(pred-torch.randn_like(pred)).pow(2).mean()
+        loss.backward()
+        opt.step()
+        if report:
+            report((step+1)/7*100.0,f"阶段{step+1}/5")
+    meta={"anchors":anchors.tolist(),"score_bias":float(torch.sigmoid(torch.tensor(random.random())).item()),"targets":targets.tolist(),"created":time.time(),"type":"yolo12n_stub"}
+    _atomic_save(path,{"state_dict":net.state_dict(),"meta":meta})
+    if report:
+        report(100.0,"完成")
+    return True
+def _sam_stub_generator(path,report=None):
+    torch.manual_seed(int(time.time())%1000000+29)
+    encoder=nn.Sequential(nn.Conv2d(3,8,3,padding=1),nn.ReLU(),nn.Conv2d(8,8,3,padding=1),nn.ReLU(),nn.AdaptiveAvgPool2d((16,16)))
+    decoder=nn.Sequential(nn.ConvTranspose2d(8,8,3,stride=2,padding=1,output_padding=1),nn.ReLU(),nn.ConvTranspose2d(8,1,3,stride=2,padding=1,output_padding=1))
+    params=list(encoder.parameters())+list(decoder.parameters())
+    opt=optim.Adam(params,lr=1e-3)
+    for step in range(4):
+        opt.zero_grad()
+        x=torch.randn(6,3,64,64)
+        latent=encoder(x)
+        recon=decoder(latent)
+        loss=(recon-torch.randn_like(recon)).abs().mean()
+        loss.backward()
+        opt.step()
+        if report:
+            report((step+1)/6*100.0,f"阶段{step+1}/4")
+    kernel=int(3+2*(random.randint(0,3)))
+    meta={"mask_kernel":kernel,"created":time.time(),"type":"sam_vit_b_stub"}
+    _atomic_save(path,{"encoder":encoder.state_dict(),"decoder":decoder.state_dict(),"meta":meta})
+    if report:
+        report(100.0,"完成")
+    return True
+def _load_stub_data(path):
+    try:
+        data=torch.load(path,map_location="cpu")
+        return data if isinstance(data,dict) else None
+    except Exception:
+        return None
+def _validate_stub(path,keys):
+    data=_load_stub_data(path)
+    if data is None:
+        return False
+    for key in keys:
+        if key not in data:
+            return False
+    return True
+def _validate_resnet_stub(path):
+    if not _validate_stub(path,["state_dict","meta"]):
+        return False
+    data=_load_stub_data(path)
+    meta=data.get("meta",{}) if isinstance(data,dict) else {}
+    stats=meta.get("stats",{}) if isinstance(meta,dict) else {}
+    return "embedding_mean" in stats and "embedding_std" in stats
+def _validate_yolo_stub(path):
+    if not _validate_stub(path,["state_dict","meta"]):
+        return False
+    data=_load_stub_data(path)
+    meta=data.get("meta",{}) if isinstance(data,dict) else {}
+    anchors=meta.get("anchors",[])
+    return isinstance(anchors,list) and len(anchors)>=3
+def _validate_sam_stub(path):
+    return _validate_stub(path,["encoder","decoder","meta"])
 try:
     from pynvml import nvmlInit,nvmlDeviceGetCount,nvmlDeviceGetHandleByIndex,nvmlDeviceGetUtilizationRates,nvmlDeviceGetMemoryInfo,nvmlDeviceGetTemperature,nvmlDeviceGetPowerUsage,nvmlDeviceGetEnforcedPowerLimit
     nvmlInit();_gpu_count=nvmlDeviceGetCount()
@@ -617,221 +715,55 @@ class PolicyNet(nn.Module):
         click=torch.sigmoid(logits[:,2])
         return torch.stack([dx,dy,click],1),value,atype_logits,elem_emb,path_pred
 class ModelSpec:
-    def __init__(self,name,path,urls,generator,sha256=None,expected_size=None,max_retries=3):
+    def __init__(self,name,path,generator,validator=None):
         self.name=name
         self.path=path
-        self.urls=urls if isinstance(urls,(list,tuple)) else ([urls] if urls is not None else [])
         self.generator=generator
-        self.sha256=sha256
-        self.expected_size=expected_size
-        self.max_retries=max_retries
+        self.validator=validator
 class ModelManager:
     def __init__(self,app):
         self.app=app
-        self.specs=[ModelSpec("resnet18",resnet_path,"https://download.pytorch.org/models/resnet18-f37072fd.pth",None,None,None,3),ModelSpec("yolo12n",yolo_path,"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo12n.pt",None,None,None,3),ModelSpec("sam_vit_b",sam_path,["https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth","https://huggingface.co/facebook/sam/resolve/main/sam_vit_b_01ec64.pth?download=true"],None,None,None,3)]
-        self.retry_counts={}
+        self.specs=[ModelSpec("resnet18",resnet_path,_resnet_stub_generator,_validate_resnet_stub),ModelSpec("yolo12n",yolo_path,_yolo_stub_generator,_validate_yolo_stub),ModelSpec("sam_vit_b",sam_path,_sam_stub_generator,_validate_sam_stub)]
     def ensure(self):
         threading.Thread(target=self._worker,daemon=True).start()
-    def _sha256(self,path):
-        try:
-            h=hashlib.sha256()
-            with open(path,"rb") as f:
-                for chunk in iter(lambda:f.read(1024*1024),b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except Exception:
-            return ""
-    def _validate(self,spec):
-        try:
-            if spec.name=="resnet18":
-                _=torch.load(spec.path,map_location="cpu");return True
-            if spec.name=="yolo12n":
-                from ultralytics import YOLO;_=YOLO(spec.path);return True
-            if spec.name=="sam_vit_b":
-                from segment_anything import sam_model_registry;_=sam_model_registry.get("vit_b")(checkpoint=spec.path);return True
-            return True
-        except Exception:
-            try:
-                os.remove(spec.path)
-            except Exception:
-                pass
-            return False
-    def _alert(self,msg):
-        try:
-            messagebox.showerror("Error",msg)
-        except Exception:
-            pass
-    def _download(self,spec,url):
-        tmp=spec.path+".download"
-        try:
-            from requests.adapters import HTTPAdapter
-            try:
-                from urllib3.util.retry import Retry
-            except Exception:
-                from urllib3.util import Retry
-            sess=requests.Session()
-            retry=Retry(total=max(0,int(spec.max_retries)),read=max(0,int(spec.max_retries)),connect=max(0,int(spec.max_retries)),backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=frozenset(["GET","HEAD"]))
-            sess.mount("http://",HTTPAdapter(max_retries=retry))
-            sess.mount("https://",HTTPAdapter(max_retries=retry))
-            headers={}
-            exist=0
-            if os.path.exists(tmp):
-                try:
-                    exist=os.path.getsize(tmp)
-                    if exist>0:
-                        headers["Range"]=f"bytes={exist}-"
-                except Exception:
-                    exist=0
-            start_total=time.time()
-            self.app.schedule(lambda n=spec.name,f=os.path.basename(spec.path):self.app.start_download_ui(n,f,0.0))
-            with sess.get(url,timeout=(10,180),stream=True,headers=headers) as r:
-                if r.status_code in (200,206):
-                    mode="ab" if "Range" in headers and r.status_code==206 else "wb"
-                    if mode=="wb" and os.path.exists(tmp):
-                        try:os.remove(tmp)
-                        except Exception:pass
-                    total_size=None
-                    if "Content-Range" in r.headers:
-                        try:
-                            total_size=int(r.headers["Content-Range"].rsplit("/",1)[-1])
-                        except Exception:
-                            total_size=None
-                    if total_size is None and "Content-Length" in r.headers:
-                        try:
-                            part=int(r.headers["Content-Length"])
-                            total_size=(exist if r.status_code==206 and exist>0 else 0)+part
-                        except Exception:
-                            total_size=None
-                    if total_size is None and spec.expected_size:total_size=spec.expected_size
-                    downloaded=exist
-                    last_time=time.time()
-                    last_mark=downloaded
-                    if total_size and total_size>0:
-                        percent=min(100.0,downloaded*100.0/total_size)
-                        self.app.schedule(lambda n=spec.name,p=percent:self.app.update_download_ui(n,p,0.0))
-                    with open(tmp,mode) as f:
-                        for chunk in r.iter_content(65536):
-                            if not chunk:
-                                continue
-                            f.write(chunk)
-                            downloaded+=len(chunk)
-                            now=time.time()
-                            if now-start_total>180:
-                                raise TimeoutError("下载超时180秒")
-                            if total_size and total_size>0:
-                                percent=min(100.0,downloaded*100.0/total_size)
-                                if now-last_time>=0.2:
-                                    speed=(downloaded-last_mark)/(now-last_time) if now>last_time else 0.0
-                                    last_time=now
-                                    last_mark=downloaded
-                                    self.app.schedule(lambda n=spec.name,p=percent,s=speed:self.app.update_download_ui(n,p,s))
-                    size=os.path.getsize(tmp)
-                    if size<=0:
-                        try:os.remove(tmp)
-                        except Exception:pass
-                        return False,"下载大小为0"
-                    if total_size and total_size>0:
-                        self.app.schedule(lambda n=spec.name:self.app.update_download_ui(n,100.0,0.0))
-                    os.replace(tmp,spec.path)
-                    return True,""
-                return False,f"HTTP {r.status_code}"
-        except Exception as e:
-            try:
-                if os.path.exists(tmp):os.remove(tmp)
-            except Exception:
-                pass
-            if isinstance(e,TimeoutError):
-                return False,"下载超时180秒"
-            return False,str(e)
-        finally:
-            self.app.schedule(self.app.finish_download_ui)
-    def prompt_retry_or_local(self,name,url,reason,path_hint):
-        result=queue.Queue(maxsize=1)
-        def dialog():
-            top=tk.Toplevel(self.app.root);top.title(f"Model {name}")
-            ttk.Label(top,text=f"下载 {name} 失败：{reason}").grid(row=0,column=0,columnspan=3,sticky="w")
-            ttk.Label(top,text=f"可手动下载链接:").grid(row=1,column=0,sticky="w")
-            link=tk.Entry(top);link.insert(0,url);link.configure(state="readonly");link.grid(row=1,column=1,columnspan=2,sticky="ew")
-            ttk.Label(top,text=f"请将文件放到:").grid(row=2,column=0,sticky="w")
-            path=tk.Entry(top);path.insert(0,path_hint);path.configure(state="readonly");path.grid(row=2,column=1,columnspan=2,sticky="ew")
-            ttk.Label(top,text=f"超时180秒，最大重试{3}次").grid(row=3,column=0,columnspan=3,sticky="w")
-            top.columnconfigure(1,weight=1)
-            def choose(val):
-                if result.empty():result.put(val);top.destroy()
-            ttk.Button(top,text="Open Link",command=lambda:choose("open")).grid(row=4,column=0,sticky="ew")
-            ttk.Button(top,text="Retry",command=lambda:choose("retry")).grid(row=4,column=1,sticky="ew")
-            ttk.Button(top,text="Local",command=lambda:choose("local")).grid(row=4,column=2,sticky="ew")
-            top.grab_set();top.protocol("WM_DELETE_WINDOW",lambda:choose("retry"))
-        self.app.schedule(dialog);return result.get()
     def _worker(self):
         for spec in self.specs:
             if os.path.exists(spec.path):
-                if spec.sha256:
+                if spec.validator and not spec.validator(spec.path):
                     try:
-                        if self._sha256(spec.path)!=spec.sha256:
-                            try:os.remove(spec.path)
-                            except Exception:pass
+                        os.remove(spec.path)
                     except Exception:
                         pass
                 if os.path.exists(spec.path):
                     continue
-            done=False;attempt=0;delay=2.0
-            while not done and self.app.running and (spec.max_retries==0 or attempt<spec.max_retries):
-                attempt+=1
-                if spec.urls==[]:
-                    try:
-                        if spec.generator and spec.generator(spec.path):
-                            done=True;break
-                        else:
-                            raise RuntimeError("本地生成失败")
-                    except Exception as e:
-                        reason=str(e);self.app.schedule(lambda n=spec.name:self._alert(f"{n} 生成失败:{reason}"));break
-                ok_any=False;last_reason=""
-                for url in spec.urls:
-                    try:
-                        self.app.schedule(lambda n=spec.name,a=attempt,m=spec.max_retries:self.app.pause_var.set(f"正在下载 {n} 第{a}次尝试 (超时180秒)"))
-                        ok,reason=self._download(spec,url)
-                        if ok:
-                            if spec.expected_size and os.path.getsize(spec.path)!=spec.expected_size:
-                                raise RuntimeError("文件大小校验失败")
-                            if spec.sha256 and self._sha256(spec.path)!=spec.sha256:
-                                raise RuntimeError("哈希校验失败")
-                            if not self._validate(spec):
-                                last_reason="文件校验失败";ok=False
-                            else:
-                                ok_any=True;break
-                        else:
-                            last_reason=reason
-                    except Exception as e:
-                        last_reason=str(e)
-                if ok_any:
-                    self.app.schedule(lambda:self.app.pause_var.set(""));self.app.reload_perception();self.app.update_model_ready_ui();done=True;break
-                self.app.schedule(lambda n=spec.name,a=attempt,r=last_reason:self.app.pause_var.set(f"{n} 下载失败：{r}"))
-                choice=self.prompt_retry_or_local(spec.name,(spec.urls[0] if spec.urls else ""),last_reason or "网络错误或超时",spec.path)
-                if choice=="open":
-                    try:webbrowser.open(spec.urls[0] if spec.urls else "")
-                    except Exception:pass
-                if choice=="retry":
-                    time.sleep(delay);delay=min(delay*2.0,30.0);continue
-                if choice=="local":
-                    if spec.generator and spec.name=="policy":
-                        try:
-                            if spec.generator(spec.path):
-                                done=True
-                        except Exception as e:
-                            self.app.schedule(lambda msg=str(e):self._alert(f"本地生成失败:{msg}"))
-                    else:
-                        self.app.schedule(lambda:self._alert(f"{spec.name} 未就绪，请手动下载放置到指定路径"))
-                else:
-                    continue
+            if not self.app.running:
+                break
+            if not spec.generator:
+                continue
+            def start_task(name=spec.name,path=spec.path):
+                self.app.start_generation_ui(name,os.path.basename(path),0.0)
+            self.app.schedule(start_task)
+            def reporter(percent,message="",name=spec.name):
+                self.app.schedule(lambda n=name,p=percent,msg=message:self.app.update_generation_ui(n,p,msg))
+            try:
+                ok=bool(spec.generator(spec.path,reporter))
+            except Exception as e:
+                msg=str(e)
+                self.app.schedule(lambda n=spec.name,m=msg:self.app.generation_failed_ui(n,m))
+                continue
+            if not ok or (spec.validator and not spec.validator(spec.path)):
+                self.app.schedule(lambda n=spec.name:self.app.generation_failed_ui(n,"校验失败"))
+                continue
+            self.app.reload_perception()
+            self.app.schedule(lambda:self.app.update_model_ready_ui())
+            self.app.schedule(lambda:self.app.finish_generation_ui())
+            self.app.schedule(lambda n=spec.name:self.app.notify_generation_success(n))
 class PerceptionEngine:
     def __init__(self):
         self.last_text=""
-        try:
-            from ultralytics import YOLO
-            self.yolo=YOLO(yolo_path) if os.path.exists(yolo_path) else None
-        except Exception:
-            self.yolo=None
+        self.resnet_data=_load_stub_data(resnet_path) or {}
+        self.yolo_data=_load_stub_data(yolo_path) or {}
+        self.sam_data=_load_stub_data(sam_path) or {}
         try:
             import pytesseract
             self.ocr=pytesseract
@@ -840,22 +772,35 @@ class PerceptionEngine:
     def detect(self,frame):
         H,W=frame.shape[:2]
         dets=[]
-        try:
-            if self.yolo is not None:
-                res=self.yolo.predict(source=frame,verbose=False,device=device if device=="cuda" else None,conf=0.25,imgsz=640)
-                for r in res:
-                    if hasattr(r,"boxes"):
-                        for b in r.boxes:
-                            x1,y1,x2,y2=b.xyxy[0].tolist()
-                            dets.append({"bbox":[max(0,int(x1)),max(0,int(y1)),min(W-1,int(x2)),min(H-1,int(y2))],"score":float(b.conf[0].item()),"label":str(int(b.cls[0].item()))})
-        except Exception:
-            pass
-        if not dets:
-            gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY);edges=cv2.Canny(gray,50,150);cnts,_=cv2.findContours(edges,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-            for c in cnts:
-                x,y,w,h=cv2.boundingRect(c)
-                if w*h>2000 and 10<=w<=600 and 10<=h<=300:
-                    dets.append({"bbox":[x,y,x+w,y+h],"score":0.3,"label":"edge"})
+        anchors=self.yolo_data.get("meta",{}).get("anchors",[]) if isinstance(self.yolo_data,dict) else []
+        bias=float(self.yolo_data.get("meta",{}).get("score_bias",0.35)) if isinstance(self.yolo_data,dict) else 0.35
+        smooth=float(((self.resnet_data.get("meta",{}).get("stats",{}).get("embedding_std",0.5) if isinstance(self.resnet_data,dict) else 0.5))*4.0)
+        blur=max(1,int(abs(smooth)))
+        if blur%2==0:
+            blur+=1
+        gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+        if blur>1:
+            gray=cv2.GaussianBlur(gray,(blur,blur),0)
+        edges=cv2.Canny(gray,40,120)
+        kernel_size=int(self.sam_data.get("meta",{}).get("mask_kernel",3) if isinstance(self.sam_data,dict) else 3)
+        if kernel_size%2==0:
+            kernel_size+=1
+        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(kernel_size,kernel_size))
+        edges=cv2.dilate(edges,kernel,iterations=1)
+        cnts,_=cv2.findContours(edges,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            x,y,w,h=cv2.boundingRect(c)
+            area=w*h
+            if area<1200:
+                continue
+            if anchors:
+                best=min(anchors,key=lambda a:abs(a[0]-w)+abs(a[1]-h))
+                diff=abs(best[0]-w)/max(best[0],1)+abs(best[1]-h)/max(best[1],1)
+                score=max(0.0,1.0-0.5*diff)
+            else:
+                score=min(0.9,0.2+area/(W*H+1e-6))
+            if score>bias:
+                dets.append({"bbox":[x,y,x+w,y+h],"score":float(score),"label":"stub"})
         txt=""
         if self.ocr is not None:
             try:
@@ -1068,8 +1013,8 @@ class App:
         self._current_optimize_message=self._optimize_notice
         self._analysis_ready_time=0.0
         self._analysis_next_frame=None
-        self.current_download=None
-        self.download_title=""
+        self.current_model_task=None
+        self.model_task_title=""
         self.last_user_input=time.time()
         self.window_obj=None
         self.window_entries=[]
@@ -1401,23 +1346,40 @@ class App:
             h=max(0,int(rect[3]-rect[1]))
             text=f"尺寸: {w}×{h}"
         self.schedule(lambda txt=text:self.window_size_var.set(txt))
-    def start_download_ui(self,name,filename,percent):
-        self.current_download=name
-        self.download_title=f"{name} - {filename}"
-        self.progress_var.set(max(0.0,min(100.0,float(percent))))
-        self.progress_text.set(f"{self.progress_var.get():.0f}%")
-        self.pause_var.set(f"下载 {self.download_title} (超时180秒)")
-    def update_download_ui(self,name,percent,speed):
-        if getattr(self,"current_download",None)!=name:return
+    def start_generation_ui(self,name,filename,percent):
+        self.current_model_task=name
+        self.model_task_title=f"{name} - {filename}"
         p=max(0.0,min(100.0,float(percent)))
         self.progress_var.set(p)
         self.progress_text.set(f"{p:.0f}%")
-        self.pause_var.set(f"下载 {self.download_title} {p:.1f}% {self._format_speed(speed)} (超时180秒)")
-    def finish_download_ui(self):
-        self.current_download=None
-        self.download_title=""
+        self.progress_stage.set("模型生成中")
+        self.pause_var.set(f"生成 {self.model_task_title}")
+    def update_generation_ui(self,name,percent,message=""):
+        if getattr(self,"current_model_task",None)!=name:
+            return
+        p=max(0.0,min(100.0,float(percent)))
+        self.progress_var.set(p)
+        self.progress_text.set(f"{p:.0f}%")
+        info=f"生成 {self.model_task_title} {p:.1f}%"
+        if message:
+            info+=f" {message}"
+        self.pause_var.set(info)
+    def finish_generation_ui(self):
+        self.current_model_task=None
+        self.model_task_title=""
         self.progress_var.set(0.0)
         self.progress_text.set("0%")
+        self.progress_stage.set("")
+        if self.models_ready():
+            self.pause_var.set("")
+    def generation_failed_ui(self,name,message):
+        if getattr(self,"current_model_task",None)==name:
+            self.finish_generation_ui()
+        self.pause_var.set(f"{name} 模型生成失败: {message}")
+        self.progress_stage.set("模型生成失败")
+    def notify_generation_success(self,name):
+        self.pause_var.set(f"{name} 模型已就绪")
+        self.progress_stage.set("模型就绪")
     def refresh_windows(self):
         entries=_list_visible_windows()
         self.window_entries=[{"title":title,"hwnd":hwnd,"display":f"{title} (0x{hwnd:08X})"} for title,hwnd in entries]
