@@ -1000,7 +1000,7 @@ class App:
         self.gpu_var=tk.StringVar(value="GPU:0.0%")
         self.vram_var=tk.StringVar(value="VRAM:0.0%")
         self.gpu_src_var=tk.StringVar(value="GPU指标来源: 不可用")
-        self.freq_var=tk.StringVar(value="Capture:0.0 Hz")
+        self.freq_var=tk.StringVar(value="截图频率:0.0 Hz")
         self.progress_var=tk.DoubleVar(value=0.0)
         self.progress_text=tk.StringVar(value="0%")
         self.progress_stage=tk.StringVar(value="")
@@ -1962,18 +1962,30 @@ class App:
         while self.running:
             cpu=float(psutil.cpu_percent(interval=None));mem=float(psutil.virtual_memory().percent);gpu,mem_gpu,temp,pwr_ratio=self._gpu_metrics_ext()
             if self.gpu_source=="不可用":
-                M=max(cpu,mem)
+                weights=[("cpu",cpu,0.55),("mem",mem,0.45)]
             else:
-                M=max(cpu,mem,gpu,mem_gpu)
-            freq=0.0 if M>=100.0 else max(0.0,100.0*(1.0-M/100.0))
-            self.metrics={"cpu":cpu,"mem":mem,"gpu":gpu,"vram":mem_gpu,"freq":freq,"temp":temp,"pwr":pwr_ratio}
+                weights=[("cpu",cpu,0.3),("mem",mem,0.25),("gpu",gpu,0.25),("vram",mem_gpu,0.2)]
+            total_weight=sum(w for _,_,w in weights)
+            load_ratio=sum(min(max(v,0.0),100.0)/100.0*w for _,v,w in weights)/max(total_weight,1e-6)
+            spare=max(0.0,1.0-load_ratio)
+            freq=120.0*(spare**1.4)
+            if temp>=78.0:
+                freq*=0.6
+            if pwr_ratio>=0.9:
+                freq*=0.7
+            peak_usage=max(cpu,mem,gpu,mem_gpu)
+            if load_ratio>=0.995 or (load_ratio>=0.9 and freq<1.0):
+                freq=0.0
+            freq=max(0.0,min(120.0,freq))
+            self.metrics={"cpu":cpu,"mem":mem,"gpu":gpu,"vram":mem_gpu,"freq":freq,"temp":temp,"pwr":pwr_ratio,"load":load_ratio*100.0}
             if freq>0:
                 target_ci=1.0/freq
             else:
                 target_ci=0.05
             self._cap_interval_ema=0.8*self._cap_interval_ema+0.2*target_ci
             self.capture_interval=max(0.005,float(self._cap_interval_ema))
-            target_ai=0.02+0.08*min(max(M,0.0),1.0)
+            usage_ratio=max(0.0,min(1.0,peak_usage/100.0))
+            target_ai=0.02+0.08*usage_ratio
             if temp>=80 or pwr_ratio>=0.95:target_ai*=2.0
             self._ai_interval_ema=0.8*self._ai_interval_ema+0.2*target_ai
             self.ai_interval=float(self._ai_interval_ema)
@@ -1994,10 +2006,11 @@ class App:
                     if self.mode=="init" and self.window_hwnd is not None:self.set_mode("learn")
                     if self.window_hwnd is not None:self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
             try:
-                if os.cpu_count():
-                    target_threads=max(1,int(min(os.cpu_count(),max(1,int((1.0-M)*os.cpu_count())))))
-                    if target_threads!=last_threads:
-                        torch.set_num_threads(target_threads);last_threads=target_threads
+                total_threads=os.cpu_count() or 1
+                free_ratio=max(0.1,1.0-usage_ratio)
+                target_threads=max(1,min(total_threads,int(math.ceil(total_threads*free_ratio))))
+                if target_threads!=last_threads:
+                    torch.set_num_threads(target_threads);last_threads=target_threads
             except Exception:
                 pass
             time.sleep(0.5)
@@ -2229,7 +2242,7 @@ class App:
         self.mem_var.set(f"Memory:{self.metrics['mem']:.1f}%")
         self.gpu_var.set(f"GPU:{self.metrics['gpu']:.1f}%")
         self.vram_var.set(f"VRAM:{self.metrics['vram']:.1f}%")
-        self.freq_var.set(f"Capture:{self.metrics['freq']:.1f} Hz")
+        self.freq_var.set(f"截图频率:{self.metrics['freq']:.1f} Hz")
         self.progress_text.set(f"{self.progress_var.get():.0f}%")
         self.root.after(50,self._update_ui)
 
