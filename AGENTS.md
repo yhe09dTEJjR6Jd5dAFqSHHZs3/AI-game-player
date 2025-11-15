@@ -50,7 +50,9 @@ AI优化过程不属于学习模式，因此在用户点击“Confirm”按钮�
 用户当前选择的窗口画面；
 电脑硬件资源占用百分比：CPU、内存、GPU、显存；
 
+鲁棒性：
 在程序运行过程中的任意时刻，用户都有可能会手动调整所选窗口以及主程序窗口的宽、高、位置。
+当记录的数据量极少时，也要能优化成功。
 
 其他：
 FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
