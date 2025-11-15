@@ -2,8 +2,6 @@
 
 仅用一个没有注释的Python程序实现所有功能。
 
-适配Windows 11，Python 3.13.9，PyTorch 2.9.0。
-
 设CPU、内存、GPU、显存占用率中的最大值为M(%)
 当GPU不可用时，GPU、显存占用率视为0%；
 当M＜100%时：
@@ -51,8 +49,9 @@ AI优化过程不属于学习模式，因此在用户点击“Confirm”按钮�
 电脑硬件资源占用百分比：CPU、内存、GPU、显存；
 
 鲁棒性：
-在程序运行过程中的任意时刻，用户都有可能会手动调整所选窗口以及主程序窗口的宽、高、位置。
 当记录的数据量极少时，也要能优化成功。
+适配Windows 11，Python 3.13.9，PyTorch 2.9.0。
+在程序运行过程中的任意时刻，用户都有可能会手动调整所选窗口以及主程序窗口的宽、高、位置。
 
 其他：
 FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
