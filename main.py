@@ -2459,7 +2459,13 @@ class App:
                     self.pause_var.set("经验数据不足，使用空白样本优化")
                 self.schedule(warn)
             def build_fallback_batch():
-                sample=ds.__getitem__(0)
+                idx=0
+                if ds.real_count>0:
+                    try:
+                        idx=random.randint(0,max(0,ds.real_count-1))
+                    except Exception:
+                        idx=0
+                sample=ds.__getitem__(idx)
                 if isinstance(sample,(tuple,list)):
                     seq=sample[0]
                     act=sample[1] if len(sample)>=2 else np.zeros((3,),np.float32)
@@ -2510,8 +2516,9 @@ class App:
             for g in self.optimizer.param_groups:g["lr"]=lr
             drop_last=ds.real_count>=bs and bs>0
             loader_kwargs={"batch_size":bs,"shuffle":True,"num_workers":0,"pin_memory":(device=="cuda"),"drop_last":drop_last}
+            manual_sampling=fallback_mode or ds.real_count<=max(8,bs)
             dl=None
-            if not fallback_mode:
+            if not manual_sampling:
                 loader_kwargs["num_workers"]=num_workers
                 if num_workers>0:
                     loader_kwargs["persistent_workers"]=num_workers>0 and ds.real_count>=num_workers*2
@@ -2522,10 +2529,17 @@ class App:
                     loader_kwargs["num_workers"]=0
                     loader_kwargs.pop("persistent_workers",None)
                     loader_kwargs.pop("prefetch_factor",None)
-                    dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
+                    try:
+                        dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
+                    except Exception:
+                        dl=None
+                        manual_sampling=True
             epochs=2 if fallback_mode else 3
             if fallback_mode:
                 steps_per_epoch=max(4,min(16,bs))
+            elif manual_sampling:
+                real_len=max(1,ds.real_count)
+                steps_per_epoch=max(1,math.ceil(real_len/max(1,bs)))
             else:
                 try:
                     steps_per_epoch=max(1,len(dl))
@@ -2734,12 +2748,16 @@ class App:
                 epoch_steps=0
                 phase_ready=False
                 fallback_provided=False
+                loader_wait_start=time.time()
+                loader_fail_count=0
                 while epoch_steps<steps_per_epoch:
                     if self.optimize_event.is_set():break
                     item=None
                     if iterator is not None:
                         try:
                             item=next(iterator)
+                            loader_wait_start=time.time()
+                            loader_fail_count=0
                         except StopIteration:
                             if epoch_steps==0 and not fallback_provided:
                                 item=build_fallback_batch()
@@ -2747,12 +2765,21 @@ class App:
                             else:
                                 break
                         except Exception:
+                            iterator=None
+                            manual_sampling=True
+                            dl=None
                             item=build_fallback_batch()
                             fallback_provided=True
                     else:
                         item=build_fallback_batch()
                         fallback_provided=True
                     if not train_batch(item,steps_per_epoch):
+                        loader_fail_count+=1
+                        if not manual_sampling and (time.time()-loader_wait_start>5.0 or loader_fail_count>3):
+                            iterator=None
+                            manual_sampling=True
+                            dl=None
+                            loader_wait_start=time.time()
                         continue
                     if self.optimize_event.is_set():break
             interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
