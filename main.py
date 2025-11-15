@@ -1,4 +1,4 @@
-import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime,re,traceback
+import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,webbrowser,hashlib,datetime,re,traceback,collections,copy
 import psutil,pyautogui
 try:
  import torch,torch.nn as nn,torch.optim as optim,torch.nn.functional as F
@@ -1064,6 +1064,10 @@ class App:
         self.progress_info_lock=threading.Lock()
         self.progress_info={"active":False,"phase":"","phase_start":0.0,"done":0,"total":1,"epoch":0,"epochs":1,"step":0,"steps":1}
         self._progress_timer_id=None
+        self._optimize_notice="优化进行中，10秒切换规则失效"
+        self._current_optimize_message=self._optimize_notice
+        self._analysis_ready_time=0.0
+        self._analysis_next_frame=None
         self.current_download=None
         self.download_title=""
         self.last_user_input=time.time()
@@ -1259,7 +1263,7 @@ class App:
 
     def _start_progress_monitor(self,total,epochs,steps):
         with self.progress_info_lock:
-            self.progress_info={"active":True,"phase":"准备数据","phase_start":time.time(),"done":0,"total":max(1,int(total)),"epoch":0,"epochs":max(1,int(epochs)),"step":0,"steps":max(1,int(steps))}
+            self.progress_info={"active":True,"phase":"准备数据","phase_start":time.time(),"done":0,"total":max(1,int(total)),"epoch":0,"epochs":max(1,int(epochs)),"step":0,"steps":max(1,int(steps)),"alerted":False,"last_step_time":time.time()}
         self.schedule(lambda:self.progress_stage.set("准备数据..."))
         self.schedule(self._ensure_progress_timer)
 
@@ -1291,6 +1295,17 @@ class App:
             steps=max(1,int(info.get("steps",1)))
             step_val=max(0,step)
             stage_text=f"训练中 第{min(epoch,epochs)}/{epochs}轮 批次 {step_val}/{steps}"
+            wait=max(0.0,now-info.get("last_step_time",info.get("phase_start",now)))
+            if wait>15.0:
+                stage_text+=" (等待数据加载...)"
+                if not info.get("alerted",False):
+                    with self.progress_info_lock:
+                        self.progress_info["alerted"]=True
+                    self.schedule(lambda msg="数据加载长时间无响应，可稍候或点击 Get Up 中止":self.pause_var.set(msg) if self.mode=="optimize" else None)
+            elif info.get("alerted",False) and wait<=5.0:
+                with self.progress_info_lock:
+                    self.progress_info["alerted"]=False
+                self.schedule(lambda text=self._current_optimize_message:self.pause_var.set(text) if self.mode=="optimize" else None)
         elif phase=="保存模型":
             elapsed=max(0.0,now-info.get("phase_start",now))
             percent=max(percent,min(99.0,95.0+min(4.0,elapsed*5.0)))
@@ -1305,6 +1320,8 @@ class App:
         with self.progress_info_lock:
             self.progress_info["phase"]=phase
             self.progress_info["phase_start"]=time.time()
+            self.progress_info["last_step_time"]=time.time()
+            self.progress_info["alerted"]=False
 
     def _update_progress_epoch(self,epoch,epochs,steps):
         with self.progress_info_lock:
@@ -1312,12 +1329,16 @@ class App:
             self.progress_info["epochs"]=max(1,epochs)
             self.progress_info["steps"]=max(1,steps)
             self.progress_info["step"]=0
+            self.progress_info["last_step_time"]=time.time()
+            self.progress_info["alerted"]=False
 
     def _update_progress_step(self,step,done,total):
         with self.progress_info_lock:
             self.progress_info["step"]=step
             self.progress_info["done"]=done
             self.progress_info["total"]=max(1,total)
+            self.progress_info["last_step_time"]=time.time()
+            self.progress_info["alerted"]=False
 
     def _stop_progress_monitor(self):
         with self.progress_info_lock:
@@ -1349,6 +1370,25 @@ class App:
             updater()
         else:
             self.schedule(updater)
+    def _snapshot_state_dict(self,source=None):
+        src=source if source is not None else self.model.state_dict()
+        if isinstance(src,dict):
+            items=[]
+            for k,v in src.items():
+                if torch.is_tensor(v):
+                    items.append((k,v.detach().cpu().clone()))
+                else:
+                    items.append((k,copy.deepcopy(v)))
+            return collections.OrderedDict(items)
+        return copy.deepcopy(src)
+    def _save_model_snapshot(self,state=None):
+        snap=self._snapshot_state_dict(state)
+        if snap is None:
+            return
+        try:
+            torch.save(snap,model_path)
+        except Exception:
+            pass
     def _update_window_size_ui(self,rect):
         if rect is None:
             text='尺寸: 未选择窗口' if self.window_hwnd is None else '尺寸: 未检测'
@@ -1419,6 +1459,8 @@ class App:
         self.sleep_btn.configure(state="normal" if (self.models_ready() and self.window_hwnd is not None) else "disabled")
         self.getup_btn.configure(state="disabled")
         self.pause_var.set("" if self.models_ready() else "模型未就绪，已暂停且 10 秒切换规则失效")
+        self._analysis_ready_time=time.monotonic()+1.0
+        self._analysis_next_frame=None
         self.set_mode("learn")
     def _get_ext_frame_rect(self,hwnd):
         try:
@@ -2242,7 +2284,7 @@ class App:
             if not self.window_visible or not self.window_full or self.resource_paused or not self.capture_enabled:return
             self.mode="train";self.mode_var.set("Training");self._start_ai()
         elif mode=="learn":
-            self._mouse_up_safety();self.mode="learn";self.mode_var.set("Learning");self._stop_ai()
+            self._mouse_up_safety();self.mode="learn";self.mode_var.set("Learning");self._stop_ai();self._analysis_ready_time=time.monotonic()+0.75;self._analysis_next_frame=None
         elif mode=="optimize":
             self._mouse_up_safety();self.mode="optimize";self.mode_var.set("Optimizing");self._stop_ai()
         elif mode=="init":
@@ -2315,12 +2357,18 @@ class App:
         now=time.monotonic()
         start=False
         with self._analysis_lock:
-            if self._analysis_active>=self._analysis_limit and now-self._last_analysis<self.analysis_interval:
+            if now<self._analysis_ready_time:
+                self._analysis_next_frame=frame
                 return
-            if self._analysis_active>0 and now-self._last_analysis<self.analysis_interval:
+            if now-self._last_analysis<self.analysis_interval:
+                self._analysis_next_frame=frame
+                return
+            if self._analysis_active>0:
+                self._analysis_next_frame=frame
                 return
             self._analysis_active+=1
             self._last_analysis=now
+            self._analysis_ready_time=max(self._analysis_ready_time,now)+self.analysis_interval
             start=True
         if not start:
             return
@@ -2336,8 +2384,25 @@ class App:
             except Exception:
                 pass
             finally:
+                next_frame=None
+                delay=None
+                pending=None
                 with self._analysis_lock:
                     self._analysis_active=max(0,self._analysis_active-1)
+                    if self._analysis_next_frame is not None:
+                        pending=self._analysis_next_frame
+                        if time.monotonic()>=self._analysis_ready_time:
+                            next_frame=pending
+                            self._analysis_next_frame=None
+                        else:
+                            delay=max(0.0,self._analysis_ready_time-time.monotonic())
+                            self._analysis_next_frame=None
+                if next_frame is not None:
+                    self._analyze_ui_async(next_frame)
+                elif delay is not None and pending is not None:
+                    timer=threading.Timer(delay,lambda img=pending:self._analyze_ui_async(img))
+                    timer.daemon=True
+                    timer.start()
         threading.Thread(target=worker,args=(frame.copy(),),daemon=True).start()
     def on_sleep(self):
         if self.mode in ("learn","train") and self.recording_enabled and not self.resource_paused and self.models_ready():
@@ -2379,6 +2444,7 @@ class App:
         skip_finalize=False
         monitor_started=False
         backup=None
+        saved_snapshot=False
         try:
             try:
                 if os.path.exists(model_path):backup=torch.load(model_path,map_location="cpu")
@@ -2406,6 +2472,9 @@ class App:
                 num_workers=0
             else:
                 num_workers=min(base_workers,max(0,ds.real_count-1))
+            force_single_worker=(os.name=="nt") or (threading.current_thread() is not threading.main_thread())
+            if force_single_worker:
+                num_workers=0
             bs=max(4,int(8+64*(1.0-M)))
             if ds.real_count>0 and ds.real_count<bs:
                 bs=max(1,ds.real_count)
@@ -2414,11 +2483,22 @@ class App:
             prefetch_factor=4 if num_workers>0 else None
             drop_last=ds.real_count>=bs and bs>0
             persistent=num_workers>0 and ds.real_count>=num_workers*2
+            if force_single_worker:
+                prefetch_factor=None
+                persistent=False
+            loader_kwargs={"batch_size":bs,"shuffle":True,"num_workers":num_workers,"pin_memory":(device=="cuda"),"drop_last":drop_last}
+            if num_workers>0:
+                loader_kwargs["persistent_workers"]=persistent
+                if prefetch_factor is not None:
+                    loader_kwargs["prefetch_factor"]=prefetch_factor
             try:
-                dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=persistent,prefetch_factor=prefetch_factor)
+                dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
             except Exception:
+                loader_kwargs["num_workers"]=0
+                loader_kwargs.pop("persistent_workers",None)
+                loader_kwargs.pop("prefetch_factor",None)
+                dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
                 num_workers=0
-                dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=0,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=False,prefetch_factor=None)
             epochs=3
             try:
                 steps_per_epoch=max(1,len(dl))
@@ -2429,9 +2509,12 @@ class App:
             done_steps=0
             self.model.train()
             best_loss=None
+            best_state=None
             c_scores={}
             start_time=time.time()
-            self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
+            opt_msg=self._optimize_notice+("（单线程数据加载）" if force_single_worker else "")
+            self._current_optimize_message=opt_msg
+            self.schedule(lambda text=opt_msg:self.pause_var.set(text))
             self._start_progress_monitor(total,epochs,steps_per_epoch)
             monitor_started=True
             for ep in range(epochs):
@@ -2560,13 +2643,21 @@ class App:
                     self._update_progress_step(min(epoch_steps,steps_per_epoch),min(done_steps,total),total)
                     prog=5.0+90.0*(min(done_steps,total)/max(1,total))
                     self.schedule(lambda v=prog:self._set_progress_ui(v))
-                    if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
+                    if best_loss is None or float(loss.item())<best_loss:
+                        best_loss=float(loss.item())
+                        best_state=self._snapshot_state_dict()
                     if self.optimize_event.is_set():break
             interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
             if not interrupted:
                 self._update_progress_phase("保存模型")
-                try:torch.save(self.model.state_dict(),model_path)
-                except Exception:pass
+                if best_state is not None:
+                    try:self.model.load_state_dict(best_state,strict=False)
+                    except Exception:pass
+                    snapshot=best_state
+                else:
+                    snapshot=None
+                self._save_model_snapshot(snapshot)
+                saved_snapshot=True
                 self.schedule(lambda:self._set_progress_ui(100.0))
                 if monitor_started:
                     self._stop_progress_monitor()
@@ -2582,6 +2673,20 @@ class App:
                 pass
         finally:
             interrupted=self.optimize_event.is_set() if self.optimize_event is not None else interrupted
+            if not saved_snapshot:
+                snapshot_target=None
+                if best_state is not None and (completed or interrupted or (error is not None)):
+                    try:self.model.load_state_dict(best_state,strict=False)
+                    except Exception:pass
+                    snapshot_target=best_state
+                elif backup is not None and (interrupted or (error is not None)):
+                    try:self.model.load_state_dict(backup,strict=False)
+                    except Exception:pass
+                    snapshot_target=backup
+                if snapshot_target is None:
+                    snapshot_target=self._snapshot_state_dict()
+                self._save_model_snapshot(snapshot_target)
+                saved_snapshot=True
             if skip_finalize:
                 self.optimize_event=None
                 self.optimize_thread=None
@@ -2589,6 +2694,7 @@ class App:
             if monitor_started:
                 self._stop_progress_monitor()
             def finalize(err=error,done=completed,int_flag=interrupted):
+                self._current_optimize_message=self._optimize_notice
                 if done:
                     self._set_progress_ui(0.0)
                     self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
