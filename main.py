@@ -1098,6 +1098,11 @@ class App:
         self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
         self.listener_mouse=mouse.Listener(on_move=self._on_mouse_move,on_click=self._on_mouse_click)
         self.listener_keyboard=keyboard.Listener(on_press=self._on_key_press)
+        self.analysis_interval=0.25
+        self._analysis_limit=2
+        self._analysis_active=0
+        self._analysis_lock=threading.Lock()
+        self._last_analysis=0.0
         self._build_ui()
         self.model_manager=ModelManager(self)
         self.model_manager.ensure()
@@ -2307,6 +2312,18 @@ class App:
                 norm_x=(target_x-rect[0])/width;norm_y=(target_y-rect[1])/height;self.writer.record(frame,[dx,dy,click_prob],[norm_x,norm_y],2,rect,self._window_title(),self.mode,"ai");self.buffer.add(frame,[dx,dy,click_prob],2,3,0,-1,self.perception.last_text)
             time.sleep(self.ai_interval)
     def _analyze_ui_async(self,frame):
+        now=time.monotonic()
+        start=False
+        with self._analysis_lock:
+            if self._analysis_active>=self._analysis_limit and now-self._last_analysis<self.analysis_interval:
+                return
+            if self._analysis_active>0 and now-self._last_analysis<self.analysis_interval:
+                return
+            self._analysis_active+=1
+            self._last_analysis=now
+            start=True
+        if not start:
+            return
         def worker(img):
             try:
                 dets,txt=self.perception.detect(img);self.pool.update_state(txt)
@@ -2318,6 +2335,9 @@ class App:
                 if txt:self.rule_text=txt
             except Exception:
                 pass
+            finally:
+                with self._analysis_lock:
+                    self._analysis_active=max(0,self._analysis_active-1)
         threading.Thread(target=worker,args=(frame.copy(),),daemon=True).start()
     def on_sleep(self):
         if self.mode in ("learn","train") and self.recording_enabled and not self.resource_paused and self.models_ready():
@@ -2353,209 +2373,252 @@ class App:
                 pass
         return float(np.clip(diff*0.5+bonus,-1.0,2.0))
     def _optimize_loop(self):
+        error=None
+        interrupted=False
+        completed=False
+        skip_finalize=False
+        monitor_started=False
         backup=None
         try:
-            if os.path.exists(model_path):backup=torch.load(model_path,map_location="cpu")
-        except Exception:backup=None
-        hot=self.metrics["temp"]>=80 or self.metrics["pwr"]>=0.95
-        seq_len=2 if hot else 4
-        ds=DiskExperienceDataset(experience_dir,seq=seq_len,aug=True)
-        if not ds.has_samples():
-            def no_data():
-                self.progress_stage.set("经验数据不足")
-                self.pause_var.set("经验池为空，请先采集数据后再优化")
-                try:messagebox.showwarning("提示","经验池为空，请先在学习或训练模式采集数据")
-                except Exception:pass
-                self._set_progress_ui(0.0)
-                self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
-                self.getup_btn.configure(state="disabled")
-                self.recording_enabled=True
-                self.set_mode("learn")
-            self.schedule(no_data)
-            return
-        M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
-        base_workers=max(0,min(6,os.cpu_count() or 2)-1)
-        if ds.real_count<=2:
-            num_workers=0
-        else:
-            num_workers=min(base_workers,max(0,ds.real_count-1))
-        bs=max(4,int(8+64*(1.0-M)))
-        if ds.real_count>0 and ds.real_count<bs:
-            bs=max(1,ds.real_count)
-        lr=1e-4*(0.5 if hot else 1.0)
-        for g in self.optimizer.param_groups:g["lr"]=lr
-        prefetch_factor=4 if num_workers>0 else None
-        drop_last=ds.real_count>=bs and bs>0
-        persistent=num_workers>0 and ds.real_count>=num_workers*2
-        try:
-            dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=persistent,prefetch_factor=prefetch_factor)
-        except Exception:
-            num_workers=0
-            dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=0,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=False,prefetch_factor=None)
-        epochs=3
-        try:
-            steps_per_epoch=max(1,len(dl))
-        except Exception:
-            real_len=max(1,ds.real_count)
-            steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
-        total=max(1,steps_per_epoch*epochs)
-        done_steps=0
-        self.model.train()
-        best_loss=None
-        c_scores={}
-        start_time=time.time()
-        self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
-        self._start_progress_monitor(total,epochs,steps_per_epoch)
-        for ep in range(epochs):
-            if self.optimize_event.is_set():break
-            self._update_progress_epoch(ep,epochs,steps_per_epoch)
-            it=iter(dl)
-            epoch_steps=0
-            phase_ready=False
-            while True:
-                try:item=next(it)
-                except StopIteration:break
+            try:
+                if os.path.exists(model_path):backup=torch.load(model_path,map_location="cpu")
+            except Exception:backup=None
+            hot=self.metrics["temp"]>=80 or self.metrics["pwr"]>=0.95
+            seq_len=2 if hot else 4
+            ds=DiskExperienceDataset(experience_dir,seq=seq_len,aug=True)
+            if not ds.has_samples():
+                def no_data():
+                    self.progress_stage.set("经验数据不足")
+                    self.pause_var.set("经验池为空，请先采集数据后再优化")
+                    try:messagebox.showwarning("提示","经验池为空，请先在学习或训练模式采集数据")
+                    except Exception:pass
+                    self._set_progress_ui(0.0)
+                    self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
+                    self.getup_btn.configure(state="disabled")
+                    self.recording_enabled=True
+                    self.set_mode("learn")
+                self.schedule(no_data)
+                skip_finalize=True
+                return
+            M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
+            base_workers=max(0,min(6,os.cpu_count() or 2)-1)
+            if ds.real_count<=2:
+                num_workers=0
+            else:
+                num_workers=min(base_workers,max(0,ds.real_count-1))
+            bs=max(4,int(8+64*(1.0-M)))
+            if ds.real_count>0 and ds.real_count<bs:
+                bs=max(1,ds.real_count)
+            lr=1e-4*(0.5 if hot else 1.0)
+            for g in self.optimizer.param_groups:g["lr"]=lr
+            prefetch_factor=4 if num_workers>0 else None
+            drop_last=ds.real_count>=bs and bs>0
+            persistent=num_workers>0 and ds.real_count>=num_workers*2
+            try:
+                dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=num_workers,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=persistent,prefetch_factor=prefetch_factor)
+            except Exception:
+                num_workers=0
+                dl=torch.utils.data.DataLoader(ds,batch_size=bs,shuffle=True,num_workers=0,pin_memory=(device=="cuda"),drop_last=drop_last,persistent_workers=False,prefetch_factor=None)
+            epochs=3
+            try:
+                steps_per_epoch=max(1,len(dl))
+            except Exception:
+                real_len=max(1,ds.real_count)
+                steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
+            total=max(1,steps_per_epoch*epochs)
+            done_steps=0
+            self.model.train()
+            best_loss=None
+            c_scores={}
+            start_time=time.time()
+            self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
+            self._start_progress_monitor(total,epochs,steps_per_epoch)
+            monitor_started=True
+            for ep in range(epochs):
                 if self.optimize_event.is_set():break
-                if not phase_ready:
-                    self._update_progress_phase("训练中")
-                    phase_ready=True
-                if isinstance(item,(tuple,list)):
-                    seq=item[0]
-                    act=item[1]
-                    batch=len(seq)
-                    atype_t=item[2] if len(item)>=3 else torch.zeros((batch,),dtype=torch.long)
-                    ctrl_t=item[3] if len(item)>=4 else torch.full((batch,),-1,dtype=torch.long)
-                    tmpl_t=item[4] if len(item)>=5 else torch.full((batch,),-1,dtype=torch.long)
-                    path_vec=item[5] if len(item)>=6 else torch.zeros((batch,64),dtype=torch.float32)
-                    texts=item[6] if len(item)>=7 else ["" for _ in range(batch)]
-                    success=item[7] if len(item)>=8 else torch.zeros((batch,),dtype=torch.long)
-                else:
-                    seq,act=item
-                    batch=len(seq)
-                    atype_t=torch.zeros((batch,),dtype=torch.long)
-                    ctrl_t=torch.full((batch,),-1,dtype=torch.long)
-                    tmpl_t=torch.full((batch,),-1,dtype=torch.long)
-                    path_vec=torch.zeros((batch,64),dtype=torch.float32)
-                    texts=["" for _ in range(batch)]
-                    success=torch.zeros((batch,),dtype=torch.long)
-                sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
-                if sample is not None:
-                    frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
-                    seq_np=frames_b.astype(np.float32)
-                    seq_t=torch.from_numpy(np.transpose(seq_np,(0,1,4,2,3))/255.0).to(device,non_blocking=True)
-                    act_t=torch.from_numpy(actions_b).to(device,non_blocking=True)
-                    atype_t=torch.from_numpy(atypes_b).to(device,non_blocking=True)
-                    ctrl_t=torch.from_numpy(ctrls_b).to(device,non_blocking=True)
-                    tmpl_t=torch.from_numpy(tmpls_b).to(device,non_blocking=True)
-                    path_vec=torch.zeros((seq_t.shape[0],64),device=device,dtype=torch.float32)
-                    texts=list(txts_b);success=torch.tensor([1 if any(k in (t or "").lower() for k in ["win","victory","success","complete"]) else 0 for t in texts],device=device,dtype=torch.long)
-                else:
-                    seq_t=torch.from_numpy(np.transpose(seq.numpy(),(0,1,4,2,3))/255.0).to(device,non_blocking=True);act_t=act.to(device,non_blocking=True);atype_t=atype_t.to(device,non_blocking=True);ctrl_t=ctrl_t.to(device,non_blocking=True);path_vec=path_vec.to(device,non_blocking=True).float();success=success.to(device,non_blocking=True).long();texts=list(texts)
-                with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
-                    logits,values,atype_logits,elem_emb,path_pred=self.model(seq_t)
-                    loss_policy=F.mse_loss(logits,act_t)
-                    with torch.no_grad():
-                        seq_np=(seq_t.detach().float().cpu().numpy()*255.0).transpose(0,1,3,4,2)
-                        rewards=np.array([self._compute_reward(s,(texts[i] if i<len(texts) else "")) for i,s in enumerate(seq_np)],dtype=np.float32)
-                        returns=torch.from_numpy(rewards).to(device)
-                    loss_value=F.mse_loss(values,returns)
-                    at_mask=(atype_t>=0)&(atype_t<=2)
-                    loss_atype=F.cross_entropy(atype_logits[at_mask],atype_t[at_mask]) if at_mask.any() else torch.zeros((),device=device)
-                    protoM,id2idx=self.pool.matrix()
-                    if protoM is not None and protoM.shape[0]>0:
-                        if ctrl_t.dim()==0:ctrl_t=ctrl_t.unsqueeze(0)
-                        map_idx=torch.full_like(ctrl_t,-1)
-                        if id2idx:
-                            for i in range(ctrl_t.shape[0]):
-                                cid=int(ctrl_t[i].item())
-                                if cid in id2idx:map_idx[i]=id2idx[cid]
-                        c_mask=map_idx>=0
-                        loss_ctrl=torch.zeros((),device=device)
-                        if c_mask.any():
-                            sim=torch.matmul(elem_emb[c_mask],protoM.T)
-                            loss_ctrl=F.cross_entropy(sim,map_idx[c_mask])
+                self._update_progress_epoch(ep,epochs,steps_per_epoch)
+                it=iter(dl)
+                epoch_steps=0
+                phase_ready=False
+                while True:
+                    try:item=next(it)
+                    except StopIteration:break
+                    if self.optimize_event.is_set():break
+                    if not phase_ready:
+                        self._update_progress_phase("训练中")
+                        phase_ready=True
+                    if isinstance(item,(tuple,list)):
+                        seq=item[0]
+                        act=item[1]
+                        batch=len(seq)
+                        atype_t=item[2] if len(item)>=3 else torch.zeros((batch,),dtype=torch.long)
+                        ctrl_t=item[3] if len(item)>=4 else torch.full((batch,),-1,dtype=torch.long)
+                        tmpl_t=item[4] if len(item)>=5 else torch.full((batch,),-1,dtype=torch.long)
+                        path_vec=item[5] if len(item)>=6 else torch.zeros((batch,64),dtype=torch.float32)
+                        texts=item[6] if len(item)>=7 else ["" for _ in range(batch)]
+                        success=item[7] if len(item)>=8 else torch.zeros((batch,),dtype=torch.long)
                     else:
-                        loss_ctrl=torch.zeros((),device=device)
-                    tmplM,tid2idx=self.templates.matrix()
-                    loss_tmpl=torch.zeros((),device=device)
-                    if tmplM is not None:
-                        if (tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,dtype=torch.long,device=device)).dim()==0:
-                            tmpl_t=(tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,dtype=torch.long,device=device))
-                        map_t=torch.full_like((tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,device=device)), -1)
-                        if tid2idx:
-                            for i in range(map_t.shape[0]):
-                                tid=int((tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,device=device))[i].item())
-                                if tid in tid2idx:map_t[i]=tid2idx[tid]
-                        t_mask=map_t>=0
-                        if t_mask.any():
-                            path_n=F.normalize(path_pred,dim=1)
-                            sim_tmpl=path_n[:, :tmplM.shape[1]].matmul(tmplM.T)
-                            loss_tmpl=F.cross_entropy(sim_tmpl[t_mask],map_t[t_mask])
-                    
-                    tmplM,tid2idx=self.templates.matrix()
-                    loss_tmpl=torch.zeros((),device=device)
-                    if tmplM is not None:
-                        tt=(tmpl_t if 'tmpl_t' in locals() else torch.full((path_pred.shape[0],),-1,dtype=torch.long,device=device))
-                        if tt.dim()==0:
-                            tt=tt.unsqueeze(0)
-                        tmap=torch.full_like(tt,-1)
-                        if tid2idx:
-                            for i in range(tt.shape[0]):
-                                ti=int(tt[i].item())
-                                if ti in tid2idx:
-                                    tmap[i]=tid2idx[ti]
-                        tmask=tmap>=0
-                        if tmask.any():
-                            pnorm=F.normalize(path_pred,dim=1)
-                            simt=torch.matmul(pnorm[tmask],tmplM.T)
-                            loss_tmpl=F.cross_entropy(simt,tmap[tmask])
-                    loss_path=F.mse_loss(path_pred,path_vec) if path_vec is not None else torch.zeros((),device=device)
-                    goal_weight=torch.ones_like(values)
-                    try:
-                        gscores=self.goal_graph.granger()
-                        for i in range(ctrl_t.shape[0]):
-                            pid=int(ctrl_t[i].item())
-                            if pid in gscores:goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,gscores[pid])))
-                            goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,self.state_graph.reachability(pid))))
-                        c_scores=gscores
-                    except Exception:
-                        pass
-                    loss_value=(loss_value*goal_weight.mean()).mean()
-                    loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl+0.1*loss_tmpl
-                self.optimizer.zero_grad(set_to_none=True)
-                if scaler is not None:
-                    scaler.scale(loss).step(self.optimizer);scaler.update()
+                        seq,act=item
+                        batch=len(seq)
+                        atype_t=torch.zeros((batch,),dtype=torch.long)
+                        ctrl_t=torch.full((batch,),-1,dtype=torch.long)
+                        tmpl_t=torch.full((batch,),-1,dtype=torch.long)
+                        path_vec=torch.zeros((batch,64),dtype=torch.float32)
+                        texts=["" for _ in range(batch)]
+                        success=torch.zeros((batch,),dtype=torch.long)
+                    sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
+                    if sample is not None:
+                        frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
+                        seq_np=frames_b.astype(np.float32)
+                        seq_t=torch.from_numpy(np.transpose(seq_np,(0,1,4,2,3))/255.0).to(device,non_blocking=True)
+                        act_t=torch.from_numpy(actions_b).to(device,non_blocking=True)
+                        atype_t=torch.from_numpy(atypes_b).to(device,non_blocking=True)
+                        ctrl_t=torch.from_numpy(ctrls_b).to(device,non_blocking=True)
+                        tmpl_t=torch.from_numpy(tmpls_b).to(device,non_blocking=True)
+                        path_vec=torch.zeros((seq_t.shape[0],64),device=device,dtype=torch.float32)
+                        texts=list(txts_b);success=torch.tensor([1 if any(k in (t or "").lower() for k in ["win","victory","success","complete"]) else 0 for t in texts],device=device,dtype=torch.long)
+                    else:
+                        seq_t=torch.from_numpy(np.transpose(seq.numpy(),(0,1,4,2,3))/255.0).to(device,non_blocking=True);act_t=act.to(device,non_blocking=True);atype_t=atype_t.to(device,non_blocking=True);ctrl_t=ctrl_t.to(device,non_blocking=True);path_vec=path_vec.to(device,non_blocking=True).float();success=success.to(device,non_blocking=True).long();texts=list(texts)
+                    with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
+                        logits,values,atype_logits,elem_emb,path_pred=self.model(seq_t)
+                        loss_policy=F.mse_loss(logits,act_t)
+                        with torch.no_grad():
+                            seq_np=(seq_t.detach().float().cpu().numpy()*255.0).transpose(0,1,3,4,2)
+                            rewards=np.array([self._compute_reward(s,(texts[i] if i<len(texts) else "")) for i,s in enumerate(seq_np)],dtype=np.float32)
+                            returns=torch.from_numpy(rewards).to(device)
+                        loss_value=F.mse_loss(values,returns)
+                        at_mask=(atype_t>=0)&(atype_t<=2)
+                        loss_atype=F.cross_entropy(atype_logits[at_mask],atype_t[at_mask]) if at_mask.any() else torch.zeros((),device=device)
+                        protoM,id2idx=self.pool.matrix()
+                        if protoM is not None and protoM.shape[0]>0:
+                            if ctrl_t.dim()==0:ctrl_t=ctrl_t.unsqueeze(0)
+                            map_idx=torch.full_like(ctrl_t,-1)
+                            if id2idx:
+                                for i in range(ctrl_t.shape[0]):
+                                    cid=int(ctrl_t[i].item())
+                                    if cid in id2idx:map_idx[i]=id2idx[cid]
+                            c_mask=map_idx>=0
+                            loss_ctrl=torch.zeros((),device=device)
+                            if c_mask.any():
+                                sim=torch.matmul(elem_emb[c_mask],protoM.T)
+                                loss_ctrl=F.cross_entropy(sim,map_idx[c_mask])
+                        else:
+                            loss_ctrl=torch.zeros((),device=device)
+                        tmplM,tid2idx=self.templates.matrix()
+                        loss_tmpl=torch.zeros((),device=device)
+                        if tmplM is not None:
+                            if (tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,dtype=torch.long,device=device)).dim()==0:
+                                tmpl_t=(tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,dtype=torch.long,device=device))
+                            map_t=torch.full_like((tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,device=device)), -1)
+                            if tid2idx:
+                                for i in range(map_t.shape[0]):
+                                    tid=int((tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,device=device))[i].item())
+                                    if tid in tid2idx:map_t[i]=tid2idx[tid]
+                            t_mask=map_t>=0
+                            if t_mask.any():
+                                path_n=F.normalize(path_pred,dim=1)
+                                sim_tmpl=path_n[:, :tmplM.shape[1]].matmul(tmplM.T)
+                                loss_tmpl=F.cross_entropy(sim_tmpl[t_mask],map_t[t_mask])
+
+                        tmplM,tid2idx=self.templates.matrix()
+                        loss_tmpl=torch.zeros((),device=device)
+                        if tmplM is not None:
+                            tt=(tmpl_t if 'tmpl_t' in locals() else torch.full((path_pred.shape[0],),-1,dtype=torch.long,device=device))
+                            if tt.dim()==0:
+                                tt=tt.unsqueeze(0)
+                            tmap=torch.full_like(tt,-1)
+                            if tid2idx:
+                                for i in range(tt.shape[0]):
+                                    ti=int(tt[i].item())
+                                    if ti in tid2idx:
+                                        tmap[i]=tid2idx[ti]
+                            tmask=tmap>=0
+                            if tmask.any():
+                                pnorm=F.normalize(path_pred,dim=1)
+                                simt=torch.matmul(pnorm[tmask],tmplM.T)
+                                loss_tmpl=F.cross_entropy(simt,tmap[tmask])
+                        loss_path=F.mse_loss(path_pred,path_vec) if path_vec is not None else torch.zeros((),device=device)
+                        goal_weight=torch.ones_like(values)
+                        try:
+                            gscores=self.goal_graph.granger()
+                            for i in range(ctrl_t.shape[0]):
+                                pid=int(ctrl_t[i].item())
+                                if pid in gscores:goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,gscores[pid])))
+                                goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,self.state_graph.reachability(pid))))
+                            c_scores=gscores
+                        except Exception:
+                            pass
+                        loss_value=(loss_value*goal_weight.mean()).mean()
+                        loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl+0.1*loss_tmpl
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if scaler is not None:
+                        scaler.scale(loss).step(self.optimizer);scaler.update()
+                    else:
+                        loss.backward();self.optimizer.step()
+                    epoch_steps+=1
+                    done_steps+=1
+                    self._update_progress_step(min(epoch_steps,steps_per_epoch),min(done_steps,total),total)
+                    prog=5.0+90.0*(min(done_steps,total)/max(1,total))
+                    self.schedule(lambda v=prog:self._set_progress_ui(v))
+                    if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
+                    if self.optimize_event.is_set():break
+            interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
+            if not interrupted:
+                self._update_progress_phase("保存模型")
+                try:torch.save(self.model.state_dict(),model_path)
+                except Exception:pass
+                self.schedule(lambda:self._set_progress_ui(100.0))
+                if monitor_started:
+                    self._stop_progress_monitor()
+                    monitor_started=False
+                self.schedule(lambda:self.progress_stage.set("优化完成，请确认"))
+                self._confirm_dialog()
+                completed=True
+        except Exception:
+            error=traceback.format_exc()
+            try:
+                if backup is not None:self.model.load_state_dict(backup,strict=False)
+            except Exception:
+                pass
+        finally:
+            interrupted=self.optimize_event.is_set() if self.optimize_event is not None else interrupted
+            if skip_finalize:
+                self.optimize_event=None
+                self.optimize_thread=None
+                return
+            if monitor_started:
+                self._stop_progress_monitor()
+            def finalize(err=error,done=completed,int_flag=interrupted):
+                if done:
+                    self._set_progress_ui(0.0)
+                    self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
+                    self.getup_btn.configure(state="disabled")
+                    self.recording_enabled=True
+                    self.progress_stage.set("")
+                    self.pause_var.set("")
+                    self.set_mode("learn")
                 else:
-                    loss.backward();self.optimizer.step()
-                epoch_steps+=1
-                done_steps+=1
-                self._update_progress_step(min(epoch_steps,steps_per_epoch),min(done_steps,total),total)
-                prog=5.0+90.0*(min(done_steps,total)/max(1,total))
-                self.schedule(lambda v=prog:self._set_progress_ui(v))
-                if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
-                if self.optimize_event.is_set():break
-        interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
-        if not interrupted:
-            self._update_progress_phase("保存模型")
-            try:torch.save(self.model.state_dict(),model_path)
-            except Exception:pass
-            self.schedule(lambda:self._set_progress_ui(100.0))
-            self._stop_progress_monitor()
-            self.schedule(lambda:self.progress_stage.set("优化完成，请确认"))
-            self._confirm_dialog()
-            def _finish_optimize():
-                self._set_progress_ui(0.0)
-                self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
-                self.getup_btn.configure(state="disabled")
-                self.recording_enabled=True
-                self.progress_stage.set("")
-                self.set_mode("learn")
-            self.schedule(_finish_optimize)
-        else:
-            self._stop_progress_monitor()
-            self.schedule(lambda:self.progress_stage.set("优化已中止"))
-            self.schedule(lambda:self._set_progress_ui(0.0))
-        self.schedule(lambda:self.pause_var.set(""))
+                    self._set_progress_ui(0.0)
+                    self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
+                    self.getup_btn.configure(state="disabled")
+                    self.recording_enabled=True
+                    self.set_mode("learn")
+                    if int_flag:
+                        self.progress_stage.set("优化已中止")
+                        self.pause_var.set("优化已中止，已恢复学习模式")
+                    else:
+                        self.progress_stage.set("优化失败")
+                        self.pause_var.set("优化失败，已恢复学习模式")
+            self.schedule(finalize)
+            if error and not interrupted:
+                def show_error(msg=error):
+                    try:
+                        text=msg if len(msg)<=1200 else msg[-1200:]
+                        messagebox.showerror("优化失败",text)
+                    except Exception:pass
+                self.schedule(show_error)
+            self.optimize_event=None
+            self.optimize_thread=None
     def stop(self):
         self.running=False
         try:self._stop_ai()
