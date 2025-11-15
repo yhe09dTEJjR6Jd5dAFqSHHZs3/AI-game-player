@@ -2641,6 +2641,92 @@ class App:
                 path_t=torch.from_numpy(path_arr).to(device,non_blocking=True)
                 success_t=torch.from_numpy(success_arr).to(device,non_blocking=True)
                 return seq_t,act_t,atype_t.long(),ctrl_t.long(),tmpl_t.long(),path_t.float(),text_list,success_t.long()
+            epoch_steps=0
+            phase_ready=False
+            def train_batch(item,step_cap):
+                nonlocal epoch_steps,done_steps,best_loss,best_state,phase_ready,total
+                try:
+                    seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(item)
+                except Exception:
+                    seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(build_fallback_batch())
+                if seq_t is None or seq_t.shape[0]==0:
+                    return False
+                if not phase_ready:
+                    self._update_progress_phase("训练中")
+                    phase_ready=True
+                self.optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
+                    logits,values,atype_logits,elem_emb,path_pred=self.model(seq_t)
+                    loss_policy=F.mse_loss(logits,act_t)
+                    with torch.no_grad():
+                        seq_np=(seq_t.detach().float().cpu().numpy()*255.0).transpose(0,1,3,4,2)
+                        rewards=np.array([self._compute_reward(s,(texts[i] if i<len(texts) else "")) for i,s in enumerate(seq_np)],dtype=np.float32)
+                        returns=torch.from_numpy(rewards).to(device)
+                    loss_value=F.mse_loss(values,returns)
+                    at_mask=(atype_t>=0)&(atype_t<=2)
+                    loss_atype=F.cross_entropy(atype_logits[at_mask],atype_t[at_mask]) if at_mask.any() else torch.zeros((),device=device)
+                    protoM,id2idx=self.pool.matrix()
+                    if protoM is not None and protoM.shape[0]>0:
+                        if ctrl_t.dim()==0:
+                            ctrl_t=ctrl_t.unsqueeze(0)
+                        map_idx=torch.full_like(ctrl_t,-1)
+                        if id2idx:
+                            for i in range(ctrl_t.shape[0]):
+                                cid=int(ctrl_t[i].item())
+                                if cid in id2idx:map_idx[i]=id2idx[cid]
+                        c_mask=map_idx>=0
+                        loss_ctrl=torch.zeros((),device=device)
+                        if c_mask.any():
+                            sim=torch.matmul(elem_emb[c_mask],protoM.T)
+                            loss_ctrl=F.cross_entropy(sim,map_idx[c_mask])
+                    else:
+                        loss_ctrl=torch.zeros((),device=device)
+                    tmplM,tid2idx=self.templates.matrix()
+                    loss_tmpl=torch.zeros((),device=device)
+                    if tmplM is not None:
+                        tt=tmpl_t
+                        if tt.dim()==0:
+                            tt=tt.unsqueeze(0)
+                        tmap=torch.full_like(tt,-1)
+                        if tid2idx:
+                            for i in range(tt.shape[0]):
+                                ti=int(tt[i].item())
+                                if ti in tid2idx:
+                                    tmap[i]=tid2idx[ti]
+                        tmask=tmap>=0
+                        if tmask.any():
+                            pnorm=F.normalize(path_pred,dim=1)
+                            simt=torch.matmul(pnorm[tmask],tmplM.T)
+                            loss_tmpl=F.cross_entropy(simt,tmap[tmask])
+                    loss_path=F.mse_loss(path_pred,path_vec) if path_vec is not None else torch.zeros((),device=device)
+                    goal_weight=torch.ones_like(values)
+                    try:
+                        gscores=self.goal_graph.granger()
+                        for i in range(ctrl_t.shape[0]):
+                            pid=int(ctrl_t[i].item())
+                            if pid in gscores:goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,gscores[pid])))
+                            goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,self.state_graph.reachability(pid))))
+                        c_scores=gscores
+                    except Exception:
+                        pass
+                    loss_value=(loss_value*goal_weight.mean()).mean()
+                    loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
+                epoch_steps+=1
+                done_steps+=1
+                self._update_progress_step(min(epoch_steps,step_cap),min(done_steps,total),total)
+                prog=5.0+90.0*(min(done_steps,total)/max(1,total))
+                self.schedule(lambda v=prog:self._set_progress_ui(v))
+                if best_loss is None or float(loss.item())<best_loss:
+                    best_loss=float(loss.item())
+                    best_state=self._snapshot_state_dict()
+                return True
             for ep in range(epochs):
                 if self.optimize_event.is_set():break
                 self._update_progress_epoch(ep,epochs,steps_per_epoch)
@@ -2666,88 +2752,25 @@ class App:
                     else:
                         item=build_fallback_batch()
                         fallback_provided=True
-                    try:
-                        seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(item)
-                    except Exception:
-                        seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(build_fallback_batch())
-                    if seq_t is None or seq_t.shape[0]==0:
+                    if not train_batch(item,steps_per_epoch):
                         continue
-                    if not phase_ready:
-                        self._update_progress_phase("训练中")
-                        phase_ready=True
-                    self.optimizer.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
-                        logits,values,atype_logits,elem_emb,path_pred=self.model(seq_t)
-                        loss_policy=F.mse_loss(logits,act_t)
-                        with torch.no_grad():
-                            seq_np=(seq_t.detach().float().cpu().numpy()*255.0).transpose(0,1,3,4,2)
-                            rewards=np.array([self._compute_reward(s,(texts[i] if i<len(texts) else "")) for i,s in enumerate(seq_np)],dtype=np.float32)
-                            returns=torch.from_numpy(rewards).to(device)
-                        loss_value=F.mse_loss(values,returns)
-                        at_mask=(atype_t>=0)&(atype_t<=2)
-                        loss_atype=F.cross_entropy(atype_logits[at_mask],atype_t[at_mask]) if at_mask.any() else torch.zeros((),device=device)
-                        protoM,id2idx=self.pool.matrix()
-                        if protoM is not None and protoM.shape[0]>0:
-                            if ctrl_t.dim()==0:ctrl_t=ctrl_t.unsqueeze(0)
-                            map_idx=torch.full_like(ctrl_t,-1)
-                            if id2idx:
-                                for i in range(ctrl_t.shape[0]):
-                                    cid=int(ctrl_t[i].item())
-                                    if cid in id2idx:map_idx[i]=id2idx[cid]
-                            c_mask=map_idx>=0
-                            loss_ctrl=torch.zeros((),device=device)
-                            if c_mask.any():
-                                sim=torch.matmul(elem_emb[c_mask],protoM.T)
-                                loss_ctrl=F.cross_entropy(sim,map_idx[c_mask])
-                        else:
-                            loss_ctrl=torch.zeros((),device=device)
-                        tmplM,tid2idx=self.templates.matrix()
-                        loss_tmpl=torch.zeros((),device=device)
-                        if tmplM is not None:
-                            tt=tmpl_t
-                            if tt.dim()==0:
-                                tt=tt.unsqueeze(0)
-                            tmap=torch.full_like(tt,-1)
-                            if tid2idx:
-                                for i in range(tt.shape[0]):
-                                    ti=int(tt[i].item())
-                                    if ti in tid2idx:
-                                        tmap[i]=tid2idx[ti]
-                            tmask=tmap>=0
-                            if tmask.any():
-                                pnorm=F.normalize(path_pred,dim=1)
-                                simt=torch.matmul(pnorm[tmask],tmplM.T)
-                                loss_tmpl=F.cross_entropy(simt,tmap[tmask])
-                        loss_path=F.mse_loss(path_pred,path_vec) if path_vec is not None else torch.zeros((),device=device)
-                        goal_weight=torch.ones_like(values)
-                        try:
-                            gscores=self.goal_graph.granger()
-                            for i in range(ctrl_t.shape[0]):
-                                pid=int(ctrl_t[i].item())
-                                if pid in gscores:goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,gscores[pid])))
-                                goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,self.state_graph.reachability(pid))))
-                            c_scores=gscores
-                        except Exception:
-                            pass
-                        loss_value=(loss_value*goal_weight.mean()).mean()
-                        loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                        scaler.step(self.optimizer)
-                        scaler.update()
-                    else:
-                        loss.backward()
-                        self.optimizer.step()
-                    epoch_steps+=1
-                    done_steps+=1
-                    self._update_progress_step(min(epoch_steps,steps_per_epoch),min(done_steps,total),total)
-                    prog=5.0+90.0*(min(done_steps,total)/max(1,total))
-                    self.schedule(lambda v=prog:self._set_progress_ui(v))
-                    if best_loss is None or float(loss.item())<best_loss:
-                        best_loss=float(loss.item())
-                        best_state=self._snapshot_state_dict()
                     if self.optimize_event.is_set():break
             interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
+            if not interrupted and done_steps==0:
+                synthetic_steps=max(4,min(16,bs))
+                total=max(1,synthetic_steps)
+                self._update_progress_epoch(0,1,synthetic_steps)
+                epoch_steps=0
+                phase_ready=False
+                attempts=0
+                max_attempts=max(6,synthetic_steps*3)
+                while epoch_steps<synthetic_steps and attempts<max_attempts:
+                    if self.optimize_event.is_set():break
+                    attempts+=1
+                    item=build_fallback_batch()
+                    if train_batch(item,synthetic_steps):
+                        continue
+                interrupted=self.optimize_event.is_set() if self.optimize_event is not None else interrupted
             if not interrupted:
                 self._update_progress_phase("保存模型")
                 if best_state is not None:
