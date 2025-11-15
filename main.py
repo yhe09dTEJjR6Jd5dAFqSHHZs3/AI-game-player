@@ -1338,7 +1338,11 @@ class App:
             self.progress_info["done"]=done
             self.progress_info["total"]=max(1,total)
             self.progress_info["last_step_time"]=time.time()
+    def _touch_progress_watchdog(self):
+        with self.progress_info_lock:
             self.progress_info["alerted"]=False
+            if self.progress_info.get("active",False):
+                self.progress_info["last_step_time"]=time.time()
 
     def _stop_progress_monitor(self):
         with self.progress_info_lock:
@@ -2501,22 +2505,26 @@ class App:
                 success_arr=np.asarray(success,dtype=np.int64).reshape(1)
                 return (torch.from_numpy(np.ascontiguousarray(seq_arr)),torch.from_numpy(np.ascontiguousarray(act_arr)),torch.from_numpy(np.ascontiguousarray(atype_arr)),torch.from_numpy(np.ascontiguousarray(ctrl_arr)),torch.from_numpy(np.ascontiguousarray(tmpl_arr)),torch.from_numpy(np.ascontiguousarray(path_arr)),[str(text)],torch.from_numpy(np.ascontiguousarray(success_arr)))
             M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
+            real_samples=max(0,ds.real_count)
             base_workers=max(0,min(6,os.cpu_count() or 2)-1)
-            if ds.real_count<=2:
+            if real_samples<=2:
                 num_workers=0
             else:
-                num_workers=min(base_workers,max(0,ds.real_count-1))
+                num_workers=min(base_workers,max(0,real_samples-1))
             force_single_worker=(os.name=="nt") or (threading.current_thread() is not threading.main_thread())
             if force_single_worker:
                 num_workers=0
             bs=max(4,int(8+64*(1.0-M)))
-            if ds.real_count>0 and ds.real_count<bs:
-                bs=max(1,ds.real_count)
+            if real_samples>0 and real_samples<bs:
+                bs=max(1,real_samples)
+            small_sample_limit=max(8,bs+8)
+            manual_sampling=fallback_mode or real_samples<=small_sample_limit
+            if manual_sampling:
+                num_workers=0
             lr=1e-4*(0.5 if hot else 1.0)
             for g in self.optimizer.param_groups:g["lr"]=lr
-            drop_last=ds.real_count>=bs and bs>0
+            drop_last=(not manual_sampling) and real_samples>=bs*2 and bs>0
             loader_kwargs={"batch_size":bs,"shuffle":True,"num_workers":0,"pin_memory":(device=="cuda"),"drop_last":drop_last}
-            manual_sampling=fallback_mode or ds.real_count<=max(8,bs)
             dl=None
             if not manual_sampling:
                 loader_kwargs["num_workers"]=num_workers
@@ -2534,6 +2542,13 @@ class App:
                     except Exception:
                         dl=None
                         manual_sampling=True
+            def _compose_opt_msg():
+                suffix=""
+                if force_single_worker:
+                    suffix+="（单线程数据加载）"
+                if manual_sampling:
+                    suffix+="（小样本手工采样）"
+                return self._optimize_notice+suffix
             epochs=2 if fallback_mode else 3
             if fallback_mode:
                 steps_per_epoch=max(4,min(16,bs))
@@ -2553,11 +2568,12 @@ class App:
             best_state=None
             c_scores={}
             start_time=time.time()
-            opt_msg=self._optimize_notice+("（单线程数据加载）" if force_single_worker else "")
+            opt_msg=_compose_opt_msg()
             self._current_optimize_message=opt_msg
-            self.schedule(lambda text=opt_msg:self.pause_var.set(text))
+            self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
             self._start_progress_monitor(total,epochs,steps_per_epoch)
             monitor_started=True
+            manual_notice_sent=manual_sampling
             def prepare_inputs(item):
                 sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
                 if sample is not None:
@@ -2664,6 +2680,7 @@ class App:
                 except Exception:
                     seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(build_fallback_batch())
                 if seq_t is None or seq_t.shape[0]==0:
+                    self._touch_progress_watchdog()
                     return False
                 if not phase_ready:
                     self._update_progress_phase("训练中")
@@ -2780,8 +2797,18 @@ class App:
                             manual_sampling=True
                             dl=None
                             loader_wait_start=time.time()
+                            opt_msg=_compose_opt_msg()
+                            self._current_optimize_message=opt_msg
+                            self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
+                            manual_notice_sent=True
+                            self._touch_progress_watchdog()
                         continue
                     if self.optimize_event.is_set():break
+                    if manual_sampling and not manual_notice_sent:
+                        opt_msg=_compose_opt_msg()
+                        self._current_optimize_message=opt_msg
+                        self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
+                        manual_notice_sent=True
             interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
             if not interrupted and done_steps==0:
                 synthetic_steps=max(4,min(16,bs))
