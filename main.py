@@ -2508,31 +2508,30 @@ class App:
                 bs=max(1,ds.real_count)
             lr=1e-4*(0.5 if hot else 1.0)
             for g in self.optimizer.param_groups:g["lr"]=lr
-            prefetch_factor=4 if num_workers>0 else None
             drop_last=ds.real_count>=bs and bs>0
-            persistent=num_workers>0 and ds.real_count>=num_workers*2
-            if force_single_worker:
-                prefetch_factor=None
-                persistent=False
-            loader_kwargs={"batch_size":bs,"shuffle":True,"num_workers":num_workers,"pin_memory":(device=="cuda"),"drop_last":drop_last}
-            if num_workers>0:
-                loader_kwargs["persistent_workers"]=persistent
-                if prefetch_factor is not None:
-                    loader_kwargs["prefetch_factor"]=prefetch_factor
-            try:
-                dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
-            except Exception:
-                loader_kwargs["num_workers"]=0
-                loader_kwargs.pop("persistent_workers",None)
-                loader_kwargs.pop("prefetch_factor",None)
-                dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
-                num_workers=0
-            epochs=3
-            try:
-                steps_per_epoch=max(1,len(dl))
-            except Exception:
-                real_len=max(1,ds.real_count)
-                steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
+            loader_kwargs={"batch_size":bs,"shuffle":True,"num_workers":0,"pin_memory":(device=="cuda"),"drop_last":drop_last}
+            dl=None
+            if not fallback_mode:
+                loader_kwargs["num_workers"]=num_workers
+                if num_workers>0:
+                    loader_kwargs["persistent_workers"]=num_workers>0 and ds.real_count>=num_workers*2
+                    loader_kwargs["prefetch_factor"]=4
+                try:
+                    dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
+                except Exception:
+                    loader_kwargs["num_workers"]=0
+                    loader_kwargs.pop("persistent_workers",None)
+                    loader_kwargs.pop("prefetch_factor",None)
+                    dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
+            epochs=2 if fallback_mode else 3
+            if fallback_mode:
+                steps_per_epoch=max(4,min(16,bs))
+            else:
+                try:
+                    steps_per_epoch=max(1,len(dl))
+                except Exception:
+                    real_len=max(1,ds.real_count)
+                    steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
             total=max(1,steps_per_epoch*epochs)
             done_steps=0
             self.model.train()
@@ -2545,57 +2544,138 @@ class App:
             self.schedule(lambda text=opt_msg:self.pause_var.set(text))
             self._start_progress_monitor(total,epochs,steps_per_epoch)
             monitor_started=True
+            def prepare_inputs(item):
+                sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
+                if sample is not None:
+                    frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
+                    seq_np=frames_b.astype(np.float32)
+                    seq_t=torch.from_numpy(np.transpose(seq_np,(0,1,4,2,3))/255.0).to(device,non_blocking=True)
+                    act_t=torch.from_numpy(actions_b.astype(np.float32)).to(device,non_blocking=True)
+                    atype_t=torch.from_numpy(atypes_b.astype(np.int64)).to(device,non_blocking=True)
+                    ctrl_t=torch.from_numpy(ctrls_b.astype(np.int64)).to(device,non_blocking=True)
+                    tmpl_t=torch.from_numpy(tmpls_b.astype(np.int64)).to(device,non_blocking=True)
+                    path_t=torch.zeros((seq_t.shape[0],64),device=device,dtype=torch.float32)
+                    text_list=[str(t) for t in txts_b]
+                    success_t=torch.tensor([1 if any(k in (t or "").lower() for k in ["win","victory","success","complete"]) else 0 for t in text_list],device=device,dtype=torch.long)
+                    return seq_t,act_t,atype_t.long(),ctrl_t.long(),tmpl_t.long(),path_t,text_list,success_t
+                if item is None:
+                    item=build_fallback_batch()
+                if isinstance(item,(tuple,list)):
+                    seq=item[0];act=item[1]
+                    atype=item[2] if len(item)>=3 else torch.zeros((1,),dtype=torch.long)
+                    ctrl=item[3] if len(item)>=4 else torch.full((1,),-1,dtype=torch.long)
+                    tmpl=item[4] if len(item)>=5 else torch.full((1,),-1,dtype=torch.long)
+                    path=item[5] if len(item)>=6 else torch.zeros((1,64),dtype=torch.float32)
+                    texts=item[6] if len(item)>=7 else [""]
+                    success=item[7] if len(item)>=8 else torch.zeros((1,),dtype=torch.long)
+                else:
+                    seq,act=item
+                    atype=torch.zeros((1,),dtype=torch.long)
+                    ctrl=torch.full((1,),-1,dtype=torch.long)
+                    tmpl=torch.full((1,),-1,dtype=torch.long)
+                    path=torch.zeros((1,64),dtype=torch.float32)
+                    texts=[""]
+                    success=torch.zeros((1,),dtype=torch.long)
+                seq_arr=seq.detach().cpu().numpy() if isinstance(seq,torch.Tensor) else np.asarray(seq)
+                if seq_arr.ndim==4:
+                    seq_arr=np.expand_dims(seq_arr,0)
+                if seq_arr.ndim!=5:
+                    seq_arr=np.zeros((1,seq_len,256,256,3),np.uint8)
+                act_arr=act.detach().cpu().numpy() if isinstance(act,torch.Tensor) else np.asarray(act,dtype=np.float32)
+                if act_arr.ndim==1:
+                    act_arr=act_arr.reshape(1,-1)
+                if act_arr.shape[0]!=seq_arr.shape[0]:
+                    if act_arr.shape[0]==1:
+                        act_arr=np.repeat(act_arr,seq_arr.shape[0],axis=0)
+                    else:
+                        act_arr=act_arr[:seq_arr.shape[0]]
+                def _norm_arr(x,fill=0,dtype=np.int64):
+                    if isinstance(x,torch.Tensor):
+                        arr=x.detach().cpu().numpy()
+                    else:
+                        arr=np.asarray(x,dtype=dtype)
+                    if arr.ndim==0:
+                        arr=arr.reshape(1)
+                    if arr.size==0:
+                        arr=np.full((seq_arr.shape[0],),fill,dtype=dtype)
+                    if arr.shape[0]!=seq_arr.shape[0]:
+                        if arr.shape[0]==1:
+                            arr=np.full((seq_arr.shape[0],),arr.item(),dtype=dtype)
+                        else:
+                            arr=arr[:seq_arr.shape[0]]
+                    return arr.astype(dtype)
+                atype_arr=_norm_arr(atype,0,np.int64)
+                ctrl_arr=_norm_arr(ctrl,-1,np.int64)
+                tmpl_arr=_norm_arr(tmpl,-1,np.int64)
+                if isinstance(path,torch.Tensor):
+                    path_arr=path.detach().cpu().numpy()
+                else:
+                    path_arr=np.asarray(path,dtype=np.float32)
+                if path_arr.ndim==1:
+                    path_arr=path_arr.reshape(1,-1)
+                if path_arr.shape[0]!=seq_arr.shape[0]:
+                    if path_arr.shape[0]==1:
+                        path_arr=np.repeat(path_arr,seq_arr.shape[0],axis=0)
+                    else:
+                        path_arr=path_arr[:seq_arr.shape[0]]
+                if path_arr.shape[1]<64:
+                    pad=np.zeros((path_arr.shape[0],64-path_arr.shape[1]),np.float32)
+                    path_arr=np.concatenate([path_arr,pad],1)
+                path_arr=path_arr[:, :64].astype(np.float32)
+                if isinstance(texts,(list,tuple)):
+                    text_list=[str(t) for t in texts]
+                    if len(text_list)==1 and seq_arr.shape[0]>1:
+                        text_list=text_list*seq_arr.shape[0]
+                    elif len(text_list)<seq_arr.shape[0]:
+                        text_list=text_list+[""]*(seq_arr.shape[0]-len(text_list))
+                    else:
+                        text_list=text_list[:seq_arr.shape[0]]
+                else:
+                    text_list=[str(texts)]*seq_arr.shape[0]
+                success_arr=_norm_arr(success,0,np.int64)
+                seq_t=torch.from_numpy(np.transpose(seq_arr.astype(np.float32)/255.0,(0,1,4,2,3))).to(device,non_blocking=True)
+                act_t=torch.from_numpy(act_arr.astype(np.float32)).to(device,non_blocking=True)
+                atype_t=torch.from_numpy(atype_arr).to(device,non_blocking=True)
+                ctrl_t=torch.from_numpy(ctrl_arr).to(device,non_blocking=True)
+                tmpl_t=torch.from_numpy(tmpl_arr).to(device,non_blocking=True)
+                path_t=torch.from_numpy(path_arr).to(device,non_blocking=True)
+                success_t=torch.from_numpy(success_arr).to(device,non_blocking=True)
+                return seq_t,act_t,atype_t.long(),ctrl_t.long(),tmpl_t.long(),path_t.float(),text_list,success_t.long()
             for ep in range(epochs):
                 if self.optimize_event.is_set():break
                 self._update_progress_epoch(ep,epochs,steps_per_epoch)
-                it=iter(dl)
+                iterator=iter(dl) if dl is not None else None
                 epoch_steps=0
                 phase_ready=False
                 fallback_provided=False
-                while True:
-                    try:item=next(it)
-                    except StopIteration:
-                        if not fallback_provided and epoch_steps==0:
+                while epoch_steps<steps_per_epoch:
+                    if self.optimize_event.is_set():break
+                    item=None
+                    if iterator is not None:
+                        try:
+                            item=next(iterator)
+                        except StopIteration:
+                            if epoch_steps==0 and not fallback_provided:
+                                item=build_fallback_batch()
+                                fallback_provided=True
+                            else:
+                                break
+                        except Exception:
                             item=build_fallback_batch()
                             fallback_provided=True
-                        else:
-                            break
-                    if self.optimize_event.is_set():break
+                    else:
+                        item=build_fallback_batch()
+                        fallback_provided=True
+                    try:
+                        seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(item)
+                    except Exception:
+                        seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(build_fallback_batch())
+                    if seq_t is None or seq_t.shape[0]==0:
+                        continue
                     if not phase_ready:
                         self._update_progress_phase("训练中")
                         phase_ready=True
-                    if isinstance(item,(tuple,list)):
-                        seq=item[0]
-                        act=item[1]
-                        batch=len(seq)
-                        atype_t=item[2] if len(item)>=3 else torch.zeros((batch,),dtype=torch.long)
-                        ctrl_t=item[3] if len(item)>=4 else torch.full((batch,),-1,dtype=torch.long)
-                        tmpl_t=item[4] if len(item)>=5 else torch.full((batch,),-1,dtype=torch.long)
-                        path_vec=item[5] if len(item)>=6 else torch.zeros((batch,64),dtype=torch.float32)
-                        texts=item[6] if len(item)>=7 else ["" for _ in range(batch)]
-                        success=item[7] if len(item)>=8 else torch.zeros((batch,),dtype=torch.long)
-                    else:
-                        seq,act=item
-                        batch=len(seq)
-                        atype_t=torch.zeros((batch,),dtype=torch.long)
-                        ctrl_t=torch.full((batch,),-1,dtype=torch.long)
-                        tmpl_t=torch.full((batch,),-1,dtype=torch.long)
-                        path_vec=torch.zeros((batch,64),dtype=torch.float32)
-                        texts=["" for _ in range(batch)]
-                        success=torch.zeros((batch,),dtype=torch.long)
-                    sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
-                    if sample is not None:
-                        frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
-                        seq_np=frames_b.astype(np.float32)
-                        seq_t=torch.from_numpy(np.transpose(seq_np,(0,1,4,2,3))/255.0).to(device,non_blocking=True)
-                        act_t=torch.from_numpy(actions_b).to(device,non_blocking=True)
-                        atype_t=torch.from_numpy(atypes_b).to(device,non_blocking=True)
-                        ctrl_t=torch.from_numpy(ctrls_b).to(device,non_blocking=True)
-                        tmpl_t=torch.from_numpy(tmpls_b).to(device,non_blocking=True)
-                        path_vec=torch.zeros((seq_t.shape[0],64),device=device,dtype=torch.float32)
-                        texts=list(txts_b);success=torch.tensor([1 if any(k in (t or "").lower() for k in ["win","victory","success","complete"]) else 0 for t in texts],device=device,dtype=torch.long)
-                    else:
-                        seq_t=torch.from_numpy(np.transpose(seq.numpy(),(0,1,4,2,3))/255.0).to(device,non_blocking=True);act_t=act.to(device,non_blocking=True);atype_t=atype_t.to(device,non_blocking=True);ctrl_t=ctrl_t.to(device,non_blocking=True);path_vec=path_vec.to(device,non_blocking=True).float();success=success.to(device,non_blocking=True).long();texts=list(texts)
+                    self.optimizer.zero_grad(set_to_none=True)
                     with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
                         logits,values,atype_logits,elem_emb,path_pred=self.model(seq_t)
                         loss_policy=F.mse_loss(logits,act_t)
@@ -2624,23 +2704,7 @@ class App:
                         tmplM,tid2idx=self.templates.matrix()
                         loss_tmpl=torch.zeros((),device=device)
                         if tmplM is not None:
-                            if (tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,dtype=torch.long,device=device)).dim()==0:
-                                tmpl_t=(tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,dtype=torch.long,device=device))
-                            map_t=torch.full_like((tmpl_t if 'tmpl_t' in locals() else torch.full((elem_emb.shape[0],),-1,device=device)), -1)
-                            if tid2idx:
-                                for i in range(map_t.shape[0]):
-                                    tid=int((tmpl_t if 'tmpl_t' in locals() else torch.full((1,),-1,device=device))[i].item())
-                                    if tid in tid2idx:map_t[i]=tid2idx[tid]
-                            t_mask=map_t>=0
-                            if t_mask.any():
-                                path_n=F.normalize(path_pred,dim=1)
-                                sim_tmpl=path_n[:, :tmplM.shape[1]].matmul(tmplM.T)
-                                loss_tmpl=F.cross_entropy(sim_tmpl[t_mask],map_t[t_mask])
-
-                        tmplM,tid2idx=self.templates.matrix()
-                        loss_tmpl=torch.zeros((),device=device)
-                        if tmplM is not None:
-                            tt=(tmpl_t if 'tmpl_t' in locals() else torch.full((path_pred.shape[0],),-1,dtype=torch.long,device=device))
+                            tt=tmpl_t
                             if tt.dim()==0:
                                 tt=tt.unsqueeze(0)
                             tmap=torch.full_like(tt,-1)
@@ -2666,12 +2730,14 @@ class App:
                         except Exception:
                             pass
                         loss_value=(loss_value*goal_weight.mean()).mean()
-                        loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl+0.1*loss_tmpl
-                    self.optimizer.zero_grad(set_to_none=True)
+                        loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl
                     if scaler is not None:
-                        scaler.scale(loss).step(self.optimizer);scaler.update()
+                        scaler.scale(loss).backward()
+                        scaler.step(self.optimizer)
+                        scaler.update()
                     else:
-                        loss.backward();self.optimizer.step()
+                        loss.backward()
+                        self.optimizer.step()
                     epoch_steps+=1
                     done_steps+=1
                     self._update_progress_step(min(epoch_steps,steps_per_epoch),min(done_steps,total),total)
