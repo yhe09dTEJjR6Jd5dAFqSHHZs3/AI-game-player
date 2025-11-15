@@ -1031,6 +1031,8 @@ class App:
         self.freq_var=tk.StringVar(value="Capture:0.0 Hz")
         self.progress_var=tk.DoubleVar(value=0.0)
         self.progress_text=tk.StringVar(value="0%")
+        self.progress_lock=threading.Lock()
+        self.progress_floor=0.0
         self.current_download=None
         self.download_title=""
         self.last_user_input=time.time()
@@ -1212,6 +1214,30 @@ class App:
         v=max(0.0,min(100.0,float(value)))
         self.progress_var.set(v)
         self.progress_text.set(f"{v:.0f}%")
+        with self.progress_lock:
+            if v<=0.0:
+                self.progress_floor=0.0
+            elif v>self.progress_floor:
+                self.progress_floor=v
+
+    def _ensure_progress_floor(self,value):
+        val=max(0.0,min(99.0,float(value)))
+        with self.progress_lock:
+            if val<=self.progress_floor:
+                val=self.progress_floor
+            else:
+                self.progress_floor=val
+        def updater(v=val):
+            try:
+                cur=float(self.progress_var.get())
+            except Exception:
+                cur=0.0
+            if cur<v:
+                self._set_progress_ui(v)
+        if threading.current_thread() is threading.main_thread():
+            updater()
+        else:
+            self.schedule(updater)
     def _update_window_size_ui(self,rect):
         if rect is None:
             text='尺寸: 未选择窗口' if self.window_hwnd is None else '尺寸: 未检测'
@@ -2040,9 +2066,24 @@ class App:
         if frame is not None:
             rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
             image=Image.fromarray(rgb)
-            w=min(640,image.width)
-            h=int(image.height*float(w)/float(image.width))
-            image=image.resize((w,h))
+            try:
+                target_w=max(1,int(self.frame_label.winfo_width()))
+                target_h=max(1,int(self.frame_label.winfo_height()))
+            except Exception:
+                target_w=0
+                target_h=0
+            if target_w<=1 or target_h<=1:
+                base_w=max(1,image.width)
+                target_w=min(640,base_w)
+                target_h=max(1,int(round(image.height*float(target_w)/float(base_w))))
+            scale=min(target_w/float(max(1,image.width)),target_h/float(max(1,image.height)))
+            if scale<=0:
+                scale=1.0
+            new_w=max(1,int(round(image.width*scale)))
+            new_h=max(1,int(round(image.height*scale)))
+            if new_w!=image.width or new_h!=image.height:
+                resample=getattr(Image,"LANCZOS",Image.BICUBIC)
+                image=image.resize((new_w,new_h),resample)
             try:
                 self.photo=ImageTk.PhotoImage(image=image,master=self.root)
                 try:
@@ -2229,9 +2270,15 @@ class App:
         c_scores={}
         start_time=time.time()
         self.schedule(lambda:self.pause_var.set("优化进行中，10秒切换规则失效"))
+        self._ensure_progress_floor(5.0)
         for ep in range(epochs):
             if self.optimize_event.is_set():break
+            if epochs>0:
+                start_floor=5.0+85.0*(ep/max(epochs,1))
+                if start_floor>5.0:
+                    self._ensure_progress_floor(min(95.0,start_floor))
             it=iter(dl)
+            epoch_steps=0
             while True:
                 try:item=next(it)
                 except StopIteration:break
@@ -2344,9 +2391,18 @@ class App:
                     scaler.scale(loss).step(self.optimizer);scaler.update()
                 else:
                     loss.backward();self.optimizer.step()
-                done_steps+=1;prog=100.0*min(1.0,done_steps/max(1,total));self.schedule(lambda v=prog:self._set_progress_ui(v))
+                epoch_steps+=1
+                done_steps+=1
+                with self.progress_lock:
+                    floor=self.progress_floor
+                prog=100.0*min(1.0,done_steps/max(1,total))
+                target=min(100.0,max(prog,floor))
+                self.schedule(lambda v=target:self._set_progress_ui(v))
                 if best_loss is None or float(loss.item())<best_loss:best_loss=float(loss.item())
                 if self.optimize_event.is_set():break
+            if epoch_steps==0 and not self.optimize_event.is_set():
+                post_floor=5.0+85.0*((ep+1)/max(epochs,1))
+                self._ensure_progress_floor(min(95.0,post_floor))
         interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
         if not interrupted:
             try:torch.save(self.model.state_dict(),model_path)
