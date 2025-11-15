@@ -2506,6 +2506,7 @@ class App:
                 return (torch.from_numpy(np.ascontiguousarray(seq_arr)),torch.from_numpy(np.ascontiguousarray(act_arr)),torch.from_numpy(np.ascontiguousarray(atype_arr)),torch.from_numpy(np.ascontiguousarray(ctrl_arr)),torch.from_numpy(np.ascontiguousarray(tmpl_arr)),torch.from_numpy(np.ascontiguousarray(path_arr)),[str(text)],torch.from_numpy(np.ascontiguousarray(success_arr)))
             M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
             real_samples=max(0,ds.real_count)
+            force_synthetic=real_samples<8
             base_workers=max(0,min(6,os.cpu_count() or 2)-1)
             if real_samples<=2:
                 num_workers=0
@@ -2518,7 +2519,7 @@ class App:
             if real_samples>0 and real_samples<bs:
                 bs=max(1,real_samples)
             small_sample_limit=max(8,bs+8)
-            manual_sampling=fallback_mode or real_samples<=small_sample_limit
+            manual_sampling=fallback_mode or real_samples<=small_sample_limit or force_synthetic
             if manual_sampling:
                 num_workers=0
             lr=1e-4*(0.5 if hot else 1.0)
@@ -2548,9 +2549,14 @@ class App:
                     suffix+="（单线程数据加载）"
                 if manual_sampling:
                     suffix+="（小样本手工采样）"
+                if force_synthetic:
+                    suffix+="（极少样本降级）"
                 return self._optimize_notice+suffix
             epochs=2 if fallback_mode else 3
-            if fallback_mode:
+            if force_synthetic:
+                steps_per_epoch=0
+                epochs=0
+            elif fallback_mode:
                 steps_per_epoch=max(4,min(16,bs))
             elif manual_sampling:
                 real_len=max(1,ds.real_count)
@@ -2574,6 +2580,13 @@ class App:
             self._start_progress_monitor(total,epochs,steps_per_epoch)
             monitor_started=True
             manual_notice_sent=manual_sampling
+            wait_notice_sent=False
+            virtual_done=0
+            synthetic_triggered=force_synthetic
+            wait_threshold=3.0
+            force_batch_interval=6.0
+            max_wait=12.0
+            last_forced_batch=start_time
             def prepare_inputs(item):
                 sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
                 if sample is not None:
@@ -2674,12 +2687,15 @@ class App:
             epoch_steps=0
             phase_ready=False
             def train_batch(item,step_cap):
-                nonlocal epoch_steps,done_steps,best_loss,best_state,phase_ready,total
+                nonlocal epoch_steps,done_steps,best_loss,best_state,phase_ready,total,virtual_done,wait_notice_sent
                 try:
                     seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(item)
                 except Exception:
                     seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(build_fallback_batch())
                 if seq_t is None or seq_t.shape[0]==0:
+                    if not phase_ready:
+                        self._update_progress_phase("训练中")
+                        phase_ready=True
                     self._touch_progress_watchdog()
                     return False
                 if not phase_ready:
@@ -2751,6 +2767,12 @@ class App:
                     self.optimizer.step()
                 epoch_steps+=1
                 done_steps+=1
+                virtual_done=max(0,virtual_done-1)
+                if wait_notice_sent:
+                    opt_msg=_compose_opt_msg()
+                    self._current_optimize_message=opt_msg
+                    self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
+                wait_notice_sent=False
                 self._update_progress_step(min(epoch_steps,step_cap),min(done_steps,total),total)
                 prog=5.0+90.0*(min(done_steps,total)/max(1,total))
                 self.schedule(lambda v=prog:self._set_progress_ui(v))
@@ -2758,57 +2780,92 @@ class App:
                     best_loss=float(loss.item())
                     best_state=self._snapshot_state_dict()
                 return True
-            for ep in range(epochs):
-                if self.optimize_event.is_set():break
-                self._update_progress_epoch(ep,epochs,steps_per_epoch)
-                iterator=iter(dl) if dl is not None else None
-                epoch_steps=0
-                phase_ready=False
-                fallback_provided=False
-                loader_wait_start=time.time()
-                loader_fail_count=0
-                while epoch_steps<steps_per_epoch:
+            if not synthetic_triggered:
+                for ep in range(epochs):
                     if self.optimize_event.is_set():break
-                    item=None
-                    if iterator is not None:
-                        try:
-                            item=next(iterator)
-                            loader_wait_start=time.time()
-                            loader_fail_count=0
-                        except StopIteration:
-                            if epoch_steps==0 and not fallback_provided:
+                    self._update_progress_epoch(ep,epochs,steps_per_epoch)
+                    iterator=iter(dl) if dl is not None else None
+                    epoch_steps=0
+                    phase_ready=False
+                    fallback_provided=False
+                    loader_wait_start=time.time()
+                    loader_fail_count=0
+                    while epoch_steps<steps_per_epoch:
+                        if self.optimize_event.is_set():break
+                        item=None
+                        if iterator is not None:
+                            try:
+                                item=next(iterator)
+                                loader_wait_start=time.time()
+                                loader_fail_count=0
+                            except StopIteration:
+                                if epoch_steps==0 and not fallback_provided:
+                                    item=build_fallback_batch()
+                                    fallback_provided=True
+                                else:
+                                    break
+                            except Exception:
+                                iterator=None
+                                manual_sampling=True
+                                dl=None
                                 item=build_fallback_batch()
                                 fallback_provided=True
-                            else:
-                                break
-                        except Exception:
-                            iterator=None
-                            manual_sampling=True
-                            dl=None
+                        else:
                             item=build_fallback_batch()
                             fallback_provided=True
-                    else:
-                        item=build_fallback_batch()
-                        fallback_provided=True
-                    if not train_batch(item,steps_per_epoch):
-                        loader_fail_count+=1
-                        if not manual_sampling and (time.time()-loader_wait_start>5.0 or loader_fail_count>3):
-                            iterator=None
-                            manual_sampling=True
-                            dl=None
-                            loader_wait_start=time.time()
+                        if not train_batch(item,steps_per_epoch):
+                            loader_fail_count+=1
+                            now=time.time()
+                            wait_elapsed=now-loader_wait_start
+                            if wait_elapsed>wait_threshold:
+                                virtual_done=min(total-1-done_steps,virtual_done+1)
+                                display_done=min(total-1,done_steps+virtual_done)
+                                display_done=max(done_steps,display_done)
+                                self._update_progress_step(min(epoch_steps,steps_per_epoch),display_done,total)
+                                ratio=display_done/max(1,total)
+                                self.schedule(lambda v=5.0+90.0*ratio:self._set_progress_ui(v))
+                                degrade_text="经验数据不足，使用降级样本..."
+                                if not wait_notice_sent:
+                                    self._current_optimize_message=degrade_text
+                                    self.schedule(lambda text=degrade_text:self.pause_var.set(text) if self.mode=="optimize" else None)
+                                    wait_notice_sent=True
+                                self._touch_progress_watchdog()
+                                if not phase_ready:
+                                    self._update_progress_phase("训练中")
+                                    phase_ready=True
+                            if now-last_forced_batch>force_batch_interval and wait_elapsed>wait_threshold:
+                                last_forced_batch=now
+                                if train_batch(build_fallback_batch(),steps_per_epoch):
+                                    loader_wait_start=time.time()
+                                    continue
+                            if wait_elapsed>max_wait:
+                                synthetic_triggered=True
+                                self._touch_progress_watchdog()
+                                break
+                            if not manual_sampling and (wait_elapsed>5.0 or loader_fail_count>3):
+                                iterator=None
+                                manual_sampling=True
+                                dl=None
+                                loader_wait_start=time.time()
+                                opt_msg=_compose_opt_msg()
+                                self._current_optimize_message=opt_msg
+                                self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
+                                manual_notice_sent=True
+                                self._touch_progress_watchdog()
+                            continue
+                        if self.optimize_event.is_set():break
+                        loader_wait_start=time.time()
+                        if manual_sampling and not manual_notice_sent:
                             opt_msg=_compose_opt_msg()
                             self._current_optimize_message=opt_msg
                             self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
                             manual_notice_sent=True
-                            self._touch_progress_watchdog()
-                        continue
-                    if self.optimize_event.is_set():break
-                    if manual_sampling and not manual_notice_sent:
-                        opt_msg=_compose_opt_msg()
-                        self._current_optimize_message=opt_msg
-                        self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
-                        manual_notice_sent=True
+                    if synthetic_triggered or self.optimize_event.is_set():
+                        break
+            if synthetic_triggered and done_steps==0:
+                degrade_text="长时间等待数据，改用降级样本优化"
+                self._current_optimize_message=degrade_text
+                self.schedule(lambda text=degrade_text:self.pause_var.set(text) if self.mode=="optimize" else None)
             interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
             if not interrupted and done_steps==0:
                 synthetic_steps=max(4,min(16,bs))
