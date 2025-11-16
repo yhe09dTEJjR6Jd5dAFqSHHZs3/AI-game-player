@@ -1,2948 +1,1220 @@
-import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,hashlib,datetime,re,traceback,collections,copy
-import psutil,pyautogui
+import os
+import threading
+import time
+import ctypes
+import contextlib
+import re
+import tkinter as tk
+from tkinter import ttk
+from tkinter import messagebox
+import psutil
+import torch
+import numpy as np
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
 try:
- import torch,torch.nn as nn,torch.optim as optim,torch.nn.functional as F
-except OSError as e:
- import tkinter as _tk
- from tkinter import messagebox as _mb
- try:
-  _r=_tk.Tk();_r.withdraw()
-  _mb.showerror('PyTorch错误','检测到CUDA版PyTorch但缺少依赖\n请安装CPU版PyTorch后重试:\nhttps://pytorch.org/get-started/locally/\n建议命令: pip install torch --index-url https://download.pytorch.org/whl/cpu')
- except Exception:
-  pass
- sys.exit(1)
-import GPUtil,cv2,numpy as np,mss,pygetwindow as gw
-from pynput import mouse,keyboard
-from PIL import Image,ImageTk
-import tkinter as tk
-from tkinter import ttk,messagebox
-from tkinter import font as tkfont
-from screeninfo import get_monitors
-import os,sys,threading,time,queue,math,random,ctypes,json,subprocess,ctypes.wintypes,hashlib,datetime,re,traceback
-from pynput import mouse,keyboard
-from PIL import Image,ImageTk
-import tkinter as tk
-from tkinter import ttk,messagebox
-from screeninfo import get_monitors
-torch.backends.cudnn.benchmark=True
-OCCLUSION_THR=0.01
-WS_EX_TRANSPARENT=0x00000020
-WS_EX_LAYERED=0x00080000
-LWA_ALPHA=0x2
-GWL_EXSTYLE=-20
-GW_HWNDPREV=3
-GA_ROOT=2
-PW_RENDERFULLCONTENT=0x00000002
-class WINDOWINFO(ctypes.Structure):
-    _fields_=[("cbSize",ctypes.wintypes.DWORD),("rcWindow",ctypes.wintypes.RECT),("rcClient",ctypes.wintypes.RECT),("dwStyle",ctypes.wintypes.DWORD),("dwExStyle",ctypes.wintypes.DWORD),("dwWindowStatus",ctypes.wintypes.DWORD),("cxWindowBorders",ctypes.wintypes.UINT),("cyWindowBorders",ctypes.wintypes.UINT),("atomWindowType",ctypes.wintypes.ATOM),("wCreatorVersion",ctypes.wintypes.WORD)]
-class WINDOWPLACEMENT(ctypes.Structure):
-    _fields_=[("length",ctypes.wintypes.UINT),("flags",ctypes.wintypes.UINT),("showCmd",ctypes.wintypes.UINT),("ptMinPosition",ctypes.wintypes.POINT),("ptMaxPosition",ctypes.wintypes.POINT),("rcNormalPosition",ctypes.wintypes.RECT)]
-class LASTINPUTINFO(ctypes.Structure):
-    _fields_=[("cbSize",ctypes.wintypes.UINT),("dwTime",ctypes.wintypes.DWORD)]
-pyautogui.FAILSAFE=False
-pyautogui.PAUSE=0.0
-pyautogui.MINIMUM_DURATION=0.0
-if os.name=="nt":
+    import win32gui
+    import win32con
+    import win32ui
+except ImportError:
+    win32gui = None
+    win32con = None
+    win32ui = None
+
+try:
+    from pynput import keyboard, mouse
+except ImportError:
+    keyboard = None
+    mouse = None
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
+
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
+
+try:
+    import pytesseract
+    import os as _os_tess
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-    try:
-        dwmapi=ctypes.windll.dwmapi
-    except Exception:
-        dwmapi=None
-    user32=ctypes.windll.user32
-    kernel32=ctypes.windll.kernel32
-    try:
-        user32.WindowFromPoint.restype=ctypes.wintypes.HWND
-        user32.WindowFromPoint.argtypes=[ctypes.wintypes.POINT]
-        user32.GetAncestor.restype=ctypes.wintypes.HWND
-        user32.GetAncestor.argtypes=[ctypes.wintypes.HWND,ctypes.wintypes.UINT]
-    except Exception:
+        if hasattr(pytesseract, "pytesseract") and hasattr(pytesseract.pytesseract, "tesseract_cmd") and not pytesseract.pytesseract.tesseract_cmd:
+            for _p in (r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe", r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe"):
+                if _os_tess.path.exists(_p):
+                    pytesseract.pytesseract.tesseract_cmd = _p
+                    break
+    except:
         pass
-    gdi32=ctypes.windll.gdi32
-else:
-    dwmapi=None
-    user32=None
-    kernel32=None
-    gdi32=None
+except ImportError:
+    pytesseract = None
 
-def _list_visible_windows():
-    windows=[]
-    seen=set()
-    if user32 is not None:
-        EnumProc=ctypes.WINFUNCTYPE(ctypes.c_bool,ctypes.wintypes.HWND,ctypes.wintypes.LPARAM)
-        def callback(hwnd,_):
-            if user32.IsWindowVisible(hwnd)==0:
-                return True
-            length=user32.GetWindowTextLengthW(hwnd)
-            if length==0:
-                return True
-            buf=ctypes.create_unicode_buffer(length+1)
-            user32.GetWindowTextW(hwnd,buf,length+1)
-            title=buf.value.strip()
-            if not title:
-                return True
-            rect=ctypes.wintypes.RECT()
-            if user32.GetWindowRect(hwnd,ctypes.byref(rect))==0:
-                return True
-            if rect.right<=rect.left or rect.bottom<=rect.top:
-                return True
-            handle=int(hwnd)
-            if handle not in seen:
-                seen.add(handle)
-                windows.append((title,handle))
-            return True
-        try:
-            user32.EnumWindows(EnumProc(callback),0)
-        except Exception:
-            windows=[]
-    if not windows:
-        try:
-            for w in gw.getAllWindows():
-                title=w.title.strip()
-                if title:
-                    handle=int(getattr(w,"_hWnd",0))
-                    if handle not in seen:
-                        seen.add(handle)
-                        windows.append((title,handle))
-        except Exception:
-            pass
-    windows.sort(key=lambda x:x[0].lower())
-    return windows
-home=os.path.expanduser("~")
-base_dir=os.path.join(home,"Desktop","GameAI")
-models_dir=os.path.join(base_dir,"models")
-experience_dir=os.path.join(base_dir,"experience")
-os.makedirs(models_dir,exist_ok=True)
-os.makedirs(experience_dir,exist_ok=True)
-model_path=os.path.join(models_dir,"policy.pt")
-resnet_path=os.path.join(models_dir,"resnet18-f37072fd.pth")
-yolo_path=os.path.join(models_dir,"yolo12n.pt")
-sam_path=os.path.join(models_dir,"sam_vit_b_01ec64.pth")
-device="cuda" if torch.cuda.is_available() else "cpu"
-scaler=torch.amp.GradScaler("cuda") if device=="cuda" else None
-def _atomic_save(path,obj):
-    tmp=path+".tmp"
-    torch.save(obj,tmp)
-    os.replace(tmp,path)
-def _resnet_stub_generator(path,report=None):
-    torch.manual_seed(int(time.time())%1000000)
-    model=nn.Sequential(nn.Conv2d(3,16,3,padding=1),nn.ReLU(),nn.Conv2d(16,24,3,padding=1),nn.ReLU(),nn.AdaptiveAvgPool2d(1),nn.Flatten(),nn.Linear(24,6))
-    opt=optim.Adam(model.parameters(),lr=3e-3)
-    for step in range(6):
-        opt.zero_grad()
-        x=torch.randn(12,3,64,64)
-        target=torch.randn(12,6)
-        pred=model(x)
-        loss=(pred-target).pow(2).mean()
-        loss.backward()
-        opt.step()
-        if report:
-            report((step+1)/8*100.0,f"阶段{step+1}/6")
-    with torch.no_grad():
-        probe=torch.randn(6,3,64,64)
-        emb=model[:-1](probe)
-        stats={"embedding_mean":float(emb.mean().item()),"embedding_std":float(emb.std(unbiased=False).item())}
-    _atomic_save(path,{"state_dict":model.state_dict(),"meta":{"created":time.time(),"type":"resnet18_stub","stats":stats}})
-    if report:
-        report(100.0,"完成")
-    return True
-def _yolo_stub_generator(path,report=None):
-    torch.manual_seed(int(time.time())%1000000+17)
-    net=nn.Sequential(nn.Linear(64,96),nn.ReLU(),nn.Linear(96,64),nn.ReLU(),nn.Linear(64,45))
-    opt=optim.Adam(net.parameters(),lr=2e-3)
-    anchors=torch.abs(torch.randn(9,2))*40.0+10.0
-    targets=torch.randn(9,4)
-    for step in range(5):
-        opt.zero_grad()
-        x=torch.randn(32,64)
-        pred=net(x)
-        loss=(pred-torch.randn_like(pred)).pow(2).mean()
-        loss.backward()
-        opt.step()
-        if report:
-            report((step+1)/7*100.0,f"阶段{step+1}/5")
-    meta={"anchors":anchors.tolist(),"score_bias":float(torch.sigmoid(torch.tensor(random.random())).item()),"targets":targets.tolist(),"created":time.time(),"type":"yolo12n_stub"}
-    _atomic_save(path,{"state_dict":net.state_dict(),"meta":meta})
-    if report:
-        report(100.0,"完成")
-    return True
-def _sam_stub_generator(path,report=None):
-    torch.manual_seed(int(time.time())%1000000+29)
-    encoder=nn.Sequential(nn.Conv2d(3,8,3,padding=1),nn.ReLU(),nn.Conv2d(8,8,3,padding=1),nn.ReLU(),nn.AdaptiveAvgPool2d((16,16)))
-    decoder=nn.Sequential(nn.ConvTranspose2d(8,8,3,stride=2,padding=1,output_padding=1),nn.ReLU(),nn.ConvTranspose2d(8,1,3,stride=2,padding=1,output_padding=1))
-    params=list(encoder.parameters())+list(decoder.parameters())
-    opt=optim.Adam(params,lr=1e-3)
-    for step in range(4):
-        opt.zero_grad()
-        x=torch.randn(6,3,64,64)
-        latent=encoder(x)
-        recon=decoder(latent)
-        loss=(recon-torch.randn_like(recon)).abs().mean()
-        loss.backward()
-        opt.step()
-        if report:
-            report((step+1)/6*100.0,f"阶段{step+1}/4")
-    kernel=int(3+2*(random.randint(0,3)))
-    meta={"mask_kernel":kernel,"created":time.time(),"type":"sam_vit_b_stub"}
-    _atomic_save(path,{"encoder":encoder.state_dict(),"decoder":decoder.state_dict(),"meta":meta})
-    if report:
-        report(100.0,"完成")
-    return True
-def _load_stub_data(path):
+MODE_INIT = "init"
+MODE_LEARN = "learning"
+MODE_TRAIN = "training"
+MODE_RECOG = "recognizing"
+MODE_OPT = "optimizing"
+
+base_dir = os.path.join(os.path.expanduser("~"), "Desktop", "GameAI")
+models_dir = os.path.join(base_dir, "models")
+experience_dir = os.path.join(base_dir, "experience")
+os.makedirs(models_dir, exist_ok=True)
+os.makedirs(experience_dir, exist_ok=True)
+
+model_path = os.path.join(models_dir, "policy_latest.pt")
+
+experience_buffer = []
+experience_lock = threading.Lock()
+experience_file_index = 0
+last_user_action_vec = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+last_ai_action_vec = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+
+policy_model = None
+model_lock = threading.Lock()
+
+recognized_values = []
+recognized_lock = threading.Lock()
+category_choices = ["越高越好", "越低越好", "变化越小越好", "变化越大越好", "无关", "识别错误"]
+recognition_running = False
+recognition_attempted = False
+recognition_progress = 0.0
+recognition_finished_flag = False
+
+current_mode = MODE_INIT
+mode_lock = threading.Lock()
+
+window_a_handle = None
+window_a_title = ""
+window_a_visible = False
+window_a_rect = (0, 0, 0, 0)
+
+last_frame_np = None
+last_frame_lock = threading.Lock()
+
+last_user_input_time = time.monotonic()
+program_running = True
+
+screenshot_fps = 10.0
+hardware_stats = {"cpu": 0.0, "mem": 0.0, "gpu": 0.0, "vram": 0.0}
+
+optimization_progress = 0.0
+optimization_running = False
+optimization_cancel_requested = False
+optimization_finished_flag = False
+optimization_finished_cancelled = False
+
+gpu_available = torch.cuda.is_available()
+gpu_handle = None
+
+if pynvml is not None:
     try:
-        data=torch.load(path,map_location="cpu")
-        return data if isinstance(data,dict) else None
-    except Exception:
-        return None
-def _validate_stub(path,keys):
-    data=_load_stub_data(path)
-    if data is None:
-        return False
-    for key in keys:
-        if key not in data:
-            return False
-    return True
-def _validate_resnet_stub(path):
-    if not _validate_stub(path,["state_dict","meta"]):
-        return False
-    data=_load_stub_data(path)
-    meta=data.get("meta",{}) if isinstance(data,dict) else {}
-    stats=meta.get("stats",{}) if isinstance(meta,dict) else {}
-    return "embedding_mean" in stats and "embedding_std" in stats
-def _validate_yolo_stub(path):
-    if not _validate_stub(path,["state_dict","meta"]):
-        return False
-    data=_load_stub_data(path)
-    meta=data.get("meta",{}) if isinstance(data,dict) else {}
-    anchors=meta.get("anchors",[])
-    return isinstance(anchors,list) and len(anchors)>=3
-def _validate_sam_stub(path):
-    return _validate_stub(path,["encoder","decoder","meta"])
+        pynvml.nvmlInit()
+        gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    except:
+        gpu_handle = None
+
+if pyautogui is not None:
+    pyautogui.FAILSAFE = False
+
+root = tk.Tk()
+root.title("GameAI 窗口智能助手")
+root.geometry("1200x800")
+root.minsize(960, 680)
+root.configure(bg="#020617")
+
+style = ttk.Style(root)
 try:
-    from pynvml import nvmlInit,nvmlDeviceGetCount,nvmlDeviceGetHandleByIndex,nvmlDeviceGetUtilizationRates,nvmlDeviceGetMemoryInfo,nvmlDeviceGetTemperature,nvmlDeviceGetPowerUsage,nvmlDeviceGetEnforcedPowerLimit
-    nvmlInit();_gpu_count=nvmlDeviceGetCount()
-except Exception:
-    _gpu_count=0
-def _rect_intersection(a,b):
-    l=max(a[0],b[0]);t=max(a[1],b[1]);r=min(a[2],b[2]);btm=min(a[3],b[3])
-    if r>l and btm>t:
-        return (l,t,r,btm)
-    return None
-def _rect_area(rc):
-    return max(0,rc[2]-rc[0])*max(0,rc[3]-rc[1])
-def _rect_union_area(rects):
-    if not rects:
-        return 0
-    xs=sorted({r[0] for r in rects}|{r[2] for r in rects})
-    area=0
-    for i in range(len(xs)-1):
-        x1=xs[i];x2=xs[i+1]
-        if x2<=x1:
-            continue
-        seg=[]
-        for l,t,r,b in rects:
-            if l<x2 and r>x1:
-                seg.append((t,b))
-        if not seg:
-            continue
-        seg.sort()
-        cs,ce=seg[0]
-        total=0
-        for s,e in seg[1:]:
-            if e<=cs:
-                continue
-            if s>ce:
-                total+=ce-cs;cs,ce=s,e
-            else:
-                if e>ce:ce=e
-        total+=ce-cs
-        area+=total*(x2-x1)
-    return area
-def _poly_simplify(points,eps=2.0):
-    if len(points)<3:
-        return points
-    pts=np.array(points,dtype=np.float32).reshape(-1,1,2)
-    eps=float(eps)
-    simp=cv2.approxPolyDP(pts,eps,False).reshape(-1,2).tolist()
-    return simp if len(simp)>=2 else points
-def _now_ms():
-    return int(time.time()*1000)
-def _system_idle_seconds():
-    if user32 is None or kernel32 is None:
-        return None
-    try:
-        info=LASTINPUTINFO()
-        info.cbSize=ctypes.sizeof(LASTINPUTINFO)
-        if user32.GetLastInputInfo(ctypes.byref(info))==0:
-            return None
-        tick=0
-        try:
-            tick=float(kernel32.GetTickCount64())
-        except AttributeError:
-            tick=float(kernel32.GetTickCount())
-        return max(0.0,(tick-float(info.dwTime))/1000.0)
-    except Exception:
-        return None
-class UIElementPool:
-    def __init__(self,embedder=None,pre=None):
-        self.embedder=embedder
-        self.pre=pre
-        self.lock=threading.Lock()
-        self.protos=[]
-        self.next_id=1
-        self.last_state=""
-        self.transitions={}
-    def _embed(self,patch):
-        try:
-            if patch is None or patch.size==0:
-                return None
-            import torchvision.transforms as T
-            if self.embedder is not None and self.pre is not None:
-                img=Image.fromarray(cv2.cvtColor(patch,cv2.COLOR_BGR2RGB))
-                x=self.pre(img).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    e=self.embedder.encode_image(x).float().detach().cpu().numpy().reshape(-1)
-                n=np.linalg.norm(e)+1e-8
-                return e/n
-        except Exception:
-            pass
-        try:
-            hist=[]
-            for ch in cv2.split(patch):
-                h=cv2.calcHist([ch],[0],None,[64],[0,256]).flatten()
-                hist.append(h)
-            e=np.concatenate(hist,0).astype(np.float32)
-            e/=np.linalg.norm(e)+1e-8
-            return e
-        except Exception:
-            return None
-    def _nn(self,emb):
-        if emb is None:
-            return -1,0.0
-        best=-1;bestsim=-1.0
-        with self.lock:
-            for i,p in enumerate(self.protos):
-                sim=float(np.dot(emb,p["emb"]))
-                if sim>bestsim:
-                    bestsim=sim;best=i
-        return best,bestsim
-    def _extract_patch(self,frame,rect,nx,ny):
-        H,W=frame.shape[:2];x=int(nx*W);y=int(ny*H);sz=max(16,min(H,W)//10);x1=max(0,x-sz);y1=max(0,y-sz);x2=min(W,x+sz);y2=min(H,y+sz);return frame[y1:y2,x1:x2]
-    def add_click(self,frame,rect,nx,ny):
-        patch=self._extract_patch(frame,rect,nx,ny);emb=self._embed(patch)
-        with self.lock:
-            idx,sim=self._nn(emb)
-            if idx<0 or sim<0.8:
-                pid=self.next_id;self.next_id+=1;self.protos.append({"id":pid,"emb":emb,"count":1})
-            else:
-                pid=self.protos[idx]["id"];self.protos[idx]["emb"]=((self.protos[idx]["emb"]*self.protos[idx]["count"])+emb)/(self.protos[idx]["count"]+1e-8);self.protos[idx]["emb"]/=np.linalg.norm(self.protos[idx]["emb"])+1e-8;self.protos[idx]["count"]+=1
-        return pid
-    def add_drag(self,frame,rect,path):
-        if not path:
-            return -1
-        nx,ny=path[-1]
-        return self.add_click(frame,rect,nx,ny)
-    def update_state(self,state_text):
-        st=(state_text or "").strip()
-        if st and self.last_state and st!=self.last_state:
-            key=(self.last_state,"*")
-            self.transitions[key]=self.transitions.get(key,0)+1
-        if st:
-            self.last_state=st
-    def matrix(self):
-        with self.lock:
-            if not self.protos:
-                return None,{}
-            M=np.stack([p["emb"] for p in self.protos],0).astype(np.float32)
-            ids=[p["id"] for p in self.protos]
-        T=torch.from_numpy(M)
-        T=T/torch.clamp(T.norm(dim=1,keepdim=True),min=1e-6)
-        id2idx={pid:i for i,pid in enumerate(ids)}
-        return T.to(device),id2idx
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+except:
+    pass
+style.configure("App.TFrame", background="#020617")
+style.configure("Card.TLabelframe", background="#020617", foreground="#e5e7eb", padding=12, borderwidth=1, relief="solid")
+style.configure("Card.TLabelframe.Label", background="#020617", foreground="#9ca3af")
+style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"), foreground="#f9fafb", background="#020617")
+style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#9ca3af", background="#020617")
+style.configure("Status.TLabel", font=("Segoe UI", 10), foreground="#e5e7eb", background="#020617")
+style.configure("Metric.TLabel", font=("Consolas", 10), foreground="#a5b4fc", background="#020617")
+style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+style.map("Accent.TButton", background=[("disabled", "#1e293b"), ("!disabled", "#38bdf8"), ("active", "#0ea5e9")], foreground=[("disabled", "#64748b"), ("!disabled", "#020617")])
+style.configure("TLabel", background="#020617", foreground="#e5e7eb", padding=2)
+style.configure("TFrame", background="#020617", padding=2)
+style.configure("TLabelframe", background="#020617", padding=8)
+style.configure("Horizontal.TProgressbar", troughcolor="#020617")
 
-class ActionTemplateLibrary:
-    def __init__(self,dim=64,max_k=32):
-        self.dim=int(dim)
-        self.max_k=int(max_k)
-        self.next_id=1
-        self.templates=[]
-        self.lock=threading.Lock()
-    def _resample(self,path,L=32):
-        if not path or len(path)<2:
-            return np.zeros((L,2),dtype=np.float32)
-        pts=np.array(path,dtype=np.float32)
-        d=np.sqrt(((pts[1:]-pts[:-1])**2).sum(1))+1e-6
-        s=np.concatenate([[0.0],np.cumsum(d)])
-        t=np.linspace(0.0,s[-1],L)
-        x=np.interp(t,s,pts[:,0])
-        y=np.interp(t,s,pts[:,1])
-        return np.stack([x,y],1)
-    def _quad(self,p0,p1,p2,t):
-        return (1-t)**2*p0+2*(1-t)*t*p1+t**2*p2
-    def _bezier_feat(self,path):
-        L=32
-        pts=self._resample(path,max(8,L//2+1))
-        mid=pts[len(pts)//2]
-        p0=pts[0];p2=pts[-1]
-        c1=2*mid-0.5*(p0+p2)
-        t=np.linspace(0,1,L//2,endpoint=False)
-        seg1=self._quad(p0,c1,(p0+mid)/2.0,t)
-        seg2=self._quad((p0+mid)/2.0,c1,p2,t)
-        curve=np.vstack([seg1,seg2])
-        dv=np.diff(np.vstack([curve[:1],curve]),axis=0)
-        feat=dv.reshape(-1)
-        if feat.shape[0]<self.dim:
-            feat=np.pad(feat,(0,self.dim-feat.shape[0]))
-        return feat[:self.dim].astype(np.float32),curve.astype(np.float32)
-    def _dtw(self,a,b):
-        n=len(a);m=len(b)
-        D=np.full((n+1,m+1),1e9,dtype=np.float32);D[0,0]=0.0
-        for i in range(1,n+1):
-            for j in range(1,m+1):
-                cost=np.linalg.norm(a[i-1]-b[j-1])
-                D[i,j]=cost+min(D[i-1,j],D[i,j-1],D[i-1,j-1])
-        return float(D[n,m])
-    def add_path(self,path):
-        feat,curve=self._bezier_feat(path)
-        with self.lock:
-            if not self.templates:
-                tid=self.next_id;self.next_id+=1
-                self.templates.append({"id":tid,"mean":feat.copy(),"var":np.ones_like(feat)*0.1,"count":1,"curve":curve})
-                return tid
-            best_id=None;best_score=None;best_idx=-1
-            for i,tpl in enumerate(self.templates):
-                pw=np.maximum(tpl["var"],1e-3)
-                ll=-0.5*np.sum((feat-tpl["mean"])**2/pw)-0.5*np.sum(np.log(pw+1e-6))
-                try:
-                    d=self._dtw(curve,tpl["curve"])
-                except Exception:
-                    d=0.0
-                s=ll-0.1*d
-                if best_score is None or s>best_score:
-                    best_score=s;best_id=tpl["id"];best_idx=i
-            if best_score is None or best_score<-50.0 or len(self.templates)<self.max_k and random.random()<0.2:
-                tid=self.next_id;self.next_id+=1
-                self.templates.append({"id":tid,"mean":feat.copy(),"var":np.ones_like(feat)*0.1,"count":1,"curve":curve})
-                return tid
-            tpl=self.templates[best_idx];c=tpl["count"]
-            new_mean=(tpl["mean"]*c+feat)/(c+1.0)
-            new_var=0.9*tpl["var"]+0.1*np.square(feat-new_mean)
-            tpl["mean"]=new_mean;tpl["var"]=new_var;tpl["count"]=c+1;tpl["curve"]=0.8*tpl["curve"]+0.2*curve
-            return best_id
-    def matrix(self):
-        with self.lock:
-            if not self.templates:
-                return None,{}
-            M=np.stack([t["mean"] for t in self.templates],0).astype(np.float32)
-            ids=[t["id"] for t in self.templates]
-        T=torch.from_numpy(M)
-        T=T/torch.clamp(T.norm(dim=1,keepdim=True),min=1e-6)
-        id2idx={tid:i for i,tid in enumerate(ids)}
-        return T.to(device),id2idx
-class ExperienceWriter:
-    def __init__(self,root_dir,max_bytes=8589934592):
-        self.root_dir=root_dir
-        self.learn_dir=os.path.join(root_dir,"learn")
-        self.train_dir=os.path.join(root_dir,"train")
-        os.makedirs(self.learn_dir,exist_ok=True)
-        os.makedirs(self.train_dir,exist_ok=True)
-        self.lock=threading.Lock()
-        self.max_bytes=int(max_bytes)
-        self.latest_learn=os.path.join(root_dir,"latest_learn.jpg")
-        self.latest_train=os.path.join(root_dir,"latest_train.jpg")
-    def _subdir(self,base,ts_ms):
-        dt=datetime.datetime.fromtimestamp(ts_ms/1000.0)
-        d=os.path.join(base,dt.strftime("%Y%m%d"),dt.strftime("%H"))
-        os.makedirs(d,exist_ok=True)
-        return d
-    def _ensure_quota(self):
-        try:
-            total=0
-            files=[]
-            for root,_,fns in os.walk(self.root_dir):
-                for fn in fns:
-                    if fn.endswith(".npz") or fn.endswith(".jpg"):
-                        p=os.path.join(root,fn)
-                        if p in (self.latest_learn,self.latest_train):
-                            continue
-                        try:
-                            s=os.path.getsize(p)
-                            total+=s
-                            files.append((p,os.path.getmtime(p),s))
-                        except Exception:
-                            pass
-            if total>self.max_bytes:
-                files.sort(key=lambda x:x[1])
-                i=0
-                while total>self.max_bytes and i<len(files):
-                    p,_,s=files[i]
-                    try:
-                        os.remove(p)
-                        total-=s
-                    except Exception:
-                        pass
-                    i+=1
-        except Exception:
-            pass
-    def record(self,frame,action,pos,source,rect,title,mode,event="",extra=None):
-        if frame is None or rect is None:
-            return
-        arr=np.asarray(frame,dtype=np.uint8)
-        norm_action=[float(action[0]),float(action[1]),float(action[2])]
-        if isinstance(pos,(list,tuple)) and len(pos)==2:
-            norm_pos=[float(pos[0]),float(pos[1])]
-        else:
-            norm_pos=[0.0,0.0]
-        data={"time":int(time.time()*1000),"action":norm_action,"pos":norm_pos,"source":int(source),"rect":[int(rect[0]),int(rect[1]),int(rect[2]),int(rect[3])],"window":title or "","mode":mode,"event":event,"extra":extra if extra is not None else {}}
-        base=self.learn_dir if int(source)==1 else self.train_dir
-        target_dir=self._subdir(base,data["time"])
-        os.makedirs(target_dir,exist_ok=True)
-        name=os.path.join(target_dir,f"{data['time']}_{int(source)}.npz")
-        with self.lock:
-            try:
-                ok,buf=cv2.imencode(".jpg",arr,[int(cv2.IMWRITE_JPEG_QUALITY),90])
-                if ok:
-                    np.savez_compressed(name,frame_jpg=buf,meta=json.dumps(data,ensure_ascii=False))
-                    jpg_bytes=buf.tobytes()
-                    try:
-                        jpg_path=name.replace(".npz",".jpg")
-                        with open(jpg_path,"wb") as jf:
-                            jf.write(jpg_bytes)
-                        preview_path=self.latest_learn if int(source)==1 else self.latest_train
-                        with open(preview_path,"wb") as pf:
-                            pf.write(jpg_bytes)
-                    except Exception:
-                        pass
-                else:
-                    np.savez_compressed(name,frame=arr,meta=json.dumps(data,ensure_ascii=False))
-                self._ensure_quota()
-            except Exception:
-                pass
-class ReplayBuffer:
-    def __init__(self,cap=50000,target_size=(256,256)):
-        self.cap=cap
-        self.data=[]
-        self.lock=threading.Lock()
-        self.target_size=target_size
-    def _format_frame(self,frame):
-        tw,th=self.target_size
-        if not isinstance(frame,np.ndarray):
-            frame=np.zeros((th,tw,3),np.uint8)
-        if frame.ndim!=3 or frame.size==0:
-            return np.zeros((th,tw,3),np.uint8)
-        if frame.shape[2]>3:
-            frame=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
-        h,w=frame.shape[:2]
-        if h<=0 or w<=0:
-            return np.zeros((th,tw,3),np.uint8)
-        if frame.dtype!=np.uint8:
-            frame=np.clip(frame,0,255).astype(np.uint8)
-        scale=min(float(tw)/float(w),float(th)/float(h))
-        nw=max(1,int(round(w*scale)))
-        nh=max(1,int(round(h*scale)))
-        resized=cv2.resize(frame,(nw,nh))
-        canvas=np.zeros((th,tw,3),np.uint8)
-        top=max(0,(th-nh)//2)
-        left=max(0,(tw-nw)//2)
-        canvas[top:top+nh,left:left+nw]=resized
-        return canvas
-    def add(self,frame,action,source,event_id=0,atype=0,ctrl=-1,txt=""):
-        formatted=self._format_frame(frame)
-        with self.lock:
-            if len(self.data)>=self.cap:
-                self.data.pop(0)
-            self.data.append((formatted,np.array(action,dtype=np.float32),int(source),int(event_id),int(atype),int(ctrl),str(txt)))
-    def size(self):
-        with self.lock:
-            return len(self.data)
-    def clear(self):
-        with self.lock:
-            self.data.clear()
-    def sample(self,batch,seq=4):
-        with self.lock:
-            if len(self.data)<seq+batch:
-                return None
-            idx=[random.randint(0,len(self.data)-seq) for _ in range(batch)]
-            frames=[];actions=[];sources=[];events=[];atypes=[];ctrls=[];txts=[]
-            for i in idx:
-                seq_frames=[self.data[i+j][0] for j in range(seq)]
-                frames.append(np.stack(seq_frames,0))
-                actions.append(self.data[i+seq-1][1])
-                sources.append(self.data[i+seq-1][2])
-                events.append(self.data[i+seq-1][3])
-                atypes.append(self.data[i+seq-1][4])
-                ctrls.append(self.data[i+seq-1][5])
-                txts.append(self.data[i+seq-1][6])
-            return np.stack(frames,0),np.stack(actions,0),np.array(sources),np.array(events),np.array(atypes),np.array(ctrls),txts
-class DiskExperienceDataset(torch.utils.data.Dataset):
-    def __init__(self,root_dir,seq=4,aug=True):
-        self.files=[]
-        for sub in ("learn","train"):
-            d=os.path.join(root_dir,sub)
-            if os.path.isdir(d):
-                for root,_,fns in os.walk(d):
-                    for fn in fns:
-                        if fn.endswith(".npz"):
-                            self.files.append(os.path.join(root,fn))
-        self.files.sort()
-        self.real_count=len(self.files)
-        self.seq=seq
-        self.aug=aug
-        self.target_size=(256,256)
-    def __len__(self):
-        return max(1,len(self.files))
-    def has_samples(self):
-        return self.real_count>0
-    def _aug(self,img):
-        if not self.aug:
-            return img
-        h,w=img.shape[:2]
-        sx=int(w*0.9)
-        sy=int(h*0.9)
-        x=random.randint(0,max(0,w-sx))
-        y=random.randint(0,max(0,h-sy))
-        img=img[y:y+sy,x:x+sx]
-        img=cv2.resize(img,(w,h))
-        if random.random()<0.5:
-            img=cv2.flip(img,1)
-        if random.random()<0.5:
-            img=cv2.GaussianBlur(img,(3,3),0)
-        if random.random()<0.5:
-            g=random.uniform(0.9,1.1);b=random.uniform(-10,10)
-            img=np.clip(img.astype(np.float32)*g+b,0,255).astype(np.uint8)
-        return img
-    def _prepare_frame(self,img):
-        tw,th=self.target_size
-        if not isinstance(img,np.ndarray) or img.ndim!=3 or img.size==0:
-            return np.zeros((th,tw,3),np.uint8)
-        h,w=img.shape[:2]
-        if h<=0 or w<=0:
-            return np.zeros((th,tw,3),np.uint8)
-        scale=min(float(tw)/float(w),float(th)/float(h))
-        nw=max(1,int(round(w*scale)))
-        nh=max(1,int(round(h*scale)))
-        resized=cv2.resize(img,(nw,nh))
-        canvas=np.zeros((th,tw,3),np.uint8)
-        top=max(0,(th-nh)//2)
-        left=max(0,(tw-nw)//2)
-        canvas[top:top+nh,left:left+nw]=resized
-        return canvas
-    def _encode_path(self,extra):
-        if not isinstance(extra,dict):
-            return np.zeros((64,),np.float32)
-        path=extra.get("path",[])
-        if not path:
-            return np.zeros((64,),np.float32)
-        pts=np.array(path,dtype=np.float32)
-        pts=np.clip(pts,0.0,1.0)
-        if len(pts)<2:
-            pts=np.vstack([pts,pts])
-        L=32
-        idxs=np.linspace(0,len(pts)-1,L).astype(np.int32)
-        smp=pts[idxs]
-        smp=np.diff(np.vstack([smp[:1],smp]),axis=0)
-        vec=smp.reshape(-1)
-        if vec.shape[0]<64:
-            pad=np.zeros((64-vec.shape[0],),np.float32)
-            vec=np.concatenate([vec,pad],0)
-        return vec.astype(np.float32)[:64]
-    def __getitem__(self,idx):
-        if len(self.files)==0:
-            blank=np.zeros((256,256,3),np.uint8)
-            seq=np.stack([blank]*self.seq,0)
-            act=np.zeros(3,np.float32)
-            return seq,act,np.array(0,dtype=np.int64),np.array(-1,dtype=np.int64),np.array(-1,dtype=np.int64),np.zeros((64,),np.float32),"",0
-        i=random.randint(0,len(self.files)-1)
-        try:
-            arr=np.load(self.files[i],allow_pickle=True)
-            if "frame_jpg" in arr.files:
-                frame=cv2.imdecode(arr["frame_jpg"],cv2.IMREAD_COLOR)
-            else:
-                frame=arr["frame"]
-            frame=self._prepare_frame(frame)
-            meta=json.loads(str(arr["meta"]))
-            act=np.array(meta.get("action",[0,0,0]),dtype=np.float32)
-            ev=str(meta.get("event",""))
-            extra=meta.get("extra",{})
-            atype=0
-            if ev=="press":
-                atype=1
-            elif ev=="drag":
-                atype=2
-            ctrl=int(extra.get("proto",-1)) if isinstance(extra,dict) else -1
-            tmpl=int(extra.get("tmpl",-1)) if isinstance(extra,dict) else -1
-            path_vec=self._encode_path(extra)
-            text=str(meta.get("event_text",""))
-            success=1 if any(k in text.lower() for k in ["win","victory","success","complete"]) else 0
-        except Exception:
-            frame=self._prepare_frame(None);act=np.zeros(3,np.float32);atype=0;ctrl=-1;tmpl=-1;path_vec=np.zeros((64,),np.float32);text="";success=0
-        seq=np.stack([self._aug(frame.copy()) for _ in range(self.seq)],0)
-        return seq,act,np.array(atype,dtype=np.int64),np.array(ctrl,dtype=np.int64),np.array(tmpl,dtype=np.int64),path_vec,text,success
-class Encoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv=nn.Sequential(nn.Conv2d(12,32,5,2,2),nn.ReLU(),nn.Conv2d(32,64,3,2,1),nn.ReLU(),nn.Conv2d(64,128,3,2,1),nn.ReLU(),nn.AdaptiveAvgPool2d((8,8)))
-        self.fc=nn.Linear(128*8*8,256)
-    def forward(self,x):
-        b,t,c,h,w=x.shape
-        x=x.reshape(b,t*c,h,w)
-        x=self.conv(x)
-        x=x.view(b,-1)
-        return torch.tanh(self.fc(x))
+window_label_var = tk.StringVar()
+visible_label_var = tk.StringVar()
+size_label_var = tk.StringVar()
+fps_label_var = tk.StringVar()
+cpu_label_var = tk.StringVar()
+mem_label_var = tk.StringVar()
+gpu_label_var = tk.StringVar()
+vram_label_var = tk.StringVar()
+mode_label_var = tk.StringVar(value="模式: 初始化")
+progress_label_var = tk.StringVar()
+
+main_frame = ttk.Frame(root, style="App.TFrame")
+main_frame.pack(fill="both", expand=True, padx=14, pady=14)
+
+header_frame = ttk.Frame(main_frame, style="App.TFrame")
+header_frame.pack(fill="x", pady=(0, 10))
+title_label = ttk.Label(header_frame, text="GameAI 窗口智能助手", style="Title.TLabel")
+title_label.pack(side="left", anchor="w")
+mode_label = ttk.Label(header_frame, textvariable=mode_label_var, style="Status.TLabel")
+mode_label.pack(side="right", anchor="e")
+subtitle_label = ttk.Label(main_frame, text="学习 / 训练 / 优化 一体化控制面板", style="Subtitle.TLabel")
+subtitle_label.pack(fill="x", pady=(0, 10))
+
+status_frame = ttk.LabelFrame(main_frame, text="窗口与性能状态", style="Card.TLabelframe")
+status_frame.pack(fill="x", pady=(0, 10))
+
+status_left = ttk.Frame(status_frame, style="App.TFrame")
+status_left.pack(side="left", fill="x", expand=True, padx=(0, 6))
+status_right = ttk.Frame(status_frame, style="App.TFrame")
+status_right.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+window_label = ttk.Label(status_left, textvariable=window_label_var, style="Status.TLabel")
+window_label.pack(anchor="w")
+visible_label = ttk.Label(status_left, textvariable=visible_label_var, style="Status.TLabel")
+visible_label.pack(anchor="w")
+size_label = ttk.Label(status_left, textvariable=size_label_var, style="Status.TLabel")
+size_label.pack(anchor="w")
+fps_label = ttk.Label(status_left, textvariable=fps_label_var, style="Status.TLabel")
+fps_label.pack(anchor="w")
+
+cpu_label = ttk.Label(status_right, textvariable=cpu_label_var, style="Metric.TLabel")
+cpu_label.pack(anchor="w")
+mem_label = ttk.Label(status_right, textvariable=mem_label_var, style="Metric.TLabel")
+mem_label.pack(anchor="w")
+gpu_label = ttk.Label(status_right, textvariable=gpu_label_var, style="Metric.TLabel")
+gpu_label.pack(anchor="w")
+vram_label = ttk.Label(status_right, textvariable=vram_label_var, style="Metric.TLabel")
+vram_label.pack(anchor="w")
+
+controls_frame = ttk.LabelFrame(main_frame, text="控制与训练", style="Card.TLabelframe")
+controls_frame.pack(fill="x", pady=(0, 10))
+
+btn_frame = ttk.Frame(controls_frame, style="App.TFrame")
+btn_frame.pack(fill="x", pady=(4, 4))
+
+select_btn = ttk.Button(btn_frame, text="选择窗口", style="Accent.TButton")
+sleep_btn = ttk.Button(btn_frame, text="Sleep", style="Accent.TButton")
+getup_btn = ttk.Button(btn_frame, text="Get Up", style="Accent.TButton")
+recognize_btn = ttk.Button(btn_frame, text="识别", style="Accent.TButton")
+select_btn.pack(side="left", padx=(0, 8))
+sleep_btn.pack(side="left", padx=8)
+getup_btn.pack(side="left", padx=8)
+recognize_btn.pack(side="left", padx=8)
+sleep_btn.state(["disabled"])
+getup_btn.state(["disabled"])
+recognize_btn.state(["disabled"])
+
+progress_frame = ttk.Frame(controls_frame, style="App.TFrame")
+progress_frame.pack(fill="x", pady=(4, 4))
+progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", maximum=100)
+progress_bar.pack(fill="x", padx=2, pady=(0, 4))
+progress_text_label = ttk.Label(progress_frame, textvariable=progress_label_var, style="Status.TLabel")
+progress_text_label.pack(anchor="w")
+
+preview_frame = ttk.LabelFrame(main_frame, text="窗口 A 画面", style="Card.TLabelframe")
+preview_frame.pack(fill="both", expand=True)
+canvas = tk.Label(preview_frame, bg="#000000", bd=0, highlightthickness=0)
+canvas.pack(fill="both", expand=True, padx=6, pady=6)
+canvas_image_ref = None
+
+numbers_frame = ttk.LabelFrame(main_frame, text="数值列表", style="Card.TLabelframe")
+numbers_frame.pack(fill="x", pady=(10, 0))
+numbers_canvas = tk.Canvas(numbers_frame, bg="#020617", highlightthickness=0, borderwidth=0, height=140)
+numbers_scrollbar = ttk.Scrollbar(numbers_frame, orient="vertical", command=numbers_canvas.yview)
+numbers_inner = ttk.Frame(numbers_canvas, style="App.TFrame")
+numbers_canvas.create_window((0, 0), window=numbers_inner, anchor="nw")
+numbers_canvas.configure(yscrollcommand=numbers_scrollbar.set)
+numbers_canvas.pack(side="left", fill="both", expand=True)
+numbers_scrollbar.pack(side="right", fill="y")
+numbers_inner.bind("<Configure>", lambda e: numbers_canvas.configure(scrollregion=numbers_canvas.bbox("all")))
+number_row_widgets = []
+
 class PolicyNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder=Encoder()
-        self.policy=nn.Sequential(nn.Linear(256,128),nn.ReLU(),nn.Linear(128,3))
-        self.value=nn.Sequential(nn.Linear(256,128),nn.ReLU(),nn.Linear(128,1))
-        self.atype=nn.Sequential(nn.Linear(256,128),nn.ReLU(),nn.Linear(128,3))
-        self.elem=nn.Linear(256,128)
-        self.path_head=nn.Sequential(nn.Linear(256,128),nn.ReLU(),nn.Linear(128,64))
-    def forward(self,x):
-        emb=self.encoder(x)
-        logits=self.policy(emb)
-        value=self.value(emb).squeeze(-1)
-        atype_logits=self.atype(emb)
-        elem_emb=F.normalize(self.elem(emb),dim=1)
-        path_pred=self.path_head(emb)
-        dx=torch.tanh(logits[:,0])
-        dy=torch.tanh(logits[:,1])
-        click=torch.sigmoid(logits[:,2])
-        return torch.stack([dx,dy,click],1),value,atype_logits,elem_emb,path_pred
-class ModelSpec:
-    def __init__(self,name,path,generator,validator=None):
-        self.name=name
-        self.path=path
-        self.generator=generator
-        self.validator=validator
-class ModelManager:
-    def __init__(self,app):
-        self.app=app
-        self.specs=[ModelSpec("resnet18",resnet_path,_resnet_stub_generator,_validate_resnet_stub),ModelSpec("yolo12n",yolo_path,_yolo_stub_generator,_validate_yolo_stub),ModelSpec("sam_vit_b",sam_path,_sam_stub_generator,_validate_sam_stub)]
-    def ensure(self):
-        threading.Thread(target=self._worker,daemon=True).start()
-    def _worker(self):
-        for spec in self.specs:
-            if os.path.exists(spec.path):
-                if spec.validator and not spec.validator(spec.path):
-                    try:
-                        os.remove(spec.path)
-                    except Exception:
-                        pass
-                if os.path.exists(spec.path):
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=8, stride=4, padding=2),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU()
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 10 * 10, 256),
+            nn.ReLU()
+        )
+        self.grid_h = 21
+        self.grid_w = 21
+        self.action_head = nn.Linear(256, 3)
+        self.control_head = nn.Linear(256, self.grid_h * self.grid_w)
+        self.rule_head = nn.Linear(256, 4)
+
+    def forward(self, x):
+        x = x.float() / 255.0
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        action = self.action_head(x)
+        control_logits = self.control_head(x).view(-1, 1, self.grid_h, self.grid_w)
+        rule_logits = self.rule_head(x)
+        pos = torch.tanh(action[:, :2])
+        click_logit = action[:, 2]
+        return pos, click_logit, control_logits, rule_logits
+
+
+class ExperienceDataset(Dataset):
+    def __init__(self, directory):
+        self.samples = []
+        for name in os.listdir(directory):
+            if name.endswith(".pt") and name.startswith("experience_"):
+                path = os.path.join(directory, name)
+                try:
+                    data = torch.load(path, map_location="cpu")
+                    obs = data.get("obs")
+                    act = data.get("act")
+                    src = data.get("src")
+                    if obs is not None and act is not None:
+                        n = obs.shape[0]
+                        for i in range(n):
+                            self.samples.append((obs[i], act[i], 0 if src is None else int(src[i])))
+                except:
                     continue
-            if not self.app.running:
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        o, a, s = self.samples[idx]
+        return o, a, s
+
+def ensure_model_exists():
+    global policy_model, experience_file_index
+    for name in os.listdir(experience_dir):
+        if name.startswith("experience_") and name.endswith(".pt"):
+            try:
+                idx = int(name[len("experience_"):-3])
+                if idx >= experience_file_index:
+                    experience_file_index = idx + 1
+            except:
+                continue
+    model_files = []
+    try:
+        for name in os.listdir(models_dir):
+            if name.endswith(".pt"):
+                model_files.append(os.path.join(models_dir, name))
+    except:
+        model_files = []
+    state = None
+    if model_files:
+        try:
+            model_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        except:
+            pass
+        for path in model_files:
+            try:
+                state = torch.load(path, map_location="cpu")
                 break
-            if not spec.generator:
+            except:
                 continue
-            def start_task(name=spec.name,path=spec.path):
-                self.app.start_generation_ui(name,os.path.basename(path),0.0)
-            self.app.schedule(start_task)
-            def reporter(percent,message="",name=spec.name):
-                self.app.schedule(lambda n=name,p=percent,msg=message:self.app.update_generation_ui(n,p,msg))
-            try:
-                ok=bool(spec.generator(spec.path,reporter))
-            except Exception as e:
-                msg=str(e)
-                self.app.schedule(lambda n=spec.name,m=msg:self.app.generation_failed_ui(n,m))
-                continue
-            if not ok or (spec.validator and not spec.validator(spec.path)):
-                self.app.schedule(lambda n=spec.name:self.app.generation_failed_ui(n,"校验失败"))
-                continue
-            self.app.reload_perception()
-            self.app.schedule(lambda:self.app.update_model_ready_ui())
-            self.app.schedule(lambda:self.app.finish_generation_ui())
-            self.app.schedule(lambda n=spec.name:self.app.notify_generation_success(n))
-class PerceptionEngine:
-    def __init__(self):
-        self.last_text=""
-        self.resnet_data=_load_stub_data(resnet_path) or {}
-        self.yolo_data=_load_stub_data(yolo_path) or {}
-        self.sam_data=_load_stub_data(sam_path) or {}
+    model = PolicyNet()
+    if state is not None:
         try:
-            import pytesseract
-            self.ocr=pytesseract
-        except Exception:
-            self.ocr=None
-    def detect(self,frame):
-        H,W=frame.shape[:2]
-        dets=[]
-        anchors=self.yolo_data.get("meta",{}).get("anchors",[]) if isinstance(self.yolo_data,dict) else []
-        bias=float(self.yolo_data.get("meta",{}).get("score_bias",0.35)) if isinstance(self.yolo_data,dict) else 0.35
-        smooth=float(((self.resnet_data.get("meta",{}).get("stats",{}).get("embedding_std",0.5) if isinstance(self.resnet_data,dict) else 0.5))*4.0)
-        blur=max(1,int(abs(smooth)))
-        if blur%2==0:
-            blur+=1
-        gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-        if blur>1:
-            gray=cv2.GaussianBlur(gray,(blur,blur),0)
-        edges=cv2.Canny(gray,40,120)
-        kernel_size=int(self.sam_data.get("meta",{}).get("mask_kernel",3) if isinstance(self.sam_data,dict) else 3)
-        if kernel_size%2==0:
-            kernel_size+=1
-        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(kernel_size,kernel_size))
-        edges=cv2.dilate(edges,kernel,iterations=1)
-        cnts,_=cv2.findContours(edges,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            x,y,w,h=cv2.boundingRect(c)
-            area=w*h
-            if area<1200:
-                continue
-            if anchors:
-                best=min(anchors,key=lambda a:abs(a[0]-w)+abs(a[1]-h))
-                diff=abs(best[0]-w)/max(best[0],1)+abs(best[1]-h)/max(best[1],1)
-                score=max(0.0,1.0-0.5*diff)
-            else:
-                score=min(0.9,0.2+area/(W*H+1e-6))
-            if score>bias:
-                dets.append({"bbox":[x,y,x+w,y+h],"score":float(score),"label":"stub"})
-        txt=""
-        if self.ocr is not None:
-            try:
-                rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);txt=self.ocr.image_to_string(rgb,lang="eng")
-            except Exception:
-                txt=""
-        else:
-            try:
-                gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY);thr=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-                cnts,_=cv2.findContours(thr,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE);numbers=0
-                for c in cnts:
-                    x,y,w,h=cv2.boundingRect(c)
-                    if 8<w<80 and 12<h<80 and w*h<2000:
-                        numbers+=1
-                txt=f"NUM:{numbers}"
-            except Exception:
-                txt=""
-        self.last_text=txt.strip()
-        out=[]
-        for d in dets[:20]:
-            x1,y1,x2,y2=d["bbox"];cx=(x1+x2)/2/W;cy=(y1+y2)/2/H
-            out.append((cx,cy,d.get("label","0"),d.get("score",0.0)))
-        return out,txt
-
-class StateGraph:
-    def __init__(self):
-        self.nodes=set()
-        self.edges={} 
-        self.last_state=None
-        self.pending=None
-    def _normalize(self,txt):
-        if not txt: return "EMPTY|0"
-        t=str(txt).lower()
-        nums=[int(x) for x in re.findall(r"\d+",t)]
-        score=nums[-1] if nums else 0
-        if score<10:b="0-9"
-        elif score<50:b="10-49"
-        elif score<100:b="50-99"
-        else:b="100+"
-        return f"{t[:64]}|{b}"
-    def observe(self,txt):
-        s=self._normalize(txt)
-        self.nodes.add(s)
-        if self.pending is not None:
-            prev,action=self.pending
-            self.edges.setdefault(prev,{}).setdefault(action,{})
-            self.edges[prev][action][s]=self.edges[prev][action].get(s,0)+1
-            self.pending=None
-        self.last_state=s
-    def note_action(self,txt,ctrl,atype):
-        s=self._normalize(txt)
-        self.nodes.add(s)
-        self.pending=(s,(int(ctrl),int(atype)))
-    def reachability(self,ctrl):
-        ctrl=int(ctrl)
-        good=set([n for n in self.nodes if n.endswith("100+")])
-        if not good: return 0.0
-        dist={n:(0 if n in good else 1e9) for n in self.nodes}
-        for _ in range(3):
-            updated=False
-            for u,acts in self.edges.items():
-                for (c,a),vs in acts.items():
-                    if c!=ctrl: continue
-                    for v,w in vs.items():
-                        if dist[v]+1<dist[u]:
-                            dist[u]=dist[v]+1;updated=True
-            if not updated: break
-        cur=self.last_state or next(iter(self.nodes)) if self.nodes else None
-        if cur is None: return 0.0
-        d=dist.get(cur,1e9)
-        if d>=1e9: return 0.0
-        return max(0.0,1.0/(1.0+d))
-class GoalGraph:
-    def __init__(self):
-        self.lock=threading.Lock()
-        self.events=[]
-        self.proto_success={}
-        self.proto_counts={}
-        self.last_score=None
-    def _extract_score(self,txt):
-        try:
-            nums=[int(x) for x in re.findall(r"\d+",txt)]
-            return max(nums) if nums else None
-        except Exception:
-            return None
-    def add(self,ts,proto_id,text,atype,path_vec):
-        score=self._extract_score(text.lower())
-        success=1 if any(k in text.lower() for k in ["win","victory","success","complete"]) else 0
-        with self.lock:
-            self.events.append((ts,proto_id,score,success,atype))
-            if proto_id is not None and proto_id>=0:
-                self.proto_counts[proto_id]=self.proto_counts.get(proto_id,0)+1
-                self.proto_success[proto_id]=self.proto_success.get(proto_id,0)+success
-    def causal_score(self,proto_id):
-        with self.lock:
-            c=self.proto_counts.get(proto_id,0)
-            if c==0:return 0.0
-            s=self.proto_success.get(proto_id,0)
-            p1=s/max(c,1)
-            p0=(sum(self.proto_success.values())-s)/max(sum(self.proto_counts.values())-c,1)
-            return float(p1-p0)
-    def granger(self,lag=1):
-        with self.lock:
-            if len(self.events)<lag+5:return {}
-            ids=list(set([e[1] for e in self.events if e[1]>=0]))
-            res={}
-            for pid in ids:
-                x=[];y=[]
-                for i in range(lag,len(self.events)):
-                    prev=self.events[i-lag];curr=self.events[i]
-                    x.append(1.0 if prev[1]==pid else 0.0)
-                    y.append(1.0 if curr[3]>0 else 0.0)
-                X=np.array(x,dtype=np.float32).reshape(-1,1);Y=np.array(y,dtype=np.float32).reshape(-1,1)
-                try:
-                    w=np.linalg.lstsq(X,Y,rcond=None)[0];res[pid]=float(w[0][0])
-                except Exception:
-                    res[pid]=0.0
-            return res
-class App:
-    def __init__(self):
-        self.root=tk.Tk()
-        self.root.title("Game AI")
-        self.colors={"bg":"#0b1120","panel":"#111c2f","accent":"#38bdf8","text":"#e2e8f0","muted":"#64748b"}
-        self.style=ttk.Style(self.root)
-        try:self.style.theme_use("clam")
-        except Exception:pass
-        self.root.configure(bg=self.colors["bg"])
-        self.font_bases={"body":10,"stats":10,"title":12,"accent":10,"muted":9,"labelframe":11}
-        self.fonts={
-            "body":tkfont.Font(family="Segoe UI",size=self.font_bases["body"]),
-            "stats":tkfont.Font(family="Segoe UI",size=self.font_bases["stats"]),
-            "title":tkfont.Font(family="Segoe UI",size=self.font_bases["title"],weight="bold"),
-            "accent":tkfont.Font(family="Segoe UI",size=self.font_bases["accent"],weight="bold"),
-            "muted":tkfont.Font(family="Segoe UI",size=self.font_bases["muted"]),
-            "labelframe":tkfont.Font(family="Segoe UI",size=self.font_bases["labelframe"],weight="bold"),
-        }
-        for s in ["TFrame","Main.TFrame","Panel.TFrame","Stats.TFrame"]:
-            self.style.configure(s,background=self.colors["panel"])
-        self.style.configure("Panel.TLabelframe",background=self.colors["panel"],foreground=self.colors["accent"],bordercolor=self.colors["panel"],lightcolor=self.colors["panel"],darkcolor=self.colors["panel"])
-        self.style.configure("Panel.TLabelframe.Label",background=self.colors["panel"],foreground=self.colors["accent"],font=self.fonts["labelframe"])
-        self.style.configure("TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=self.fonts["body"])
-        self.style.configure("Stats.TLabel",background=self.colors["panel"],foreground=self.colors["text"],font=self.fonts["stats"])
-        self.style.configure("Title.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=self.fonts["title"])
-        self.style.configure("Accent.TLabel",background=self.colors["panel"],foreground=self.colors["accent"],font=self.fonts["accent"])
-        self.style.configure("Muted.TLabel",background=self.colors["panel"],foreground=self.colors["muted"],font=self.fonts["muted"])
-        self.style.configure("Secondary.TButton",background="#1f2937",foreground=self.colors["text"],padding=6)
-        self.style.map("Secondary.TButton",background=[("active","#334155"),("disabled","#1e293b")],foreground=[("disabled","#475569")])
-        self.style.configure("Accent.TButton",background=self.colors["accent"],foreground="#0f172a",padding=6)
-        self.style.map("Accent.TButton",background=[("active","#0ea5e9"),("disabled","#1e293b")],foreground=[("disabled","#1f2937")])
-        self.style.configure("Accent.Horizontal.TProgressbar",background=self.colors["accent"],troughcolor="#1f2937",bordercolor="#1f2937",lightcolor=self.colors["accent"],darkcolor=self.colors["accent"])
-        self.style.configure("TCombobox",fieldbackground=self.colors["panel"],background=self.colors["panel"],foreground=self.colors["text"])
-        self.style.map("TCombobox",fieldbackground=[("readonly",self.colors["panel"])],foreground=[("readonly",self.colors["text"])])
-        if device!="cuda":
-            try:self.root.after(100,lambda:messagebox.showwarning("GPU不可用","未检测到可用的GPU，将使用CPU运行"))
-            except Exception:pass
-        self.root.minsize(900,600)
-        self.root.bind("<Configure>",self._on_root_resize)
-        self.ui_queue=queue.Queue()
-        self.running=True
-        self.writer=ExperienceWriter(experience_dir)
-        self.buffer=ReplayBuffer()
-        self.model=PolicyNet().to(device)
-        if os.path.exists(model_path):
-            try:self.model.load_state_dict(torch.load(model_path,map_location=device),strict=False)
-            except Exception:pass
-        self.optimizer=optim.Adam(self.model.parameters(),lr=1e-4)
-        self.capture_interval=0.05
-        self._cap_interval_ema=self.capture_interval
-        self._ai_interval_ema=0.05
-        self._paused_hysteresis=False
-        self.metrics={"cpu":0.0,"mem":0.0,"gpu":0.0,"vram":0.0,"freq":20.0,"temp":0.0,"pwr":0.0}
-        self.gpu_source="不可用"
-        self.frame=None
-        self.photo=None
-        self.frame_lock=threading.Lock()
-        self.frame_history=[]
-        self.history_lock=threading.Lock()
-        self.mode="init"
-        self.resource_paused=False
-        self.capture_enabled=False
-        self.recording_enabled=False
-        self.optimize_event=None
-        self.optimize_thread=None
-        self.ai_thread=None
-        self.ai_stop=threading.Event()
-        self.hold_state=False
-        self.ai_interval=0.05
-        self.selected_title=tk.StringVar()
-        self.window_state=tk.StringVar(value="No window")
-        self.window_size_var=tk.StringVar(value='尺寸: 未选择窗口')
-        self.visible_var=tk.StringVar(value='可见: 未检测')
-        self.full_var=tk.StringVar(value='完整: 未检测')
-        self.pause_var=tk.StringVar(value="未选择窗口，功能锁定")
-        self.mode_var=tk.StringVar(value="Init")
-        self.cpu_var=tk.StringVar(value="CPU:0.0%")
-        self.mem_var=tk.StringVar(value="Memory:0.0%")
-        self.gpu_var=tk.StringVar(value="GPU:0.0%")
-        self.vram_var=tk.StringVar(value="VRAM:0.0%")
-        self.gpu_src_var=tk.StringVar(value="GPU指标来源: 不可用")
-        self.freq_var=tk.StringVar(value="截图频率:0.0 Hz")
-        self.progress_var=tk.DoubleVar(value=0.0)
-        self.progress_text=tk.StringVar(value="0%")
-        self.progress_stage=tk.StringVar(value="")
-        self.progress_lock=threading.Lock()
-        self.progress_floor=0.0
-        self.progress_info_lock=threading.Lock()
-        self.progress_info={"active":False,"phase":"","phase_start":0.0,"done":0,"total":1,"epoch":0,"epochs":1,"step":0,"steps":1}
-        self._progress_timer_id=None
-        self._optimize_notice="优化进行中，10秒切换规则失效"
-        self._current_optimize_message=self._optimize_notice
-        self._analysis_ready_time=0.0
-        self._analysis_next_frame=None
-        self.current_model_task=None
-        self.model_task_title=""
-        self.last_user_input=time.time()
-        self.window_obj=None
-        self.window_entries=[]
-        self.window_rect=None
-        self.window_hwnd=None
-        self.window_title=""
-        self.window_visible=False
-        self.window_full=False
-        self.window_occ_state=0
-        self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
-        self.window_coverage=0.0
-        self.window_core_ratio=0.0
-        self.window_edge_ratio=0.0
-        self.window_occ_ratio=0.0
-        self.window_visible_reason='未知'
-        self.window_full_reason='未知'
-        self.last_print_frame=None
-        self.last_occl_check=0.0
-        self.status_lock=threading.Lock()
-        self.monitor_bounds=[(m.x,m.y,m.width,m.height) for m in get_monitors()]
-        self.mss_ctx=mss.mss()
-        self.cap_queue=queue.Queue(maxsize=2)
-        self.prep_queue=queue.Queue(maxsize=2)
-        self.drag_active=False
-        self.drag_points=[]
-        self.drag_start=None
-        self.capture_thread=threading.Thread(target=self._capture_loop,daemon=True)
-        self.prep_thread=threading.Thread(target=self._preprocess_loop,daemon=True)
-        self.write_thread=threading.Thread(target=self._writer_loop,daemon=True)
-        self.monitor_thread=threading.Thread(target=self._monitor_loop,daemon=True)
-        self.listener_mouse=mouse.Listener(on_move=self._on_mouse_move,on_click=self._on_mouse_click)
-        self.listener_keyboard=keyboard.Listener(on_press=self._on_key_press)
-        self.analysis_interval=0.25
-        self._analysis_limit=2
-        self._analysis_active=0
-        self._analysis_lock=threading.Lock()
-        self._last_analysis=0.0
-        self._build_ui()
-        self.model_manager=ModelManager(self)
-        self.model_manager.ensure()
-        self.capture_thread.start()
-        self.prep_thread.start()
-        self.write_thread.start()
-        self.monitor_thread.start()
-        self.listener_mouse.start()
-        self.listener_keyboard.start()
-        self.root.protocol("WM_DELETE_WINDOW",self.stop)
-        self.root.after(50,self._update_ui)
-        self.root.after(200,self._check_mode_switch)
-        self.perception=PerceptionEngine()
-        try:
-            import clip as openai_clip
-            self.clip_model,self.clip_preprocess=openai_clip.load("ViT-B/32",device=device,download_root=models_dir)
-        except Exception:
-            self.clip_model=None;self.clip_preprocess=None
-        self.pool=UIElementPool(self.clip_model,self.clip_preprocess)
-        self.templates=ActionTemplateLibrary()
-        self.rule_text=""
-        self.goal_graph=GoalGraph()
-        self.state_graph=StateGraph()
-        try:
-            if os.cpu_count():
-                torch.set_num_threads(max(1,min(os.cpu_count(),8)))
-        except Exception:
+            model.load_state_dict(state)
+        except:
             pass
-        self.root.update_idletasks()
-        self._update_font_scale()
-    def reload_perception(self):
-        try:self.perception=PerceptionEngine()
-        except Exception:pass
-    def models_ready(self):
-        return all(os.path.exists(p) for p in [resnet_path,yolo_path,sam_path])
-    def update_model_ready_ui(self):
-        try:
-            if self.models_ready():
-                self.sleep_btn.configure(state="normal" if self.window_hwnd is not None else "disabled")
-            else:
-                self.sleep_btn.configure(state="disabled")
-        except Exception:
-            pass
-    def _build_ui(self):
-        self.root.columnconfigure(0,weight=1)
-        self.root.rowconfigure(0,weight=1)
-        container=ttk.Frame(self.root,style="Main.TFrame",padding=16)
-        container.grid(row=0,column=0,sticky="nsew")
-        container.columnconfigure(0,weight=1)
-        container.rowconfigure(0,weight=0)
-        container.rowconfigure(1,weight=4)
-        container.rowconfigure(2,weight=2)
-        container.rowconfigure(3,weight=0)
-        header=ttk.Frame(container,style="Panel.TFrame")
-        header.grid(row=0,column=0,sticky="ew")
-        header.columnconfigure(1,weight=1)
-        ttk.Label(header,text="目标窗口",style="Title.TLabel").grid(row=0,column=0,sticky="w")
-        state_row=ttk.Frame(header,style="Panel.TFrame")
-        state_row.grid(row=1,column=0,columnspan=4,sticky="ew",pady=(6,0))
-        state_row.columnconfigure(0,weight=1)
-        state_row.columnconfigure(1,weight=1)
-        state_row.columnconfigure(2,weight=1)
-        state_row.columnconfigure(3,weight=1)
-        ttk.Label(state_row,textvariable=self.window_state,style="Stats.TLabel").grid(row=0,column=0,sticky="w")
-        ttk.Label(state_row,textvariable=self.visible_var,style="Stats.TLabel").grid(row=0,column=1,sticky="e")
-        ttk.Label(state_row,textvariable=self.full_var,style="Stats.TLabel").grid(row=0,column=2,sticky="e")
-        ttk.Label(state_row,textvariable=self.window_size_var,style="Stats.TLabel").grid(row=0,column=3,sticky="e")
-        control_row=ttk.Frame(header,style="Panel.TFrame")
-        control_row.grid(row=2,column=0,columnspan=4,sticky="ew",pady=(8,0))
-        control_row.columnconfigure(1,weight=1)
-        ttk.Label(control_row,text="窗口列表",style="Stats.TLabel").grid(row=0,column=0,sticky="w")
-        self.window_combo=ttk.Combobox(control_row,textvariable=self.selected_title,state="readonly")
-        self.window_combo.grid(row=0,column=1,sticky="ew",padx=(8,8))
-        ttk.Button(control_row,text="刷新",command=self.refresh_windows,style="Secondary.TButton").grid(row=0,column=2,sticky="ew")
-        ttk.Button(control_row,text="选择",command=self.select_window,style="Accent.TButton").grid(row=0,column=3,sticky="ew",padx=(8,0))
-        preview=ttk.Labelframe(container,text="窗口画面",style="Panel.TLabelframe",padding=12)
-        preview.grid(row=1,column=0,sticky="nsew",pady=(12,12))
-        preview.columnconfigure(0,weight=1)
-        preview.rowconfigure(0,weight=1)
-        self.frame_label=tk.Label(preview,background=self.colors["panel"],borderwidth=0,highlightthickness=0)
-        self.frame_label.grid(row=0,column=0,sticky="nsew")
-        bottom=ttk.Frame(container,style="Panel.TFrame")
-        bottom.grid(row=2,column=0,sticky="nsew")
-        bottom.columnconfigure(0,weight=3)
-        bottom.columnconfigure(1,weight=2)
-        bottom.rowconfigure(0,weight=1)
-        stats=ttk.Frame(bottom,style="Stats.TFrame")
-        stats.grid(row=0,column=0,sticky="nsew",padx=(0,12))
-        for i in range(3):stats.columnconfigure(i,weight=1)
-        ttk.Label(stats,textvariable=self.cpu_var,style="Stats.TLabel").grid(row=0,column=0,sticky="w")
-        ttk.Label(stats,textvariable=self.mem_var,style="Stats.TLabel").grid(row=0,column=1,sticky="w")
-        ttk.Label(stats,textvariable=self.gpu_var,style="Stats.TLabel").grid(row=0,column=2,sticky="w")
-        ttk.Label(stats,textvariable=self.vram_var,style="Stats.TLabel").grid(row=1,column=0,sticky="w",pady=(6,0))
-        ttk.Label(stats,textvariable=self.gpu_src_var,style="Muted.TLabel").grid(row=1,column=1,sticky="w",pady=(6,0))
-        ttk.Label(stats,textvariable=self.freq_var,style="Accent.TLabel").grid(row=1,column=2,sticky="e",pady=(6,0))
-        control=ttk.Labelframe(bottom,text="AI 控制",style="Panel.TLabelframe",padding=12)
-        control.grid(row=0,column=1,sticky="nsew")
-        control.columnconfigure(0,weight=1)
-        control.columnconfigure(1,weight=1)
-        ttk.Label(control,textvariable=self.mode_var,style="Title.TLabel").grid(row=0,column=0,columnspan=2,sticky="w")
-        self.sleep_btn=ttk.Button(control,text="Sleep",command=self.on_sleep,state="disabled",style="Accent.TButton")
-        self.sleep_btn.grid(row=1,column=0,sticky="ew",pady=(10,0))
-        self.getup_btn=ttk.Button(control,text="Get Up",command=self.on_getup,state="disabled",style="Secondary.TButton")
-        self.getup_btn.grid(row=1,column=1,sticky="ew",padx=(10,0),pady=(10,0))
-        prog_row=ttk.Frame(control,style="Panel.TFrame")
-        prog_row.grid(row=2,column=0,columnspan=2,sticky="ew",pady=(12,0))
-        prog_row.columnconfigure(0,weight=1)
-        self.progress=ttk.Progressbar(prog_row,variable=self.progress_var,maximum=100,style="Accent.Horizontal.TProgressbar")
-        self.progress.grid(row=0,column=0,sticky="ew")
-        ttk.Label(prog_row,textvariable=self.progress_text,style="Accent.TLabel",width=6).grid(row=0,column=1,sticky="e",padx=(8,0))
-        ttk.Label(prog_row,textvariable=self.progress_stage,style="Muted.TLabel").grid(row=1,column=0,columnspan=2,sticky="w",pady=(6,0))
-        footer=ttk.Frame(container,style="Panel.TFrame")
-        footer.grid(row=3,column=0,sticky="ew",pady=(10,0))
-        footer.columnconfigure(0,weight=1)
-        ttk.Label(footer,textvariable=self.pause_var,style="Muted.TLabel",anchor="w").grid(row=0,column=0,sticky="ew")
-        self.refresh_windows()
-    def _update_font_scale(self):
-        try:
-            w=max(1,self.root.winfo_width())
-            h=max(1,self.root.winfo_height())
-        except Exception:
-            w=900
-            h=600
-        scale=min(max(w/1100.0,0.75),max(h/650.0,0.75))
-        scale=min(scale,1.6)
-        for key,font in self.fonts.items():
-            base=self.font_bases.get(key,10)
-            new_size=max(8,int(round(base*scale)))
-            if font.cget("size")!=new_size:
-                font.configure(size=new_size)
-    def _on_root_resize(self,event):
-        if event.widget is self.root:
-            self._update_font_scale()
-    def _format_speed(self,speed):
-        try:
-            v=float(speed)
-            units=["B/s","KB/s","MB/s","GB/s"]
-            idx=0
-            while v>=1024.0 and idx<len(units)-1:
-                v/=1024.0
-                idx+=1
-            return f"{v:.1f} {units[idx]}" if v>0 else "0 B/s"
-        except Exception:
-            return "0 B/s"
-    def _set_progress_ui(self,value):
-        v=max(0.0,min(100.0,float(value)))
-        self.progress_var.set(v)
-        self.progress_text.set(f"{v:.0f}%")
-        with self.progress_lock:
-            if v<=0.0:
-                self.progress_floor=0.0
-            elif v>self.progress_floor:
-                self.progress_floor=v
+    try:
+        torch.save(model.state_dict(), model_path)
+    except:
+        pass
+    model.eval()
+    policy_model = model
 
-    def _start_progress_monitor(self,total,epochs,steps):
-        with self.progress_info_lock:
-            self.progress_info={"active":True,"phase":"准备数据","phase_start":time.time(),"done":0,"total":max(1,int(total)),"epoch":0,"epochs":max(1,int(epochs)),"step":0,"steps":max(1,int(steps)),"alerted":False,"last_step_time":time.time()}
-        self.schedule(lambda:self.progress_stage.set("准备数据..."))
-        self.schedule(self._ensure_progress_timer)
+def set_mode(new_mode):
+    global current_mode, last_user_input_time
+    with mode_lock:
+        current_mode = new_mode
+        if new_mode == MODE_LEARN:
+            last_user_input_time = time.monotonic()
 
-    def _ensure_progress_timer(self):
-        if self._progress_timer_id is None:
-            self._progress_timer_id=self.root.after(200,self._progress_timer_tick)
+def get_mode():
+    with mode_lock:
+        return current_mode
 
-    def _progress_timer_tick(self):
-        with self.progress_info_lock:
-            info=dict(self.progress_info)
-        if not info.get("active",False):
-            self._progress_timer_id=None
-            return
-        now=time.time()
-        phase=info.get("phase","")
-        percent=float(self.progress_var.get())
-        if phase=="准备数据":
-            elapsed=max(0.0,now-info.get("phase_start",now))
-            percent=min(5.0,max(percent,elapsed*1.0))
-            stage_text="准备数据..."
-        elif phase=="训练中":
-            done=float(info.get("done",0))
-            total=max(1,float(info.get("total",1)))
-            frac=max(0.0,min(1.0,done/total))
-            percent=max(percent,5.0+90.0*frac)
-            epoch=int(info.get("epoch",0))+1
-            epochs=max(1,int(info.get("epochs",1)))
-            step=min(int(info.get("step",0)),int(info.get("steps",1)))
-            steps=max(1,int(info.get("steps",1)))
-            step_val=max(0,step)
-            stage_text=f"训练中 第{min(epoch,epochs)}/{epochs}轮 批次 {step_val}/{steps}"
-            wait=max(0.0,now-info.get("last_step_time",info.get("phase_start",now)))
-            if wait>15.0:
-                stage_text+=" (等待数据加载...)"
-                if not info.get("alerted",False):
-                    with self.progress_info_lock:
-                        self.progress_info["alerted"]=True
-                    self.schedule(lambda msg="数据加载长时间无响应，可稍候或点击 Get Up 中止":self.pause_var.set(msg) if self.mode=="optimize" else None)
-            elif info.get("alerted",False) and wait<=5.0:
-                with self.progress_info_lock:
-                    self.progress_info["alerted"]=False
-                self.schedule(lambda text=self._current_optimize_message:self.pause_var.set(text) if self.mode=="optimize" else None)
-        elif phase=="保存模型":
-            elapsed=max(0.0,now-info.get("phase_start",now))
-            percent=max(percent,min(99.0,95.0+min(4.0,elapsed*5.0)))
-            stage_text="保存模型..."
-        else:
-            stage_text=phase or ""
-        self._set_progress_ui(percent)
-        self.progress_stage.set(stage_text)
-        self._progress_timer_id=self.root.after(200,self._progress_timer_tick)
+def normalize_action_from_mouse(px, py, rect):
+    left, top, right, bottom = rect
+    w = max(1, right - left)
+    h = max(1, bottom - top)
+    nx = (px - left) / w
+    ny = (py - top) / h
+    nx = max(0.0, min(1.0, nx))
+    ny = max(0.0, min(1.0, ny))
+    return nx, ny
 
-    def _update_progress_phase(self,phase):
-        with self.progress_info_lock:
-            self.progress_info["phase"]=phase
-            self.progress_info["phase_start"]=time.time()
-            self.progress_info["last_step_time"]=time.time()
-            self.progress_info["alerted"]=False
+def denormalize_action_to_mouse(nx, ny, rect):
+    left, top, right, bottom = rect
+    w = right - left
+    h = bottom - top
+    x = left + nx * w
+    y = top + ny * h
+    return int(x), int(y)
 
-    def _update_progress_epoch(self,epoch,epochs,steps):
-        with self.progress_info_lock:
-            self.progress_info["epoch"]=epoch
-            self.progress_info["epochs"]=max(1,epochs)
-            self.progress_info["steps"]=max(1,steps)
-            self.progress_info["step"]=0
-            self.progress_info["last_step_time"]=time.time()
-            self.progress_info["alerted"]=False
+def is_left_button_pressed():
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+    except:
+        return False
 
-    def _update_progress_step(self,step,done,total):
-        with self.progress_info_lock:
-            self.progress_info["step"]=step
-            self.progress_info["done"]=done
-            self.progress_info["total"]=max(1,total)
-            self.progress_info["last_step_time"]=time.time()
-    def _touch_progress_watchdog(self):
-        with self.progress_info_lock:
-            self.progress_info["alerted"]=False
-            if self.progress_info.get("active",False):
-                self.progress_info["last_step_time"]=time.time()
-
-    def _stop_progress_monitor(self):
-        with self.progress_info_lock:
-            self.progress_info["active"]=False
-        def cancel():
-            if self._progress_timer_id is not None:
+def capture_window_image(hwnd):
+    global window_a_rect
+    if win32gui is None or win32ui is None or Image is None:
+        if pyautogui is not None and window_a_rect is not None:
+            left, top, right, bottom = window_a_rect
+            w = right - left
+            h = bottom - top
+            if w > 0 and h > 0:
                 try:
-                    self.root.after_cancel(self._progress_timer_id)
-                except Exception:
-                    pass
-                self._progress_timer_id=None
-        self.schedule(cancel)
-
-    def _ensure_progress_floor(self,value):
-        val=max(0.0,min(99.0,float(value)))
-        with self.progress_lock:
-            if val<=self.progress_floor:
-                val=self.progress_floor
-            else:
-                self.progress_floor=val
-        def updater(v=val):
-            try:
-                cur=float(self.progress_var.get())
-            except Exception:
-                cur=0.0
-            if cur<v:
-                self._set_progress_ui(v)
-        if threading.current_thread() is threading.main_thread():
-            updater()
-        else:
-            self.schedule(updater)
-    def _snapshot_state_dict(self,source=None):
-        src=source if source is not None else self.model.state_dict()
-        if isinstance(src,dict):
-            items=[]
-            for k,v in src.items():
-                if torch.is_tensor(v):
-                    items.append((k,v.detach().cpu().clone()))
-                else:
-                    items.append((k,copy.deepcopy(v)))
-            return collections.OrderedDict(items)
-        return copy.deepcopy(src)
-    def _save_model_snapshot(self,state=None):
-        snap=self._snapshot_state_dict(state)
-        if snap is None:
-            return
-        try:
-            torch.save(snap,model_path)
-        except Exception:
-            pass
-    def _update_window_size_ui(self,rect):
-        if rect is None:
-            text='尺寸: 未选择窗口' if self.window_hwnd is None else '尺寸: 未检测'
-        else:
-            w=max(0,int(rect[2]-rect[0]))
-            h=max(0,int(rect[3]-rect[1]))
-            text=f"尺寸: {w}×{h}"
-        self.schedule(lambda txt=text:self.window_size_var.set(txt))
-    def start_generation_ui(self,name,filename,percent):
-        self.current_model_task=name
-        self.model_task_title=f"{name} - {filename}"
-        p=max(0.0,min(100.0,float(percent)))
-        self.progress_var.set(p)
-        self.progress_text.set(f"{p:.0f}%")
-        self.progress_stage.set("模型生成中")
-        self.pause_var.set(f"生成 {self.model_task_title}")
-    def update_generation_ui(self,name,percent,message=""):
-        if getattr(self,"current_model_task",None)!=name:
-            return
-        p=max(0.0,min(100.0,float(percent)))
-        self.progress_var.set(p)
-        self.progress_text.set(f"{p:.0f}%")
-        info=f"生成 {self.model_task_title} {p:.1f}%"
-        if message:
-            info+=f" {message}"
-        self.pause_var.set(info)
-    def finish_generation_ui(self):
-        self.current_model_task=None
-        self.model_task_title=""
-        self.progress_var.set(0.0)
-        self.progress_text.set("0%")
-        self.progress_stage.set("")
-        if self.models_ready():
-            self.pause_var.set("")
-    def generation_failed_ui(self,name,message):
-        if getattr(self,"current_model_task",None)==name:
-            self.finish_generation_ui()
-        self.pause_var.set(f"{name} 模型生成失败: {message}")
-        self.progress_stage.set("模型生成失败")
-    def notify_generation_success(self,name):
-        self.pause_var.set(f"{name} 模型已就绪")
-        self.progress_stage.set("模型就绪")
-    def refresh_windows(self):
-        entries=_list_visible_windows()
-        self.window_entries=[{"title":title,"hwnd":hwnd,"display":f"{title} (0x{hwnd:08X})"} for title,hwnd in entries]
-        values=[entry["display"] for entry in self.window_entries]
-        self.window_combo["values"]=values
-        if values:
-            current_display=None
-            if self.window_hwnd is not None:
-                for entry in self.window_entries:
-                    if entry["hwnd"]==self.window_hwnd:
-                        current_display=entry["display"]
-                        break
-            if current_display:
-                self.selected_title.set(current_display)
-            elif self.selected_title.get() not in values:
-                self.selected_title.set(values[0])
-        else:
-            self.selected_title.set("")
-    def select_window(self):
-        display=self.selected_title.get()
-        entry=None
-        for item in self.window_entries:
-            if item["display"]==display:
-                entry=item
-                break
-        if entry is None:
-            self.pause_var.set("未找到选定窗口")
-            return
-        self.window_title=entry["title"]
-        self.window_hwnd=entry["hwnd"]
-        self.window_obj=None
-        try:
-            matches=[w for w in gw.getAllWindows() if int(getattr(w,"_hWnd",0))==self.window_hwnd]
-            if matches:
-                self.window_obj=matches[0]
-        except Exception:
-            self.window_obj=None
-        self.window_state.set(f"Selected:{self.window_title}")
-        self._update_window_status()
-        self.buffer.clear()
-        self.capture_enabled=True
-        self.recording_enabled=True
-        self.sleep_btn.configure(state="normal" if (self.models_ready() and self.window_hwnd is not None) else "disabled")
-        self.getup_btn.configure(state="disabled")
-        self.pause_var.set("" if self.models_ready() else "模型未就绪，已暂停且 10 秒切换规则失效")
-        self._analysis_ready_time=time.monotonic()+1.0
-        self._analysis_next_frame=None
-        self.set_mode("learn")
-    def _get_ext_frame_rect(self,hwnd):
-        try:
-            if hwnd is None:
-                return None
-            hwnd_int=int(hwnd)
-            rect=ctypes.wintypes.RECT()
-            h=ctypes.wintypes.HWND(hwnd_int)
-            if dwmapi is not None:
-                try:
-                    DWMWA_EXTENDED_FRAME_BOUNDS=9
-                    if dwmapi.DwmGetWindowAttribute(h,ctypes.c_int(DWMWA_EXTENDED_FRAME_BOUNDS),ctypes.byref(rect),ctypes.sizeof(rect))==0 and rect.right>rect.left and rect.bottom>rect.top:
-                        return (rect.left,rect.top,rect.right,rect.bottom)
-                except Exception:
-                    pass
-            try:
-                if user32 is not None and user32.GetWindowRect(h,ctypes.byref(rect))!=0 and rect.right>rect.left and rect.bottom>rect.top:
-                    return (rect.left,rect.top,rect.right,rect.bottom)
-            except Exception:
-                pass
-            try:
-                info=WINDOWINFO()
-                info.cbSize=ctypes.sizeof(info)
-                if user32 is not None and user32.GetWindowInfo(h,ctypes.byref(info))!=0:
-                    left=int(info.rcWindow.left);top=int(info.rcWindow.top);right=int(info.rcWindow.right);bottom=int(info.rcWindow.bottom)
-                    if right>left and bottom>top:
-                        return (left,top,right,bottom)
-            except Exception:
-                pass
-            try:
-                placement=WINDOWPLACEMENT()
-                placement.length=ctypes.sizeof(placement)
-                if user32 is not None and user32.GetWindowPlacement(h,ctypes.byref(placement))!=0:
-                    rc=placement.rcNormalPosition
-                    left=int(rc.left);top=int(rc.top);right=int(rc.right);bottom=int(rc.bottom)
-                    if right>left and bottom>top:
-                        return (left,top,right,bottom)
-            except Exception:
-                pass
-            try:
-                rc=ctypes.wintypes.RECT()
-                if user32 is not None and user32.GetClientRect(h,ctypes.byref(rc))!=0:
-                    pt1=ctypes.wintypes.POINT(rc.left,rc.top);pt2=ctypes.wintypes.POINT(rc.right,rc.bottom)
-                    user32.ClientToScreen(h,ctypes.byref(pt1));user32.ClientToScreen(h,ctypes.byref(pt2))
-                    if pt2.x>pt1.x and pt2.y>pt1.y:
-                        return (pt1.x,pt1.y,pt2.x,pt2.y)
-            except Exception:
-                pass
-            try:
-                if self.window_obj is not None:
-                    self.window_obj.refresh()
-                    left=int(getattr(self.window_obj,'left',0));top=int(getattr(self.window_obj,'top',0));right=int(getattr(self.window_obj,'right',left+int(getattr(self.window_obj,'width',0))));bottom=int(getattr(self.window_obj,'bottom',top+int(getattr(self.window_obj,'height',0))))
-                    if right>left and bottom>top:
-                        return (left,top,right,bottom)
-            except Exception:
-                pass
-            try:
-                title=self._window_title()
-                if title:
-                    wins=[w for w in gw.getAllWindows() if w.title==title or title in w.title]
-                    if wins:
-                        w=wins[0];w.refresh();left=int(getattr(w,'left',0));top=int(getattr(w,'top',0));right=int(getattr(w,'right',left+int(getattr(w,'width',0))));bottom=int(getattr(w,'bottom',top+int(getattr(w,'height',0))))
-                        if right>left and bottom>top:
-                            return (left,top,right,bottom)
-            except Exception:
-                pass
-            return None
-        except Exception:
-            return None
-    def _resolve_window_handle(self):
-        if self.window_hwnd is not None and user32 is not None:
-            try:
-                if user32.IsWindow(ctypes.wintypes.HWND(int(self.window_hwnd)))!=0:
-                    return int(self.window_hwnd)
-            except Exception:
-                pass
-        title=self._window_title().strip()
-        if title:
-            for entry in self.window_entries:
-                if entry.get("title","")==title:
-                    handle=entry.get("hwnd")
-                    if handle is not None:
-                        if user32 is None or user32.IsWindow(ctypes.wintypes.HWND(int(handle)))!=0:
-                            self.window_hwnd=int(handle)
-                            return int(handle)
-            for win_title,handle in _list_visible_windows():
-                if win_title==title or title.lower() in win_title.lower():
-                    self.window_hwnd=int(handle)
-                    return int(handle)
-            if user32 is not None:
-                try:
-                    found=user32.FindWindowW(None,title)
-                    if found:
-                        self.window_hwnd=int(found)
-                        return int(found)
-                except Exception:
-                    pass
+                    img = pyautogui.screenshot(region=(left, top, w, h))
+                    return img.convert("RGB")
+                except:
+                    return None
         return None
-    def _dwm_occlusion_state(self,hwnd):
-        if dwmapi is None or hwnd is None:
-            return 0
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        w = right - left
+        h = bottom - top
+        if w <= 0 or h <= 0:
+            return None
+        hwndDC = win32gui.GetWindowDC(hwnd)
+        mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+        saveDC = mfcDC.CreateCompatibleDC()
+        saveBitMap = win32ui.CreateBitmap()
+        saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
+        saveDC.SelectObject(saveBitMap)
+        result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
+        if result != 1:
+            saveDC.BitBlt((0, 0), (w, h), mfcDC, (0, 0), win32con.SRCCOPY)
+        bmpinfo = saveBitMap.GetInfo()
+        bmpstr = saveBitMap.GetBitmapBits(True)
+        img = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]), bmpstr, "raw", "BGRX", 0, 1)
+        win32gui.DeleteObject(saveBitMap.GetHandle())
+        saveDC.DeleteDC()
+        mfcDC.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwndDC)
         try:
-            DWMWA_OCCLUSION_STATE=18
-            state=ctypes.c_uint(0)
-            res=dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(int(hwnd)),ctypes.c_int(DWMWA_OCCLUSION_STATE),ctypes.byref(state),ctypes.sizeof(state))
-            if res==0:
-                return int(state.value)
-        except Exception:
+            import numpy as _np_internal_check
+            arr = _np_internal_check.array(img)
+            if arr.size == 0 or float(arr.mean()) < 1.0:
+                if pyautogui is not None:
+                    img2 = pyautogui.screenshot(region=(left, top, w, h))
+                    return img2.convert("RGB")
+        except:
             pass
-        return 0
-    def _pixel_occlusion_ratio(self,frame,hwnd,rect):
+        return img
+    except:
         try:
-            if user32 is None:
-                self.last_occl_check=time.time()
-                return 0.0
-            hwnd_int=int(hwnd) if hwnd is not None else None
-            if hwnd_int is None:
-                self.last_occl_check=time.time()
-                return 1.0
-            occ_state=self._dwm_occlusion_state(hwnd_int)
-            if occ_state==1:
-                self.last_occl_check=time.time()
-                return 1.0
-            left,top,right,bottom=rect;w=max(1,right-left);h=max(1,bottom-top);area=float(w*h)
-            overlaps=[];cur=user32.GetWindow(ctypes.wintypes.HWND(hwnd_int),ctypes.c_int(GW_HWNDPREV));seen=set()
-            while cur:
-                h=int(cur)
-                if h in seen:
-                    break
-                seen.add(h)
-                cur_hwnd=ctypes.wintypes.HWND(cur)
-                if user32.IsWindow(cur_hwnd)!=0 and user32.IsWindowVisible(cur_hwnd) and user32.IsIconic(cur_hwnd)==0:
-                    other=self._get_ext_frame_rect(h)
-                    if other is not None:
-                        inter=_rect_intersection(rect,other)
-                        if inter and inter[2]>inter[0] and inter[3]>inter[1]:
-                            if not self._is_window_transparent(h):
-                                overlaps.append(inter)
-                cur=user32.GetWindow(cur_hwnd,ctypes.c_int(GW_HWNDPREV))
-            occ=float(_rect_union_area(overlaps));ratio=occ/area if area>0 else 1.0
-            if frame is not None and ratio<=1.0:
-                capture=self.last_print_frame if self.last_print_frame is not None else self._print_window(hwnd_int,w,h)
-                if capture is not None:
-                    gray_cap=cv2.cvtColor(capture,cv2.COLOR_BGR2GRAY)
-                    intensity=float(gray_cap.mean())
-                    visible_pixels=float(np.count_nonzero(gray_cap>8))/max(gray_cap.size,1)
-                    if intensity<4.0 or visible_pixels<0.1:
-                        ratio=max(ratio,0.95)
-            if occ_state==2:
-                ratio=min(ratio,0.05)
-            self.last_occl_check=time.time()
-            return min(max(ratio,0.0),1.0)
-        except Exception:
-            return None
-    def _print_window(self,hwnd,width,height):
-        if user32 is None or gdi32 is None or width<=0 or height<=0:
-            return None
-        hdc=None;memdc=None;bmp=None
-        try:
-            hdc=user32.GetWindowDC(ctypes.wintypes.HWND(hwnd))
-            if not hdc:
-                return None
-            memdc=gdi32.CreateCompatibleDC(hdc)
-            if not memdc:
-                return None
-            bmp=gdi32.CreateCompatibleBitmap(hdc,width,height)
-            if not bmp:
-                return None
-            old=gdi32.SelectObject(memdc,bmp)
-            res=user32.PrintWindow(ctypes.wintypes.HWND(hwnd),memdc,ctypes.c_uint(PW_RENDERFULLCONTENT))
-            buf=ctypes.create_string_buffer(width*height*4)
-            got=gdi32.GetBitmapBits(bmp,len(buf),buf)
-            gdi32.SelectObject(memdc,old)
-            if res==0 or got==0:
-                return None
-            arr=np.frombuffer(buf,dtype=np.uint8).reshape((height,width,4))
-            return arr[:,:,:3].copy()
-        except Exception:
-            return None
-        finally:
-            try:
-                if bmp:gdi32.DeleteObject(bmp)
-            except Exception:
-                pass
-            try:
-                if memdc:gdi32.DeleteDC(memdc)
-            except Exception:
-                pass
-            try:
-                if hdc:user32.ReleaseDC(ctypes.wintypes.HWND(hwnd),hdc)
-            except Exception:
-                pass
-    def _is_window_transparent(self,hwnd):
-        try:
-            if user32 is None:
-                return False
-            h=ctypes.wintypes.HWND(hwnd)
-            ex=user32.GetWindowLongW(h,ctypes.c_int(GWL_EXSTYLE))
-            if ex & WS_EX_TRANSPARENT:
-                return True
-            func=getattr(user32,'GetLayeredWindowAttributes',None)
-            if ex & WS_EX_LAYERED and func is not None:
-                key=ctypes.c_uint()
-                alpha=ctypes.c_ubyte()
-                flags=ctypes.c_uint()
-                if func(h,ctypes.byref(key),ctypes.byref(alpha),ctypes.byref(flags))!=0:
-                    if flags.value & LWA_ALPHA and alpha.value<250:
-                        return True
-            return False
-        except Exception:
-            return False
-    def _monitor_coverage(self,rect):
-        area=_rect_area(rect)
-        if area<=0:
-            return 0.0
-        covered=0
-        for mx,my,mw,mh in self.monitor_bounds:
-            inter=_rect_intersection(rect,(mx,my,mx+mw,my+mh))
-            if inter:
-                covered+=_rect_area(inter)
-        return covered/area if area>0 else 0.0
-    def _sample_window_visibility(self,hwnd,rect):
-        try:
-            if user32 is None or hwnd is None or rect is None:
-                return 0.0,0.0
-            target=int(hwnd)
-            left,top,right,bottom=rect
-            w=max(1,right-left)
-            h=max(1,bottom-top)
-            core=[]
-            edge=[]
-            core_pos=[0.25,0.5,0.75]
-            edge_pos=[0.02,0.5,0.98]
-            margin_x=max(1,int(w*0.02))
-            margin_y=max(1,int(h*0.02))
-            safe_left=left+margin_x
-            safe_right=max(safe_left,right-margin_x-1)
-            safe_top=top+margin_y
-            safe_bottom=max(safe_top,bottom-margin_y-1)
-            def _sample_point(fx,fy):
-                px=float(left+min(max(fx,0.0),1.0)*(w-1))
-                py=float(top+min(max(fy,0.0),1.0)*(h-1))
-                ix=int(min(max(px,safe_left),safe_right))
-                iy=int(min(max(py,safe_top),safe_bottom))
-                return ix,iy
-            for fx in core_pos:
-                for fy in core_pos:
-                    core.append(_sample_point(fx,fy))
-            for fx in edge_pos:
-                for fy in edge_pos:
-                    edge.append(_sample_point(fx,fy))
-            core_hit=0
-            edge_hit=0
-            for px,py in core:
-                pt=ctypes.wintypes.POINT(px,py)
-                win=user32.WindowFromPoint(pt)
-                if win:
-                    win_int=int(win)
-                    root=user32.GetAncestor(ctypes.wintypes.HWND(win),ctypes.c_uint(GA_ROOT))
-                    root_int=int(root) if root else 0
-                    if root_int==0:
-                        root_int=win_int
-                    if root_int==target or win_int==target:
-                        core_hit+=1
-            for px,py in edge:
-                pt=ctypes.wintypes.POINT(px,py)
-                win=user32.WindowFromPoint(pt)
-                if win:
-                    win_int=int(win)
-                    root=user32.GetAncestor(ctypes.wintypes.HWND(win),ctypes.c_uint(GA_ROOT))
-                    root_int=int(root) if root else 0
-                    if root_int==0:
-                        root_int=win_int
-                    if root_int==target or win_int==target:
-                        edge_hit+=1
-            core_ratio=core_hit/len(core) if core else 0.0
-            edge_ratio=edge_hit/len(edge) if edge else 0.0
-            return core_ratio,edge_ratio
-        except Exception:
-            return 0.0,0.0
-    def _refresh_window_geometry(self):
-        title=self._window_title().strip()
-        if not title and self.window_hwnd is None:
-            self.window_rect=None
-            self._update_window_size_ui(None)
-            return False
-        try:
-            hwnd=self._resolve_window_handle()
-            self.window_hwnd=hwnd
-            rect=self._get_ext_frame_rect(hwnd) if hwnd is not None else None
-            if rect is None and self.window_obj is not None:
-                try:
-                    self.window_obj.refresh()
-                    rect=(int(getattr(self.window_obj,'left',0)),int(getattr(self.window_obj,'top',0)),int(getattr(self.window_obj,'right',0)),int(getattr(self.window_obj,'bottom',0)))
-                    if rect[2]<=rect[0] or rect[3]<=rect[1]:
-                        rect=None
-                except Exception:
-                    rect=None
-            self.window_rect=rect
-            self._update_window_size_ui(rect)
-            return rect is not None and hwnd is not None
-        except Exception:
-            self.window_rect=None
-            self._update_window_size_ui(None)
-            if user32 is not None and self.window_hwnd is not None:
-                try:
-                    if user32.IsWindow(ctypes.wintypes.HWND(int(self.window_hwnd)))==0:
-                        self.window_hwnd=None
-                except Exception:
-                    self.window_hwnd=None
-            return False
-    def _evaluate_visibility(self,frame):
-        if self.window_hwnd is None:
-            self.window_visible=False
-            self.window_full=False
-            self.window_visible_reason='未选择窗口'
-            self.window_full_reason='未选择窗口'
-            self.window_occ_state=0
-            self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
-            self.window_occ_ratio=1.0
-            self.window_coverage=0.0
-            self.window_edge_ratio=0.0
-            self.window_core_ratio=0.0
-            title=self._window_title()
-            label='未选择窗口' if not title else f"{title} (未找到)"
-            self.schedule(lambda txt=label:self.window_state.set(f"Selected:{txt}"))
-            self.schedule(lambda:self.visible_var.set('可见: 否(未选择窗口)'))
-            self.schedule(lambda:self.full_var.set('完整: 否(未选择窗口)'))
-            self._update_window_size_ui(None)
-            return
-        rect=self.window_rect
-        hwnd=self.window_hwnd
-        if rect is None or hwnd is None:
-            self.window_visible=False
-            self.window_full=False
-            reason='无法获取窗口区域'
-            if hwnd is not None and user32 is not None:
-                try:
-                    h=ctypes.wintypes.HWND(int(hwnd))
-                    if user32.IsWindow(h)==0:
-                        reason='窗口句柄无效'
-                    elif user32.IsIconic(h)!=0:
-                        reason='窗口已最小化'
-                    elif user32.IsWindowVisible(h)==0:
-                        reason='窗口不可见'
-                except Exception:
-                    pass
-            self.window_visible_reason=reason
-            self.window_full_reason=reason
-            self.window_occ_state=0
-            self._vis_fail=0;self._vis_pass=0;self._full_fail=0;self._full_pass=0;self._vis_state=False;self._full_state=False
-            self.window_occ_ratio=1.0
-            self.window_coverage=0.0
-            self.window_edge_ratio=0.0
-            self.window_core_ratio=0.0
-            title=self._window_title()
-            self.schedule(lambda txt=title or '未选择窗口':self.window_state.set(f"Selected:{txt}"))
-            self.schedule(lambda:self.visible_var.set(f"可见: 否({self.window_visible_reason})"))
-            self.schedule(lambda:self.full_var.set(f"完整: 否({self.window_full_reason})"))
-            return
-        if frame is None:
-            self.window_visible=False
-            self.window_full=False
-            self.window_visible_reason='等待截图'
-            self.window_full_reason='等待截图'
-            self.window_occ_state=self._dwm_occlusion_state(hwnd)
-            self.window_occ_ratio=1.0
-            self.window_coverage=self._monitor_coverage(rect)
-            core_ratio,edge_ratio=self._sample_window_visibility(hwnd,rect)
-            self.window_core_ratio=core_ratio
-            self.window_edge_ratio=edge_ratio
-            self.schedule(lambda:self.visible_var.set('可见: 否(等待截图)'))
-            self.schedule(lambda:self.full_var.set('完整: 否(等待截图)'))
-            return
-        coverage=self._monitor_coverage(rect)
-        core_ratio,edge_ratio=self._sample_window_visibility(hwnd,rect)
-        occ_state=self._dwm_occlusion_state(hwnd)
-        occ_ratio=self._pixel_occlusion_ratio(frame,hwnd,rect)
-        if occ_ratio is None:
-            occ_ratio=0.0
-        occ_ratio=max(0.0,min(1.0,float(occ_ratio)))
-        self.window_occ_state=occ_state
-        self.window_occ_ratio=occ_ratio
-        self.window_coverage=coverage
-        self.window_edge_ratio=edge_ratio
-        self.window_core_ratio=core_ratio
-        print_frame=self.last_print_frame
-        if print_frame is not None and print_frame.size>0:
-            if frame is None or frame.size==0:
-                frame=print_frame
-        sample_frames=[f for f in (frame,print_frame) if f is not None and getattr(f,"size",0)>0]
-        sample_good=any(np.std(f)>1.5 for f in sample_frames)
-        h=ctypes.wintypes.HWND(int(hwnd)) if user32 is not None else None
-        visible=True
-        vis_reason='采样通过' if sample_good else '画面不足'
-        if not sample_good:
-            visible=False
-        if visible and user32 is not None and h:
-            if user32.IsWindow(h)==0:
-                visible=False
-                vis_reason='窗口句柄无效'
-            elif user32.IsWindowVisible(h)==0:
-                visible=False
-                vis_reason='窗口不可见'
-            elif user32.IsIconic(h)!=0:
-                visible=False
-                vis_reason='窗口最小化'
-        if visible and occ_state==1:
-            visible=False
-            vis_reason='窗口被遮挡'
-        if visible and occ_ratio>=0.7:
-            visible=False
-            vis_reason=f'遮挡率{occ_ratio*100:.1f}%'
-        if visible and coverage<0.2:
-            visible=False
-            vis_reason=f'显示区域{coverage*100:.1f}%'
-        if visible and core_ratio<0.18:
-            visible=False
-            vis_reason=f'采样可见{core_ratio*100:.1f}%'
-        if visible and edge_ratio<0.12:
-            visible=False
-            vis_reason=f'边缘可见{edge_ratio*100:.1f}%'
-        if not visible and sample_good and occ_state!=1 and coverage>=0.2 and occ_ratio<0.75:
-            visible=True
-            vis_reason='捕获成功'
-        full=visible
-        full_reason='完全可见' if full else vis_reason
-        if full and coverage<0.75:
-            full=False
-            full_reason=f'覆盖{coverage*100:.1f}%'
-        if full and edge_ratio<0.45:
-            full=False
-            full_reason=f'边缘可见{edge_ratio*100:.1f}%'
-        if full and core_ratio<0.45:
-            full=False
-            full_reason=f'采样可见{core_ratio*100:.1f}%'
-        if full and occ_ratio>0.35:
-            full=False
-            full_reason=f'遮挡率{occ_ratio*100:.1f}%'
-        if occ_state==2 and occ_ratio<=0.05 and visible:
-            full=True
-            full_reason='完全可见'
-        v_raw=visible;f_raw=full
-        if v_raw:self._vis_pass=self._vis_pass+1;self._vis_fail=0
-        else:self._vis_fail=self._vis_fail+1;self._vis_pass=0
-        if f_raw:self._full_pass=self._full_pass+1;self._full_fail=0
-        else:self._full_fail=self._full_fail+1;self._full_pass=0
-        if not getattr(self,'_vis_state',False) and self._vis_fail>=3:self._vis_state=False
-        if getattr(self,'_vis_state',False) and self._vis_pass>=2:self._vis_state=True
-        if not getattr(self,'_vis_state',False) and self._vis_pass>=2:self._vis_state=True
-        if getattr(self,'_vis_state',False) and self._vis_fail>=3:self._vis_state=False
-        if not getattr(self,'_full_state',False) and self._full_fail>=3:self._full_state=False
-        if getattr(self,'_full_state',False) and self._full_pass>=2:self._full_state=True
-        if not getattr(self,'_full_state',False) and self._full_pass>=2:self._full_state=True
-        if getattr(self,'_full_state',False) and self._full_fail>=3:self._full_state=False
-        self.window_visible=bool(self._vis_state)
-        self.window_full=bool(self._full_state)
-        self.window_visible_reason=vis_reason
-        self.window_full_reason=full_reason
-        self.schedule(lambda v=self.window_visible,r=vis_reason:self.visible_var.set(f"可见: {'是' if v else '否'}({r})"))
-        self.schedule(lambda f=self.window_full,t=full_reason:self.full_var.set(f"完整: {'是' if f else '否'}({t})"))
-        title=self._window_title()
-        state_title=title if title else '未选择窗口'
-        handle_text=f"0x{int(hwnd):08X}" if hwnd is not None else "N/A"
-        suffix=f" {handle_text}"
-        if not visible:
-            suffix+=f" [{vis_reason}]"
-        elif not full:
-            suffix+=f" [{full_reason}]"
-        self.schedule(lambda txt=state_title,suf=suffix:self.window_state.set(f"Selected:{txt}{suf}"))
-    def _update_window_status(self,frame=None):
-        if frame is None:
-            self._refresh_window_geometry()
-            self._evaluate_visibility(None)
-        else:
-            self._evaluate_visibility(frame)
-    def schedule(self,func):
-        if self.running:self.ui_queue.put(func)
-    def _gpu_metrics_nvml(self):
-        try:
-            if _gpu_count>0:
-                handle=nvmlDeviceGetHandleByIndex(0)
-                util=nvmlDeviceGetUtilizationRates(handle);mem=nvmlDeviceGetMemoryInfo(handle)
-                gpu=float(util.gpu);vram=float(mem.used*100.0/max(mem.total,1));return gpu,vram,"NVML"
-        except Exception:
-            return None
-        return None
-    def _gpu_metrics_typeperf(self):
-        try:
-            p=subprocess.Popen(["typeperf","-sc","1","\\GPU Engine(*)\\Utilization Percentage","\\GPU Adapter Memory(*)\\Dedicated Usage","\\GPU Adapter Memory(*)\\Dedicated Limit"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,shell=False)
-            out,err=p.communicate(timeout=3)
-            s=out.decode(errors="ignore").strip().splitlines()
-            if len(s)<3:return None
-            values=s[-1].split(",");nums=[]
-            for v in values[1:]:
-                v=v.strip().strip('"')
-                try:nums.append(float(v))
-                except Exception:nums.append(0.0)
-            if len(nums)<3:return None
-            util_vals=nums[:-2];used=nums[-2];limit=nums[-1] if nums[-1]>0 else 1.0
-            gpu=max(0.0,min(100.0,float(max(util_vals) if util_vals else 0.0)));vram=max(0.0,min(100.0,float(used*100.0/limit)));return gpu,vram,"WMI"
-        except Exception:
-            return None
-    def _gpu_metrics_gputil(self):
-        try:
-            gpus=GPUtil.getGPUs()
-            if gpus:
-                g=gpus[0];return float(g.load*100.0),float(g.memoryUtil*100.0),"GPUtil"
-        except Exception:
-            return None
-        return None
-    def _gpu_metrics_ext(self):
-        got=self._gpu_metrics_nvml()
-        if got is None:got=self._gpu_metrics_typeperf()
-        if got is None:got=self._gpu_metrics_gputil()
-        if got is None:
-            self.gpu_source="不可用";return 0.0,0.0,0.0,0.0
-        gpu,mem,src=got;temp=0.0;pwr_ratio=0.0
-        if src=="NVML":
-            try:
-                h=nvmlDeviceGetHandleByIndex(0);temp=float(nvmlDeviceGetTemperature(h,0));p=float(nvmlDeviceGetPowerUsage(h))/1000.0;pl=float(nvmlDeviceGetEnforcedPowerLimit(h))/1000.0;pwr_ratio=p/max(pl,1e-6)
-            except Exception:
-                pass
-        self.gpu_source=src;return gpu,mem,temp,pwr_ratio
-    def _idle_seconds(self):
-        local=time.time()-getattr(self,'last_user_input',time.time())
-        sys_idle=_system_idle_seconds()
-        if sys_idle is None:
-            return max(0.0,float(local))
-        return max(0.0,min(float(local),float(sys_idle)))
-    def _monitor_loop(self):
-        last_threads=None
-        while self.running:
-            cpu=float(psutil.cpu_percent(interval=None));mem=float(psutil.virtual_memory().percent);gpu,mem_gpu,temp,pwr_ratio=self._gpu_metrics_ext()
-            if self.gpu_source=="不可用":
-                weights=[("cpu",cpu,0.55),("mem",mem,0.45)]
-            else:
-                weights=[("cpu",cpu,0.3),("mem",mem,0.25),("gpu",gpu,0.25),("vram",mem_gpu,0.2)]
-            total_weight=sum(w for _,_,w in weights)
-            load_ratio=sum(min(max(v,0.0),100.0)/100.0*w for _,v,w in weights)/max(total_weight,1e-6)
-            spare=max(0.0,1.0-load_ratio)
-            freq=120.0*(spare**1.4)
-            if temp>=78.0:
-                freq*=0.6
-            if pwr_ratio>=0.9:
-                freq*=0.7
-            peak_usage=max(cpu,mem,gpu,mem_gpu)
-            if load_ratio>=0.995 or (load_ratio>=0.9 and freq<1.0):
-                freq=0.0
-            freq=max(0.0,min(120.0,freq))
-            self.metrics={"cpu":cpu,"mem":mem,"gpu":gpu,"vram":mem_gpu,"freq":freq,"temp":temp,"pwr":pwr_ratio,"load":load_ratio*100.0}
-            if freq>0:
-                target_ci=1.0/freq
-            else:
-                target_ci=0.05
-            self._cap_interval_ema=0.8*self._cap_interval_ema+0.2*target_ci
-            self.capture_interval=max(0.005,float(self._cap_interval_ema))
-            usage_ratio=max(0.0,min(1.0,peak_usage/100.0))
-            target_ai=0.02+0.08*usage_ratio
-            if temp>=80 or pwr_ratio>=0.95:target_ai*=2.0
-            self._ai_interval_ema=0.8*self._ai_interval_ema+0.2*target_ai
-            self.ai_interval=float(self._ai_interval_ema)
-            try:
-                idle=self._idle_seconds()
-            except Exception:
-                idle=None
-            if idle is not None and self.mode=="learn" and self.window_visible and self.window_full and not self.resource_paused and self.capture_enabled and idle>=10.0:
-                self.set_mode("train")
-
-            self.schedule(lambda s=self.gpu_source:self.gpu_src_var.set(f"GPU指标来源: {s}"))
-            if freq<=0:
-                if not self.resource_paused:
-                    self.resource_paused=True;self._stop_ai();self._mouse_up_safety();self.set_mode("learn");self.recording_enabled=False;self.sleep_btn.configure(state="disabled");self.getup_btn.configure(state="disabled");self.pause_var.set("已暂停且 10 秒切换规则失效")
-            else:
-                if self.resource_paused:
-                    self.resource_paused=False;self.recording_enabled=True;self.pause_var.set("")
-                    if self.mode=="init" and self.window_hwnd is not None:self.set_mode("learn")
-                    if self.window_hwnd is not None:self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
-            try:
-                total_threads=os.cpu_count() or 1
-                free_ratio=max(0.1,1.0-usage_ratio)
-                target_threads=max(1,min(total_threads,int(math.ceil(total_threads*free_ratio))))
-                if target_threads!=last_threads:
-                    torch.set_num_threads(target_threads);last_threads=target_threads
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-    def _enqueue_drop(self,q,item):
-        try:
-            q.put_nowait(item)
-        except queue.Full:
-            try:
-                q.get_nowait()
-            except Exception:
-                pass
-            try:
-                q.put_nowait(item)
-            except Exception:
-                pass
-    def _capture_window_frame(self,rect):
-        try:
-            self.last_print_frame=None
-            hwnd=self.window_hwnd
-            if rect is None or hwnd is None:
-                return None
-            left,top,right,bottom=rect
-            width=max(1,int(right-left))
-            height=max(1,int(bottom-top))
-            frame=None
-            if user32 is not None and gdi32 is not None:
-                capture=self._print_window(int(hwnd),width,height)
-                if capture is not None and capture.size>0:
-                    if capture.shape[0]!=height or capture.shape[1]!=width:
-                        capture=cv2.resize(capture,(width,height))
-                    if float(np.std(capture))>1.5:
-                        self.last_print_frame=capture
-                        frame=capture
-            if frame is None:
-                shot=self.mss_ctx.grab({"left":int(left),"top":int(top),"width":width,"height":height})
-                arr=np.array(shot)
-                if arr.shape[-1]==4:
-                    arr=cv2.cvtColor(arr,cv2.COLOR_BGRA2BGR)
-                frame=arr
-            return frame
-        except Exception:
-            self.last_print_frame=None
-            return None
-    def _capture_loop(self):
-        while self.running:
-            start=time.time();f=self.metrics.get("freq",0.0)
-            if f<=0.0 or not self.capture_enabled or self.resource_paused:time.sleep(0.05);continue
-            if self.window_hwnd is not None:
-                self._refresh_window_geometry()
-                rect=self.window_rect
-                if rect is not None:
-                    frame=self._capture_window_frame(rect)
-                    if frame is not None and frame.size>0:
-                        now=time.time()
-                        self._evaluate_visibility(frame)
-                        self._enqueue_drop(self.cap_queue,(frame,now))
-                    else:
-                        with self.frame_lock:self.frame=None
-                        self._evaluate_visibility(None)
-                else:
-                    with self.frame_lock:self.frame=None
-                    self._evaluate_visibility(None)
-            else:
-                with self.frame_lock:self.frame=None
-            elapsed=time.time()-start;wait=max(self.capture_interval-elapsed,0.001) if self.metrics.get("freq",0.0)>0 else 0.05;time.sleep(wait)
-    def _preprocess_loop(self):
-        while self.running:
-            try:
-                item=self.cap_queue.get(timeout=0.1)
-            except Exception:
-                time.sleep(0.01);continue
-            frame,_=item
-            raw_frame=frame
-            proc_frame=frame
-            scale=1.0
-            if self.metrics["temp"]>=80 or self.metrics["pwr"]>=0.95 or self.metrics["vram"]>=90.0:scale=0.75
-            if self.metrics["vram"]>=96.0:scale=0.5
-            if scale!=1.0:
-                h,w=proc_frame.shape[:2];nw=max(64,int(w*scale));nh=max(64,int(h*scale));proc_frame=cv2.resize(proc_frame,(nw,nh))
-            with self.frame_lock:self.frame=raw_frame
-            self._append_history(proc_frame)
-            if self.mode=="learn" and not self.resource_paused and self.window_visible and self.window_full:self._analyze_ui_async(proc_frame)
-            self._enqueue_drop(self.prep_queue,(raw_frame,proc_frame,time.time()))
-            try:self.cap_queue.task_done()
-            except Exception:pass
-    def _writer_loop(self):
-        while self.running:
-            try:
-                raw_frame,proc_frame,_=self.prep_queue.get(timeout=0.1)
-            except Exception:
-                time.sleep(0.01);continue
-            if self.recording_enabled and not self.resource_paused and self.capture_enabled and self.window_visible and self.window_full and self.window_rect is not None and self.mode in ("learn","train"):
-                rect=self.window_rect;center=((rect[0]+rect[2])/2.0,(rect[1]+rect[3])/2.0)
-                action=[0.0,0.0,0.0]
-                pos=[(center[0]-rect[0])/(rect[2]-rect[0]),(center[1]-rect[1])/(rect[3]-rect[1])]
-                source=1 if self.mode=="learn" else 2;title=self._window_title()
-                try:self.writer.record(raw_frame,action,pos,source,rect,title,self.mode,"frame");self.buffer.add(proc_frame,action,source,0,0,-1,self.perception.last_text)
-                except Exception:pass
-            try:self.prep_queue.task_done()
-            except Exception:pass
-    def _append_history(self,frame):
-        with self.history_lock:
-            self.frame_history.append(frame)
-            if len(self.frame_history)>8:self.frame_history.pop(0)
-    def _save_click_patches(self,frame,nx,ny):
-        try:
-            clicks_dir=os.path.join(experience_dir,"clicks");os.makedirs(clicks_dir,exist_ok=True)
-            H,W=frame.shape[:2];x=int(nx*W);y=int(ny*H);sz=max(16,min(H,W)//10);x1=max(0,x-sz);y1=max(0,y-sz);x2=min(W,x+sz);y2=min(H,y+sz)
-            pos=frame[y1:y2,x1:x2]
-            neg=None
-            for _ in range(10):
-                rx=random.randint(sz,W-sz-1);ry=random.randint(sz,H-sz-1)
-                if abs(rx-x)>2*sz and abs(ry-y)>2*sz:
-                    neg=frame[ry-sz:ry+sz,rx-sz:rx+sz];break
-            ts=int(time.time()*1000)
-            if pos is not None:cv2.imwrite(os.path.join(clicks_dir,f"pos_{ts}.png"),pos)
-            if neg is not None:cv2.imwrite(os.path.join(clicks_dir,f"neg_{ts}.png"),neg)
-        except Exception:
+            if pyautogui is not None:
+                rect = win32gui.GetWindowRect(hwnd)
+                left, top, right, bottom = rect
+                w = right - left
+                h = bottom - top
+                if w > 0 and h > 0:
+                    img = pyautogui.screenshot(region=(left, top, w, h))
+                    return img.convert("RGB")
+        except:
             pass
-    def _on_mouse_move(self,x,y):
-        self.last_user_input=time.time()
-        rect=getattr(self,"window_rect",None)
-        if getattr(self,"drag_active",False) and rect is not None:
-            if rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3]:
-                if not hasattr(self,"drag_points") or self.drag_points is None:self.drag_points=[]
-                self.drag_points.append((x,y,time.time()))
-        if self.mode=="learn" and self.window_visible and self.window_full and rect is not None and self.recording_enabled and not self.resource_paused and self.capture_enabled:
-            if rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3]:
-                width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,0.0]
-                frame=self._current_frame_copy()
-                if frame is not None:self.writer.record(frame,action,[norm_x,norm_y],1,rect,self._window_title(),self.mode,"move");self.buffer.add(frame,action,1,1,0,-1,self.perception.last_text)
-    def _on_mouse_click(self,x,y,button,pressed):
-        self.last_user_input=time.time()
-        inside=False;rect=self.window_rect
-        if rect is not None:inside=(rect[0]<=x<=rect[2] and rect[1]<=y<=rect[3])
-        if pressed and self.mode=="learn" and self.window_visible and self.window_full and inside and self.recording_enabled and not self.resource_paused and self.capture_enabled:
-            self.drag_active=True;self.drag_points=[(x,y,time.time())];self.drag_start=time.time()
-            width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1);norm_x=(x-rect[0])/width;norm_y=(y-rect[1])/height;action=[0.0,0.0,1.0];frame=self._current_frame_copy()
-            if frame is not None:
-                pid=self.pool.add_click(frame,rect,norm_x,norm_y);self._save_click_patches(frame,norm_x,norm_y);self.writer.record(frame,action,[norm_x,norm_y],1,rect,self._window_title(),self.mode,"press",{"proto":int(pid)});self.buffer.add(frame,action,1,2,1,int(pid),self.perception.last_text);self.state_graph.note_action(self.perception.last_text,int(pid),1)
-                self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,1,np.zeros((64,),np.float32))
-        if (not pressed) and self.drag_active:
-            self.drag_active=False
-            if self.window_rect is not None:
-                width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1)
-                if len(self.drag_points)>=2:
-                    simp=_poly_simplify([(px,py) for px,py,_ in self.drag_points],eps=3.0)
-                    path=[((px-rect[0])/width,(py-rect[1])/height) for px,py in simp]
-                    frame=self._current_frame_copy()
-                    if frame is not None:
-                        pid=self.pool.add_drag(frame,rect,path);tid=self.templates.add_path(path);self.state_graph.note_action(self.perception.last_text,int(pid),2);self.writer.record(frame,[0.0,0.0,0.0],path[-1],1,rect,self._window_title(),self.mode,"drag",{"path":path,"tmpl":int(tid),"duration":time.time()-self.drag_start,"proto":int(pid)});self.buffer.add(frame,[0.0,0.0,0.0],1,tid,2,int(pid),self.perception.last_text);self.goal_graph.add(_now_ms(),int(pid),self.perception.last_text,2,np.zeros((64,),np.float32))
-    def _on_key_press(self,key):
-        self.last_user_input=time.time()
-        if key==keyboard.Key.esc:self.schedule(self.stop)
-        if self.mode=="train":
-            self._mouse_up_safety();self.ai_stop.set();self.root.after(0,self.set_mode,"learn")
-    def _current_frame_copy(self):
-        with self.frame_lock:
-            if self.frame is None:return None
-            return self.frame.copy()
-    def _window_title(self):
-        if self.window_title:
-            return self.window_title
-        if self.window_obj is not None:
+        return None
+
+def resize_for_model(img):
+    if Image is None:
+        return None
+    img = img.resize((84, 84), Image.BILINEAR)
+    arr = np.array(img, dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    arr = np.transpose(arr, (2, 0, 1))
+    return arr
+
+def record_experience(frame_arr, action_vec, source_flag):
+    global experience_buffer, experience_file_index
+    if frame_arr is None or action_vec is None:
+        return
+    with experience_lock:
+        experience_buffer.append((frame_arr, action_vec, source_flag))
+        if len(experience_buffer) >= 128:
             try:
-                return self.window_obj.title
-            except Exception:
-                return ""
-        return self.selected_title.get() or ""
-    def _update_ui(self):
-        try:
-            if not self.root.winfo_exists():
-                return
-        except Exception:
+                obs = np.stack([x[0] for x in experience_buffer], axis=0)
+                act = np.stack([x[1] for x in experience_buffer], axis=0).astype(np.float32)
+                src = np.array([x[2] for x in experience_buffer], dtype=np.int64)
+                tensor_obs = torch.from_numpy(obs)
+                tensor_act = torch.from_numpy(act)
+                tensor_src = torch.from_numpy(src)
+                path = os.path.join(experience_dir, f"experience_{experience_file_index}.pt")
+                experience_file_index += 1
+                torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src}, path)
+            except:
+                pass
+            experience_buffer = []
+
+def flush_experience_buffer():
+    global experience_buffer, experience_file_index
+    with experience_lock:
+        if not experience_buffer:
             return
-        while not self.ui_queue.empty():
-            func=self.ui_queue.get()
-            try:
-                func()
-            except Exception:
-                pass
-        with self.frame_lock:
-            frame=self.frame.copy() if self.frame is not None else None
-        if frame is not None:
-            rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-            image=Image.fromarray(rgb)
-            try:
-                target_w=max(1,int(self.frame_label.winfo_width()))
-                target_h=max(1,int(self.frame_label.winfo_height()))
-            except Exception:
-                target_w=0
-                target_h=0
-            if target_w<=1 or target_h<=1:
-                base_w=max(1,image.width)
-                target_w=min(640,base_w)
-                target_h=max(1,int(round(image.height*float(target_w)/float(base_w))))
-            scale=min(target_w/float(max(1,image.width)),target_h/float(max(1,image.height)))
-            if scale<=0:
-                scale=1.0
-            new_w=max(1,int(round(image.width*scale)))
-            new_h=max(1,int(round(image.height*scale)))
-            if new_w!=image.width or new_h!=image.height:
-                resample=getattr(Image,"LANCZOS",Image.BICUBIC)
-                image=image.resize((new_w,new_h),resample)
-            try:
-                self.photo=ImageTk.PhotoImage(image=image,master=self.root)
-                try:
-                    if self.frame_label.winfo_exists():
-                        self.frame_label.configure(image=self.photo)
-                        self.frame_label.image=self.photo
-                except Exception:
-                    pass
-            except Exception:
-                try:
-                    if self.frame_label.winfo_exists():
-                        self.frame_label.configure(image="")
-                        self.frame_label.image=None
-                except Exception:
-                    pass
-        else:
-            try:
-                if self.frame_label.winfo_exists():
-                    self.frame_label.configure(image="")
-                    self.frame_label.image=None
-            except Exception:
-                pass
-        self.cpu_var.set(f"CPU:{self.metrics['cpu']:.1f}%")
-        self.mem_var.set(f"Memory:{self.metrics['mem']:.1f}%")
-        self.gpu_var.set(f"GPU:{self.metrics['gpu']:.1f}%")
-        self.vram_var.set(f"VRAM:{self.metrics['vram']:.1f}%")
-        self.freq_var.set(f"截图频率:{self.metrics['freq']:.1f} Hz")
-        self.progress_text.set(f"{self.progress_var.get():.0f}%")
-        self.root.after(50,self._update_ui)
+        try:
+            obs = np.stack([x[0] for x in experience_buffer], axis=0)
+            act = np.stack([x[1] for x in experience_buffer], axis=0).astype(np.float32)
+            src = np.array([x[2] for x in experience_buffer], dtype=np.int64)
+            tensor_obs = torch.from_numpy(obs)
+            tensor_act = torch.from_numpy(act)
+            tensor_src = torch.from_numpy(src)
+            path = os.path.join(experience_dir, f"experience_{experience_file_index}.pt")
+            experience_file_index += 1
+            torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src}, path)
+        except:
+            pass
+        experience_buffer = []
 
-    def _check_mode_switch(self):
-        if not self.resource_paused and self.mode=="learn" and self.recording_enabled and self.window_visible and self.window_full and self.capture_enabled:
-            idle=self._idle_seconds()
-            if idle is not None and idle>=10.0:
-                self.set_mode("train")
-        self.root.after(200,self._check_mode_switch)
-    def _mouse_up_safety(self):
-        try:pyautogui.mouseUp()
-        except Exception:pass
-        self.hold_state=False
-    def set_mode(self,mode):
-        if not self.running:return
-        if mode==self.mode:return
-        if mode=="train":
-            if not self.window_visible or not self.window_full or self.resource_paused or not self.capture_enabled:return
-            self.mode="train";self.mode_var.set("Training");self._start_ai()
-        elif mode=="learn":
-            self._mouse_up_safety();self.mode="learn";self.mode_var.set("Learning");self._stop_ai();self._analysis_ready_time=time.monotonic()+0.75;self._analysis_next_frame=None
-        elif mode=="optimize":
-            self._mouse_up_safety();self.mode="optimize";self.mode_var.set("Optimizing");self._stop_ai()
-        elif mode=="init":
-            self._mouse_up_safety();self.mode="init";self.mode_var.set("Init");self._stop_ai()
-    def _start_ai(self):
-        self.ai_stop.clear()
-        if self.ai_thread is None or not self.ai_thread.is_alive():
-            self.ai_thread=threading.Thread(target=self._ai_loop,daemon=True);self.ai_thread.start()
-    def _stop_ai(self):
-        self.ai_stop.set();self.hold_state=False
-        try:pyautogui.mouseUp()
-        except Exception:pass
-    def _get_history_tensor(self):
-        with self.history_lock:
-            if len(self.frame_history)<4:
-                return None
-            frames=[f.copy() for f in self.frame_history[-4:]]
-        bh,bw=frames[0].shape[:2]
-        fixed=[]
-        for f in frames:
-            h,w=f.shape[:2]
-            if h!=bh or w!=bw:
+def hardware_monitor_loop():
+    global hardware_stats, screenshot_fps, program_running
+    while program_running:
+        try:
+            cpu = psutil.cpu_percent(interval=0.5)
+            mem = psutil.virtual_memory().percent
+            gpu = 0.0
+            vram = 0.0
+            if gpu_handle is not None and pynvml is not None:
                 try:
-                    f=cv2.resize(f,(bw,bh))
-                except Exception:
-                    bh,bw=h,w
-            fixed.append(f)
-        arr=np.stack(fixed,0).astype(np.float32)/255.0
-        arr=np.transpose(arr,(0,3,1,2))
-        arr=np.expand_dims(arr,0)
-        tensor=torch.from_numpy(arr).to(device,non_blocking=True)
-        return tensor
+                    util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
+                    meminfo = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+                    gpu = float(util.gpu)
+                    vram = float(meminfo.used) / float(meminfo.total) * 100.0 if meminfo.total > 0 else 0.0
+                except:
+                    gpu = 0.0
+                    vram = 0.0
+            elif gpu_available:
+                try:
+                    total = torch.cuda.get_device_properties(0).total_memory
+                    used = torch.cuda.memory_allocated(0)
+                    vram = float(used) / float(total) * 100.0 if total > 0 else 0.0
+                except:
+                    vram = 0.0
+                gpu = vram
+            hardware_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram}
+            metrics = [cpu, mem]
+            if gpu > 0.0:
+                metrics.append(gpu)
+            if vram > 0.0:
+                metrics.append(vram)
+            if metrics:
+                stress = max(metrics)
+                fps = 120.0 * max(0.0, min(1.0, 1.0 - stress / 100.0))
+            else:
+                fps = 60.0
+            screenshot_fps = max(0.0, min(120.0, fps))
+        except:
+            pass
 
-    def _ai_loop(self):
-        while self.running and not self.ai_stop.is_set():
-            if self.mode!="train" or not self.window_visible or not self.window_full or self.window_rect is None or self.resource_paused or not self.capture_enabled:
-                time.sleep(0.05)
-                continue
-            frames=self._get_history_tensor()
-            if frames is None:
-                time.sleep(0.05)
-                continue
+def window_visibility_check(hwnd):
+    global window_a_rect
+    if win32gui is None:
+        return False, (0, 0, 0, 0)
+    try:
+        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            return False, (0, 0, 0, 0)
+        if win32gui.IsIconic(hwnd):
+            return False, (0, 0, 0, 0)
+        rect = win32gui.GetWindowRect(hwnd)
+        left, top, right, bottom = rect
+        w = right - left
+        h = bottom - top
+        if w <= 0 or h <= 0:
+            return False, rect
+        sx = ctypes.windll.user32.GetSystemMetrics(76)
+        sy = ctypes.windll.user32.GetSystemMetrics(77)
+        sw = ctypes.windll.user32.GetSystemMetrics(78)
+        sh = ctypes.windll.user32.GetSystemMetrics(79)
+        if not (left >= sx and top >= sy and right <= sx + sw and bottom <= sy + sh):
+            return False, rect
+        sample_cols = 5
+        sample_rows = 5
+        for i in range(sample_cols):
+            for j in range(sample_rows):
+                px = left + (i + 0.5) * w / sample_cols
+                py = top + (j + 0.5) * h / sample_rows
+                if not (sx <= px < sx + sw and sy <= py < sy + sh):
+                    return False, rect
+                pt = (int(px), int(py))
+                try:
+                    hwnd_at_pt = win32gui.WindowFromPoint(pt)
+                    try:
+                        ga_root = getattr(win32con, "GA_ROOT", 2)
+                        root_hwnd = win32gui.GetAncestor(hwnd_at_pt, ga_root)
+                    except:
+                        root_hwnd = hwnd_at_pt
+                except:
+                    root_hwnd = hwnd
+                if root_hwnd != hwnd:
+                    return False, rect
+        window_a_rect = rect
+        return True, rect
+    except:
+        return False, (0, 0, 0, 0)
+
+def ai_compute_action(frame_arr):
+    global policy_model
+    if policy_model is None:
+        return None
+    try:
+        with model_lock:
+            model = policy_model
+            model.eval()
+            x = torch.from_numpy(frame_arr).unsqueeze(0)
             with torch.no_grad():
-                self.model.eval()
-                with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
-                    action,_,_,_,_=self.model(frames)
-            action=action.squeeze(0).float().cpu().numpy()
-            dx=float(action[0]);dy=float(action[1]);click_prob=float(action[2])
-            rect=self.window_rect
-            width=max(rect[2]-rect[0],1);height=max(rect[3]-rect[1],1)
-            target_x=rect[0]+width*(0.5+dx*0.25);target_y=rect[1]+height*(0.5+dy*0.25)
-            if click_prob>0.7 and not self.hold_state:
-                self.hold_state=True;pyautogui.mouseDown()
-            if click_prob<0.3 and self.hold_state:
-                self.hold_state=False;pyautogui.mouseUp()
-            cur=pyautogui.position()
-            dxp=abs(float(target_x)-float(cur[0]));dyp=abs(float(target_y)-float(cur[1]));
-            if dxp>=1 or dyp>=1:
-                dur=max(0.02,min(0.1,self.ai_interval*0.5 if hasattr(self,'ai_interval') else 0.05))
-                try:pyautogui.moveTo(target_x,target_y,duration=dur)
-                except ZeroDivisionError:pyautogui.moveTo(target_x,target_y,duration=0)
-            else:
-                pass
-            if not self.hold_state and 0.5<click_prob<=0.7:pyautogui.click()
-            frame=self._current_frame_copy()
-            if frame is not None and self.recording_enabled and not self.resource_paused:
-                norm_x=(target_x-rect[0])/width;norm_y=(target_y-rect[1])/height;self.writer.record(frame,[dx,dy,click_prob],[norm_x,norm_y],2,rect,self._window_title(),self.mode,"ai");self.buffer.add(frame,[dx,dy,click_prob],2,3,0,-1,self.perception.last_text)
-            time.sleep(self.ai_interval)
-    def _analyze_ui_async(self,frame):
-        now=time.monotonic()
-        start=False
-        with self._analysis_lock:
-            if now<self._analysis_ready_time:
-                self._analysis_next_frame=frame
-                return
-            if now-self._last_analysis<self.analysis_interval:
-                self._analysis_next_frame=frame
-                return
-            if self._analysis_active>0:
-                self._analysis_next_frame=frame
-                return
-            self._analysis_active+=1
-            self._last_analysis=now
-            self._analysis_ready_time=max(self._analysis_ready_time,now)+self.analysis_interval
-            start=True
-        if not start:
-            return
-        def worker(img):
+                pos, click_logit, control_logits, rule_logits = model(x)
+                pos = pos[0].cpu().numpy()
+                click_prob = torch.sigmoid(click_logit)[0].item()
+        nx = (pos[0] + 1.0) / 2.0
+        ny = (pos[1] + 1.0) / 2.0
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+        click_flag = 1.0 if click_prob > 0.5 else 0.0
+        return np.array([nx, ny, click_flag], dtype=np.float32)
+    except:
+        return None
+
+def frame_loop():
+    global window_a_visible, window_a_title, window_a_rect, last_frame_np, program_running, last_user_action_vec, last_ai_action_vec
+    last_time = time.time()
+    while program_running:
+        fps = screenshot_fps
+        if fps <= 0.0:
+            time.sleep(0.2)
+            continue
+        interval = 1.0 / fps if fps > 0 else 0.1
+        now = time.time()
+        delay = interval - (now - last_time)
+        if delay > 0:
+            time.sleep(delay)
+        last_time = time.time()
+        hwnd = window_a_handle
+        if hwnd is None:
+            window_a_visible = False
+            continue
+        vis, rect = window_visibility_check(hwnd)
+        window_a_visible = vis
+        window_a_rect = rect
+        if win32gui is not None:
             try:
-                dets,txt=self.perception.detect(img);self.pool.update_state(txt)
-                if dets and self.window_rect is not None:
-                    rect=self.window_rect
-                    for cx,cy,label,score in dets[:8]:
-                        self.writer.record(img,[0.0,0.0,0.0],[cx,cy],1,rect,self._window_title(),self.mode,"ui",{"label":label,"score":float(score)});self.buffer.add(img,[0.0,0.0,0.0],1,4,0,-1,txt)
-                self.state_graph.observe(txt)
-                if txt:self.rule_text=txt
-            except Exception:
-                pass
-            finally:
-                next_frame=None
-                delay=None
-                pending=None
-                with self._analysis_lock:
-                    self._analysis_active=max(0,self._analysis_active-1)
-                    if self._analysis_next_frame is not None:
-                        pending=self._analysis_next_frame
-                        if time.monotonic()>=self._analysis_ready_time:
-                            next_frame=pending
-                            self._analysis_next_frame=None
-                        else:
-                            delay=max(0.0,self._analysis_ready_time-time.monotonic())
-                            self._analysis_next_frame=None
-                if next_frame is not None:
-                    self._analyze_ui_async(next_frame)
-                elif delay is not None and pending is not None:
-                    timer=threading.Timer(delay,lambda img=pending:self._analyze_ui_async(img))
-                    timer.daemon=True
-                    timer.start()
-        threading.Thread(target=worker,args=(frame.copy(),),daemon=True).start()
-    def on_sleep(self):
-        if self.mode in ("learn","train") and self.recording_enabled and not self.resource_paused and self.models_ready():
-            self._mouse_up_safety();self.recording_enabled=False;self.getup_btn.configure(state="normal");self.sleep_btn.configure(state="disabled");self._set_progress_ui(0.0);self.set_mode("optimize");self.optimize_event=threading.Event();self.optimize_thread=threading.Thread(target=self._optimize_loop,daemon=True);self.optimize_thread.start()
+                window_a_title_local = win32gui.GetWindowText(hwnd)
+            except:
+                window_a_title_local = ""
         else:
-            self.pause_var.set("模型未就绪或资源受限，已暂停且 10 秒切换规则失效")
-    def _confirm_dialog(self):
-        q=queue.Queue(maxsize=1)
-        def dlg():
-            top=tk.Toplevel(self.root);top.title("Optimization Done")
-            ttk.Label(top,text="优化完成").grid(row=0,column=0,sticky="ew")
-            def ok():
-                if q.empty():q.put(True);top.destroy()
-            ttk.Button(top,text="Confirm",command=ok).grid(row=1,column=0,sticky="ew")
-            top.grab_set();top.protocol("WM_DELETE_WINDOW",ok)
-        self.schedule(dlg);q.get()
-    def on_getup(self):
-        if self.mode=="optimize" and self.optimize_event is not None:
-            self.optimize_event.set();self._stop_progress_monitor();self._set_progress_ui(0.0);self.progress_stage.set("优化已中止");self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled");self.getup_btn.configure(state="disabled");self.recording_enabled=True;self._mouse_up_safety();self.set_mode("learn")
-    def _compute_reward(self,seq_frames,txt):
-        try:
-            a=seq_frames[-1].astype(np.float32);b=seq_frames[-2].astype(np.float32);diff=np.mean(np.abs(a-b))/255.0
-        except Exception:
-            diff=0.0
-        bonus=0.0;s=(txt or "").lower()
-        if any(k in s for k in ["score","win","victory","complete","success","level"]):bonus+=1.0
-        if any(k in s for k in ["fail","lose","game over","defeat"]):bonus-=1.0
-        m=re.findall(r"\d+",s)
-        if len(m)>=2:
-            try:
-                if int(m[-1])>int(m[-2]):bonus+=0.5
-            except Exception:
-                pass
-        return float(np.clip(diff*0.5+bonus,-1.0,2.0))
-    def _optimize_loop(self):
-        error=None
-        interrupted=False
-        completed=False
-        skip_finalize=False
-        monitor_started=False
-        backup=None
-        saved_snapshot=False
-        try:
-            try:
-                if os.path.exists(model_path):backup=torch.load(model_path,map_location="cpu")
-            except Exception:backup=None
-            hot=self.metrics["temp"]>=80 or self.metrics["pwr"]>=0.95
-            seq_len=2 if hot else 4
-            ds=DiskExperienceDataset(experience_dir,seq=seq_len,aug=True)
-            fallback_mode=not ds.has_samples()
-            if fallback_mode:
-                def warn():
-                    self.progress_stage.set("经验数据稀少")
-                    self.pause_var.set("经验数据不足，使用空白样本优化")
-                self.schedule(warn)
-            def build_fallback_batch():
-                idx=0
-                if ds.real_count>0:
+            window_a_title_local = ""
+        window_a_title = window_a_title_local
+        if not vis:
+            continue
+        img = capture_window_image(hwnd)
+        if img is None:
+            continue
+        frame_arr_model = resize_for_model(img)
+        with last_frame_lock:
+            last_frame_np = np.array(img)
+        mode = get_mode()
+        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and not optimization_running
+        action_vec = None
+        source_flag = 0
+        if mode == MODE_TRAIN:
+            if frame_arr_model is not None:
+                a = ai_compute_action(frame_arr_model)
+                if a is not None:
+                    last_ai_action_vec = a
+                action_vec = last_ai_action_vec
+                source_flag = 1
+                if action_vec is not None and pyautogui is not None:
+                    nx, ny, click_flag = float(action_vec[0]), float(action_vec[1]), float(action_vec[2])
+                    x, y = denormalize_action_to_mouse(nx, ny, rect)
                     try:
-                        idx=random.randint(0,max(0,ds.real_count-1))
-                    except Exception:
-                        idx=0
-                sample=ds.__getitem__(idx)
-                if isinstance(sample,(tuple,list)):
-                    seq=sample[0]
-                    act=sample[1] if len(sample)>=2 else np.zeros((3,),np.float32)
-                    atype=sample[2] if len(sample)>=3 else 0
-                    ctrl=sample[3] if len(sample)>=4 else -1
-                    tmpl=sample[4] if len(sample)>=5 else -1
-                    path_vec=sample[5] if len(sample)>=6 else np.zeros((64,),np.float32)
-                    text=sample[6] if len(sample)>=7 else ""
-                    success=sample[7] if len(sample)>=8 else 0
-                else:
-                    seq=sample
-                    act=np.zeros((3,),np.float32)
-                    atype=0
-                    ctrl=-1
-                    tmpl=-1
-                    path_vec=np.zeros((64,),np.float32)
-                    text=""
-                    success=0
-                seq_arr=np.asarray(seq)
-                if seq_arr.ndim==4:
-                    seq_arr=np.expand_dims(seq_arr,0)
-                elif seq_arr.ndim<4:
-                    seq_arr=np.asarray(np.zeros((1,seq_len,256,256,3),np.uint8))
-                act_arr=np.asarray(act,dtype=np.float32)
-                if act_arr.ndim==1:
-                    act_arr=act_arr.reshape(1,-1)
-                atype_arr=np.asarray(atype,dtype=np.int64).reshape(1)
-                ctrl_arr=np.asarray(ctrl,dtype=np.int64).reshape(1)
-                tmpl_arr=np.asarray(tmpl,dtype=np.int64).reshape(1)
-                path_arr=np.asarray(path_vec,dtype=np.float32)
-                if path_arr.ndim==1:
-                    path_arr=path_arr.reshape(1,-1)
-                success_arr=np.asarray(success,dtype=np.int64).reshape(1)
-                return (torch.from_numpy(np.ascontiguousarray(seq_arr)),torch.from_numpy(np.ascontiguousarray(act_arr)),torch.from_numpy(np.ascontiguousarray(atype_arr)),torch.from_numpy(np.ascontiguousarray(ctrl_arr)),torch.from_numpy(np.ascontiguousarray(tmpl_arr)),torch.from_numpy(np.ascontiguousarray(path_arr)),[str(text)],torch.from_numpy(np.ascontiguousarray(success_arr)))
-            M=max(self.metrics["cpu"],self.metrics["mem"],self.metrics["gpu"],self.metrics["vram"])/100.0
-            real_samples=max(0,ds.real_count)
-            force_synthetic=real_samples<8
-            base_workers=max(0,min(6,os.cpu_count() or 2)-1)
-            if real_samples<=2:
-                num_workers=0
-            else:
-                num_workers=min(base_workers,max(0,real_samples-1))
-            force_single_worker=(os.name=="nt") or (threading.current_thread() is not threading.main_thread())
-            if force_single_worker:
-                num_workers=0
-            bs=max(4,int(8+64*(1.0-M)))
-            if real_samples>0 and real_samples<bs:
-                bs=max(1,real_samples)
-            small_sample_limit=max(8,bs+8)
-            manual_sampling=fallback_mode or real_samples<=small_sample_limit or force_synthetic
-            if manual_sampling:
-                num_workers=0
-            lr=1e-4*(0.5 if hot else 1.0)
-            for g in self.optimizer.param_groups:g["lr"]=lr
-            drop_last=(not manual_sampling) and real_samples>=bs*2 and bs>0
-            loader_kwargs={"batch_size":bs,"shuffle":True,"num_workers":0,"pin_memory":(device=="cuda"),"drop_last":drop_last}
-            dl=None
-            if not manual_sampling:
-                loader_kwargs["num_workers"]=num_workers
-                if num_workers>0:
-                    loader_kwargs["persistent_workers"]=num_workers>0 and ds.real_count>=num_workers*2
-                    loader_kwargs["prefetch_factor"]=4
-                try:
-                    dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
-                except Exception:
-                    loader_kwargs["num_workers"]=0
-                    loader_kwargs.pop("persistent_workers",None)
-                    loader_kwargs.pop("prefetch_factor",None)
-                    try:
-                        dl=torch.utils.data.DataLoader(ds,**loader_kwargs)
-                    except Exception:
-                        dl=None
-                        manual_sampling=True
-            def _compose_opt_msg():
-                suffix=""
-                if force_single_worker:
-                    suffix+="（单线程数据加载）"
-                if manual_sampling:
-                    suffix+="（小样本手工采样）"
-                if force_synthetic:
-                    suffix+="（极少样本降级）"
-                return self._optimize_notice+suffix
-            epochs=2 if fallback_mode else 3
-            if force_synthetic:
-                steps_per_epoch=0
-                epochs=0
-            elif fallback_mode:
-                steps_per_epoch=max(4,min(16,bs))
-            elif manual_sampling:
-                real_len=max(1,ds.real_count)
-                steps_per_epoch=max(1,math.ceil(real_len/max(1,bs)))
-            else:
-                try:
-                    steps_per_epoch=max(1,len(dl))
-                except Exception:
-                    real_len=max(1,ds.real_count)
-                    steps_per_epoch=max(1,(real_len//max(1,bs)) if drop_last else math.ceil(real_len/max(1,bs)))
-            total=max(1,steps_per_epoch*epochs)
-            done_steps=0
-            self.model.train()
-            best_loss=None
-            best_state=None
-            c_scores={}
-            start_time=time.time()
-            opt_msg=_compose_opt_msg()
-            self._current_optimize_message=opt_msg
-            self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
-            self._start_progress_monitor(total,epochs,steps_per_epoch)
-            monitor_started=True
-            manual_notice_sent=manual_sampling
-            wait_notice_sent=False
-            virtual_done=0
-            synthetic_triggered=force_synthetic
-            wait_threshold=3.0
-            force_batch_interval=6.0
-            max_wait=12.0
-            last_forced_batch=start_time
-            def prepare_inputs(item):
-                sample=self.buffer.sample(batch=max(2,bs//2),seq=seq_len)
-                if sample is not None:
-                    frames_b,actions_b,_,tmpls_b,atypes_b,ctrls_b,txts_b=sample
-                    seq_np=frames_b.astype(np.float32)
-                    seq_t=torch.from_numpy(np.transpose(seq_np,(0,1,4,2,3))/255.0).to(device,non_blocking=True)
-                    act_t=torch.from_numpy(actions_b.astype(np.float32)).to(device,non_blocking=True)
-                    atype_t=torch.from_numpy(atypes_b.astype(np.int64)).to(device,non_blocking=True)
-                    ctrl_t=torch.from_numpy(ctrls_b.astype(np.int64)).to(device,non_blocking=True)
-                    tmpl_t=torch.from_numpy(tmpls_b.astype(np.int64)).to(device,non_blocking=True)
-                    path_t=torch.zeros((seq_t.shape[0],64),device=device,dtype=torch.float32)
-                    text_list=[str(t) for t in txts_b]
-                    success_t=torch.tensor([1 if any(k in (t or "").lower() for k in ["win","victory","success","complete"]) else 0 for t in text_list],device=device,dtype=torch.long)
-                    return seq_t,act_t,atype_t.long(),ctrl_t.long(),tmpl_t.long(),path_t,text_list,success_t
-                if item is None:
-                    item=build_fallback_batch()
-                if isinstance(item,(tuple,list)):
-                    seq=item[0];act=item[1]
-                    atype=item[2] if len(item)>=3 else torch.zeros((1,),dtype=torch.long)
-                    ctrl=item[3] if len(item)>=4 else torch.full((1,),-1,dtype=torch.long)
-                    tmpl=item[4] if len(item)>=5 else torch.full((1,),-1,dtype=torch.long)
-                    path=item[5] if len(item)>=6 else torch.zeros((1,64),dtype=torch.float32)
-                    texts=item[6] if len(item)>=7 else [""]
-                    success=item[7] if len(item)>=8 else torch.zeros((1,),dtype=torch.long)
-                else:
-                    seq,act=item
-                    atype=torch.zeros((1,),dtype=torch.long)
-                    ctrl=torch.full((1,),-1,dtype=torch.long)
-                    tmpl=torch.full((1,),-1,dtype=torch.long)
-                    path=torch.zeros((1,64),dtype=torch.float32)
-                    texts=[""]
-                    success=torch.zeros((1,),dtype=torch.long)
-                seq_arr=seq.detach().cpu().numpy() if isinstance(seq,torch.Tensor) else np.asarray(seq)
-                if seq_arr.ndim==4:
-                    seq_arr=np.expand_dims(seq_arr,0)
-                if seq_arr.ndim!=5:
-                    seq_arr=np.zeros((1,seq_len,256,256,3),np.uint8)
-                act_arr=act.detach().cpu().numpy() if isinstance(act,torch.Tensor) else np.asarray(act,dtype=np.float32)
-                if act_arr.ndim==1:
-                    act_arr=act_arr.reshape(1,-1)
-                if act_arr.shape[0]!=seq_arr.shape[0]:
-                    if act_arr.shape[0]==1:
-                        act_arr=np.repeat(act_arr,seq_arr.shape[0],axis=0)
-                    else:
-                        act_arr=act_arr[:seq_arr.shape[0]]
-                def _norm_arr(x,fill=0,dtype=np.int64):
-                    if isinstance(x,torch.Tensor):
-                        arr=x.detach().cpu().numpy()
-                    else:
-                        arr=np.asarray(x,dtype=dtype)
-                    if arr.ndim==0:
-                        arr=arr.reshape(1)
-                    if arr.size==0:
-                        arr=np.full((seq_arr.shape[0],),fill,dtype=dtype)
-                    if arr.shape[0]!=seq_arr.shape[0]:
-                        if arr.shape[0]==1:
-                            arr=np.full((seq_arr.shape[0],),arr.item(),dtype=dtype)
-                        else:
-                            arr=arr[:seq_arr.shape[0]]
-                    return arr.astype(dtype)
-                atype_arr=_norm_arr(atype,0,np.int64)
-                ctrl_arr=_norm_arr(ctrl,-1,np.int64)
-                tmpl_arr=_norm_arr(tmpl,-1,np.int64)
-                if isinstance(path,torch.Tensor):
-                    path_arr=path.detach().cpu().numpy()
-                else:
-                    path_arr=np.asarray(path,dtype=np.float32)
-                if path_arr.ndim==1:
-                    path_arr=path_arr.reshape(1,-1)
-                if path_arr.shape[0]!=seq_arr.shape[0]:
-                    if path_arr.shape[0]==1:
-                        path_arr=np.repeat(path_arr,seq_arr.shape[0],axis=0)
-                    else:
-                        path_arr=path_arr[:seq_arr.shape[0]]
-                if path_arr.shape[1]<64:
-                    pad=np.zeros((path_arr.shape[0],64-path_arr.shape[1]),np.float32)
-                    path_arr=np.concatenate([path_arr,pad],1)
-                path_arr=path_arr[:, :64].astype(np.float32)
-                if isinstance(texts,(list,tuple)):
-                    text_list=[str(t) for t in texts]
-                    if len(text_list)==1 and seq_arr.shape[0]>1:
-                        text_list=text_list*seq_arr.shape[0]
-                    elif len(text_list)<seq_arr.shape[0]:
-                        text_list=text_list+[""]*(seq_arr.shape[0]-len(text_list))
-                    else:
-                        text_list=text_list[:seq_arr.shape[0]]
-                else:
-                    text_list=[str(texts)]*seq_arr.shape[0]
-                success_arr=_norm_arr(success,0,np.int64)
-                seq_t=torch.from_numpy(np.transpose(seq_arr.astype(np.float32)/255.0,(0,1,4,2,3))).to(device,non_blocking=True)
-                act_t=torch.from_numpy(act_arr.astype(np.float32)).to(device,non_blocking=True)
-                atype_t=torch.from_numpy(atype_arr).to(device,non_blocking=True)
-                ctrl_t=torch.from_numpy(ctrl_arr).to(device,non_blocking=True)
-                tmpl_t=torch.from_numpy(tmpl_arr).to(device,non_blocking=True)
-                path_t=torch.from_numpy(path_arr).to(device,non_blocking=True)
-                success_t=torch.from_numpy(success_arr).to(device,non_blocking=True)
-                return seq_t,act_t,atype_t.long(),ctrl_t.long(),tmpl_t.long(),path_t.float(),text_list,success_t.long()
-            epoch_steps=0
-            phase_ready=False
-            def train_batch(item,step_cap):
-                nonlocal epoch_steps,done_steps,best_loss,best_state,phase_ready,total,virtual_done,wait_notice_sent
-                try:
-                    seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(item)
-                except Exception:
-                    seq_t,act_t,atype_t,ctrl_t,tmpl_t,path_vec,texts,success=prepare_inputs(build_fallback_batch())
-                if seq_t is None or seq_t.shape[0]==0:
-                    if not phase_ready:
-                        self._update_progress_phase("训练中")
-                        phase_ready=True
-                    self._touch_progress_watchdog()
-                    return False
-                if not phase_ready:
-                    self._update_progress_phase("训练中")
-                    phase_ready=True
-                self.optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=(device=="cuda")):
-                    logits,values,atype_logits,elem_emb,path_pred=self.model(seq_t)
-                    loss_policy=F.mse_loss(logits,act_t)
-                    with torch.no_grad():
-                        seq_np=(seq_t.detach().float().cpu().numpy()*255.0).transpose(0,1,3,4,2)
-                        rewards=np.array([self._compute_reward(s,(texts[i] if i<len(texts) else "")) for i,s in enumerate(seq_np)],dtype=np.float32)
-                        returns=torch.from_numpy(rewards).to(device)
-                    loss_value=F.mse_loss(values,returns)
-                    at_mask=(atype_t>=0)&(atype_t<=2)
-                    loss_atype=F.cross_entropy(atype_logits[at_mask],atype_t[at_mask]) if at_mask.any() else torch.zeros((),device=device)
-                    protoM,id2idx=self.pool.matrix()
-                    if protoM is not None and protoM.shape[0]>0:
-                        if ctrl_t.dim()==0:
-                            ctrl_t=ctrl_t.unsqueeze(0)
-                        map_idx=torch.full_like(ctrl_t,-1)
-                        if id2idx:
-                            for i in range(ctrl_t.shape[0]):
-                                cid=int(ctrl_t[i].item())
-                                if cid in id2idx:map_idx[i]=id2idx[cid]
-                        c_mask=map_idx>=0
-                        loss_ctrl=torch.zeros((),device=device)
-                        if c_mask.any():
-                            sim=torch.matmul(elem_emb[c_mask],protoM.T)
-                            loss_ctrl=F.cross_entropy(sim,map_idx[c_mask])
-                    else:
-                        loss_ctrl=torch.zeros((),device=device)
-                    tmplM,tid2idx=self.templates.matrix()
-                    loss_tmpl=torch.zeros((),device=device)
-                    if tmplM is not None:
-                        tt=tmpl_t
-                        if tt.dim()==0:
-                            tt=tt.unsqueeze(0)
-                        tmap=torch.full_like(tt,-1)
-                        if tid2idx:
-                            for i in range(tt.shape[0]):
-                                ti=int(tt[i].item())
-                                if ti in tid2idx:
-                                    tmap[i]=tid2idx[ti]
-                        tmask=tmap>=0
-                        if tmask.any():
-                            pnorm=F.normalize(path_pred,dim=1)
-                            simt=torch.matmul(pnorm[tmask],tmplM.T)
-                            loss_tmpl=F.cross_entropy(simt,tmap[tmask])
-                    loss_path=F.mse_loss(path_pred,path_vec) if path_vec is not None else torch.zeros((),device=device)
-                    goal_weight=torch.ones_like(values)
-                    try:
-                        gscores=self.goal_graph.granger()
-                        for i in range(ctrl_t.shape[0]):
-                            pid=int(ctrl_t[i].item())
-                            if pid in gscores:goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,gscores[pid])))
-                            goal_weight[i]=goal_weight[i]*(1.0+max(0.0,min(1.0,self.state_graph.reachability(pid))))
-                        c_scores=gscores
-                    except Exception:
+                        pyautogui.moveTo(x, y)
+                        if click_flag >= 0.5:
+                            pyautogui.click()
+                    except:
                         pass
-                    loss_value=(loss_value*goal_weight.mean()).mean()
-                    loss=loss_policy+0.5*loss_value+0.2*loss_atype+0.2*loss_ctrl+0.1*loss_path+0.1*loss_tmpl
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.step(self.optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    self.optimizer.step()
-                epoch_steps+=1
-                done_steps+=1
-                virtual_done=max(0,virtual_done-1)
-                if wait_notice_sent:
-                    opt_msg=_compose_opt_msg()
-                    self._current_optimize_message=opt_msg
-                    self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
-                wait_notice_sent=False
-                self._update_progress_step(min(epoch_steps,step_cap),min(done_steps,total),total)
-                prog=5.0+90.0*(min(done_steps,total)/max(1,total))
-                self.schedule(lambda v=prog:self._set_progress_ui(v))
-                if best_loss is None or float(loss.item())<best_loss:
-                    best_loss=float(loss.item())
-                    best_state=self._snapshot_state_dict()
-                return True
-            if not synthetic_triggered:
-                for ep in range(epochs):
-                    if self.optimize_event.is_set():break
-                    self._update_progress_epoch(ep,epochs,steps_per_epoch)
-                    iterator=iter(dl) if dl is not None else None
-                    epoch_steps=0
-                    phase_ready=False
-                    fallback_provided=False
-                    loader_wait_start=time.time()
-                    loader_fail_count=0
-                    while epoch_steps<steps_per_epoch:
-                        if self.optimize_event.is_set():break
-                        item=None
-                        if iterator is not None:
-                            try:
-                                item=next(iterator)
-                                loader_wait_start=time.time()
-                                loader_fail_count=0
-                            except StopIteration:
-                                if epoch_steps==0 and not fallback_provided:
-                                    item=build_fallback_batch()
-                                    fallback_provided=True
-                                else:
-                                    break
-                            except Exception:
-                                iterator=None
-                                manual_sampling=True
-                                dl=None
-                                item=build_fallback_batch()
-                                fallback_provided=True
-                        else:
-                            item=build_fallback_batch()
-                            fallback_provided=True
-                        if not train_batch(item,steps_per_epoch):
-                            loader_fail_count+=1
-                            now=time.time()
-                            wait_elapsed=now-loader_wait_start
-                            if wait_elapsed>wait_threshold:
-                                virtual_done=min(total-1-done_steps,virtual_done+1)
-                                display_done=min(total-1,done_steps+virtual_done)
-                                display_done=max(done_steps,display_done)
-                                self._update_progress_step(min(epoch_steps,steps_per_epoch),display_done,total)
-                                ratio=display_done/max(1,total)
-                                self.schedule(lambda v=5.0+90.0*ratio:self._set_progress_ui(v))
-                                degrade_text="经验数据不足，使用降级样本..."
-                                if not wait_notice_sent:
-                                    self._current_optimize_message=degrade_text
-                                    self.schedule(lambda text=degrade_text:self.pause_var.set(text) if self.mode=="optimize" else None)
-                                    wait_notice_sent=True
-                                self._touch_progress_watchdog()
-                                if not phase_ready:
-                                    self._update_progress_phase("训练中")
-                                    phase_ready=True
-                            if now-last_forced_batch>force_batch_interval and wait_elapsed>wait_threshold:
-                                last_forced_batch=now
-                                if train_batch(build_fallback_batch(),steps_per_epoch):
-                                    loader_wait_start=time.time()
-                                    continue
-                            if wait_elapsed>max_wait:
-                                synthetic_triggered=True
-                                self._touch_progress_watchdog()
-                                break
-                            if not manual_sampling and (wait_elapsed>5.0 or loader_fail_count>3):
-                                iterator=None
-                                manual_sampling=True
-                                dl=None
-                                loader_wait_start=time.time()
-                                opt_msg=_compose_opt_msg()
-                                self._current_optimize_message=opt_msg
-                                self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
-                                manual_notice_sent=True
-                                self._touch_progress_watchdog()
-                            continue
-                        if self.optimize_event.is_set():break
-                        loader_wait_start=time.time()
-                        if manual_sampling and not manual_notice_sent:
-                            opt_msg=_compose_opt_msg()
-                            self._current_optimize_message=opt_msg
-                            self.schedule(lambda text=opt_msg:self.pause_var.set(text) if self.mode=="optimize" else None)
-                            manual_notice_sent=True
-                    if synthetic_triggered or self.optimize_event.is_set():
-                        break
-            if synthetic_triggered and done_steps==0:
-                degrade_text="长时间等待数据，改用降级样本优化"
-                self._current_optimize_message=degrade_text
-                self.schedule(lambda text=degrade_text:self.pause_var.set(text) if self.mode=="optimize" else None)
-            interrupted=self.optimize_event.is_set() if self.optimize_event is not None else False
-            if not interrupted and done_steps==0:
-                synthetic_steps=max(4,min(16,bs))
-                total=max(1,synthetic_steps)
-                self._update_progress_epoch(0,1,synthetic_steps)
-                epoch_steps=0
-                phase_ready=False
-                attempts=0
-                max_attempts=max(6,synthetic_steps*3)
-                while epoch_steps<synthetic_steps and attempts<max_attempts:
-                    if self.optimize_event.is_set():break
-                    attempts+=1
-                    item=build_fallback_batch()
-                    if train_batch(item,synthetic_steps):
-                        continue
-                interrupted=self.optimize_event.is_set() if self.optimize_event is not None else interrupted
-            if not interrupted:
-                self._update_progress_phase("保存模型")
-                if best_state is not None:
-                    try:self.model.load_state_dict(best_state,strict=False)
-                    except Exception:pass
-                    snapshot=best_state
-                else:
-                    snapshot=None
-                self._save_model_snapshot(snapshot)
-                saved_snapshot=True
-                self.schedule(lambda:self._set_progress_ui(100.0))
-                if monitor_started:
-                    self._stop_progress_monitor()
-                    monitor_started=False
-                self.schedule(lambda:self.progress_stage.set("优化完成，请确认"))
-                self._confirm_dialog()
-                completed=True
-        except Exception:
-            error=traceback.format_exc()
-            try:
-                if backup is not None:self.model.load_state_dict(backup,strict=False)
-            except Exception:
-                pass
-        finally:
-            interrupted=self.optimize_event.is_set() if self.optimize_event is not None else interrupted
-            if not saved_snapshot:
-                snapshot_target=None
-                if best_state is not None and (completed or interrupted or (error is not None)):
-                    try:self.model.load_state_dict(best_state,strict=False)
-                    except Exception:pass
-                    snapshot_target=best_state
-                elif backup is not None and (interrupted or (error is not None)):
-                    try:self.model.load_state_dict(backup,strict=False)
-                    except Exception:pass
-                    snapshot_target=backup
-                if snapshot_target is None:
-                    snapshot_target=self._snapshot_state_dict()
-                self._save_model_snapshot(snapshot_target)
-                saved_snapshot=True
-            if skip_finalize:
-                self.optimize_event=None
-                self.optimize_thread=None
-                return
-            if monitor_started:
-                self._stop_progress_monitor()
-            def finalize(err=error,done=completed,int_flag=interrupted):
-                self._current_optimize_message=self._optimize_notice
-                if done:
-                    self._set_progress_ui(0.0)
-                    self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
-                    self.getup_btn.configure(state="disabled")
-                    self.recording_enabled=True
-                    self.progress_stage.set("")
-                    self.pause_var.set("")
-                    self.set_mode("learn")
-                else:
-                    self._set_progress_ui(0.0)
-                    self.sleep_btn.configure(state="normal" if self.models_ready() else "disabled")
-                    self.getup_btn.configure(state="disabled")
-                    self.recording_enabled=True
-                    self.set_mode("learn")
-                    if int_flag:
-                        self.progress_stage.set("优化已中止")
-                        self.pause_var.set("优化已中止，已恢复学习模式")
+        elif mode == MODE_LEARN:
+            if win32gui is not None:
+                try:
+                    pt = win32gui.GetCursorPos()
+                except:
+                    pt = None
+                if pt is not None and rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]:
+                    nx, ny = normalize_action_from_mouse(pt[0], pt[1], rect)
+                    click_flag = 1.0 if is_left_button_pressed() else 0.0
+                    action_vec = np.array([nx, ny, click_flag], dtype=np.float32)
+            if action_vec is not None:
+                last_user_action_vec = action_vec
+            action_vec = last_user_action_vec
+            source_flag = 0
+        if recording and frame_arr_model is not None and action_vec is not None:
+            record_experience(frame_arr_model, action_vec, source_flag)
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+def get_system_idle_seconds():
+    try:
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            ticks = ctypes.windll.kernel32.GetTickCount()
+            delta = ticks - info.dwTime
+            if delta < 0:
+                delta = 0
+            return delta / 1000.0
+    except:
+        return None
+    return None
+
+def idle_mode_manager():
+    global last_user_input_time
+    if not program_running:
+        return
+    try:
+        mode = get_mode()
+        if mode == MODE_LEARN:
+            idle = get_system_idle_seconds()
+            if idle is not None:
+                if idle >= 10.0 and window_a_visible:
+                    set_mode(MODE_TRAIN)
+            else:
+                now = time.monotonic()
+                if now - last_user_input_time >= 10.0 and window_a_visible:
+                    set_mode(MODE_TRAIN)
+    except:
+        pass
+    root.after(500, idle_mode_manager)
+
+def keyboard_listener_loop():
+    global last_user_input_time
+    if keyboard is None:
+        return
+    def on_press(key):
+        global last_user_input_time
+        last_user_input_time = time.monotonic()
+        try:
+            if key == keyboard.Key.esc or (hasattr(key, "vk") and key.vk == 27):
+                terminate_program()
+                return False
+        except:
+            pass
+        if get_mode() == MODE_TRAIN:
+            set_mode(MODE_LEARN)
+    with keyboard.Listener(on_press=on_press) as listener:
+        listener.join()
+
+def mouse_listener_loop():
+    global last_user_input_time
+    if mouse is None:
+        return
+    def on_move(x, y):
+        global last_user_input_time
+        last_user_input_time = time.monotonic()
+    def on_click(x, y, button, pressed):
+        global last_user_input_time
+        last_user_input_time = time.monotonic()
+    def on_scroll(x, y, dx, dy):
+        global last_user_input_time
+        last_user_input_time = time.monotonic()
+    with mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll) as listener:
+        listener.join()
+
+def global_input_loop():
+    global last_user_input_time
+    while program_running:
+        try:
+            any_key = False
+            for vk in range(8, 256):
+                state = ctypes.windll.user32.GetAsyncKeyState(vk)
+                if state & 0x8000:
+                    any_key = True
+                    if vk == 0x1B:
+                        terminate_program()
+                        return
                     else:
-                        self.progress_stage.set("优化失败")
-                        self.pause_var.set("优化失败，已恢复学习模式")
-            self.schedule(finalize)
-            if error and not interrupted:
-                def show_error(msg=error):
-                    try:
-                        text=msg if len(msg)<=1200 else msg[-1200:]
-                        messagebox.showerror("优化失败",text)
-                    except Exception:pass
-                self.schedule(show_error)
-            self.optimize_event=None
-            self.optimize_thread=None
-    def stop(self):
-        self.running=False
-        try:self._stop_ai()
-        except Exception:pass
-        try:self.root.destroy()
-        except Exception:pass
-    def run(self):
-        self.root.mainloop()
+                        if get_mode() == MODE_TRAIN:
+                            set_mode(MODE_LEARN)
+                    break
+            if any_key:
+                last_user_input_time = time.monotonic()
+        except:
+            pass
+        time.sleep(0.05)
+
+def optimize_model_thread():
+    global optimization_running, optimization_progress, optimization_cancel_requested, optimization_finished_flag, optimization_finished_cancelled, policy_model
+    optimization_running = True
+    optimization_progress = 0.0
+    optimization_finished_flag = False
+    optimization_finished_cancelled = False
+    flush_experience_buffer()
+    dataset = ExperienceDataset(experience_dir)
+    if len(dataset) == 0:
+        model = PolicyNet()
+        try:
+            torch.save(model.state_dict(), model_path)
+            ts_name = os.path.join(models_dir, f"policy_{int(time.time())}.pt")
+            torch.save(model.state_dict(), ts_name)
+        except:
+            pass
+        with model_lock:
+            policy_model = model
+        optimization_running = False
+        optimization_finished_flag = True
+        optimization_finished_cancelled = False
+        return
+    device = "cuda" if gpu_available else "cpu"
+    model = PolicyNet()
+    try:
+        state = torch.load(model_path, map_location="cpu")
+        model.load_state_dict(state)
+    except:
+        pass
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    bce = nn.BCEWithLogitsLoss()
+    mse = nn.MSELoss()
+    bce_control = nn.BCEWithLogitsLoss()
+    ce_rule = nn.CrossEntropyLoss()
+    if device == "cuda":
+        scaler = torch.amp.GradScaler("cuda")
+    else:
+        scaler = None
+    batch_size = min(32, max(1, len(dataset)))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    total_steps = max(1, len(loader) * 3)
+    step = 0
+    for epoch in range(3):
+        for batch in loader:
+            if optimization_cancel_requested:
+                break
+            obs, act, src = batch
+            obs = obs.to(device)
+            act = act.to(device)
+            target_pos = act[:, :2]
+            target_click = act[:, 2]
+            optimizer.zero_grad()
+            if device == "cuda":
+                ctx = torch.amp.autocast("cuda")
+            else:
+                ctx = contextlib.nullcontext()
+            with ctx:
+                pos, click_logit, control_logits, _ = model(obs)
+                loss_pos = mse((pos + 1.0) / 2.0, target_pos)
+                loss_click = bce(click_logit, target_click)
+                gh = model.grid_h
+                gw = model.grid_w
+                control_target = torch.zeros((obs.size(0), 1, gh, gw), device=device)
+                click_mask = target_click >= 0.5
+                if click_mask.any():
+                    idx = torch.nonzero(click_mask, as_tuple=False).squeeze(1)
+                    cx = (target_pos[idx, 0] * (gw - 1)).long().clamp(0, gw - 1)
+                    cy = (target_pos[idx, 1] * (gh - 1)).long().clamp(0, gh - 1)
+                    control_target[idx, 0, cy, cx] = 1.0
+                loss_control = bce_control(control_logits, control_target)
+                loss = loss_pos + loss_click + 0.1 * loss_control
+                if obs.size(0) > 0:
+                    aug_list = []
+                    label_list = []
+                    for k in range(4):
+                        aug = torch.rot90(obs, k, dims=(2, 3))
+                        aug_list.append(aug)
+                        label_list.append(torch.full((obs.size(0),), k, dtype=torch.long, device=device))
+                    obs_aug = torch.cat(aug_list, dim=0)
+                    rot_labels = torch.cat(label_list, dim=0)
+                    _, _, _, rule_logits = model(obs_aug)
+                    loss_rule = ce_rule(rule_logits, rot_labels)
+                    loss = loss + 0.1 * loss_rule
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            step += 1
+            optimization_progress = min(100.0, step / total_steps * 100.0)
+        if optimization_cancel_requested:
+            break
+    model_cpu = model.to("cpu")
+    try:
+        torch.save(model_cpu.state_dict(), model_path)
+        ts_name = os.path.join(models_dir, f"policy_{int(time.time())}.pt")
+        torch.save(model_cpu.state_dict(), ts_name)
+    except:
+        pass
+    with model_lock:
+        policy_model = model_cpu
+    optimization_running = False
+    optimization_finished_flag = True
+    optimization_finished_cancelled = optimization_cancel_requested
+
+def recognize_numbers_from_image(img):
+    if img is None:
+        return []
+    if pytesseract is None or Image is None:
+        return []
+    try:
+        gray = img.convert("L")
+        w, h = gray.size
+        scale = 1
+        m = max(w, h)
+        if m < 400:
+            scale = 3
+        elif m < 900:
+            scale = 2
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+        if nw != w or nh != h:
+            gray = gray.resize((nw, nh), Image.BILINEAR)
+        candidates = [gray]
+        try:
+            from PIL import ImageEnhance, ImageFilter
+            try:
+                candidates.append(ImageEnhance.Contrast(gray).enhance(2.0))
+            except:
+                pass
+            try:
+                candidates.append(gray.filter(ImageFilter.SHARPEN))
+            except:
+                pass
+        except:
+            pass
+        for th in (120, 150, 180, 210):
+            try:
+                candidates.append(gray.point(lambda p, t=th: 255 if p > t else 0, "L"))
+            except:
+                pass
+        texts = []
+        cfg_base = "-c tessedit_char_whitelist=0123456789"
+        psms = ["--psm 6", "--psm 7", "--psm 11"]
+        for im in candidates:
+            for psm in psms:
+                cfg = psm + " " + cfg_base
+                try:
+                    texts.append(pytesseract.image_to_string(im, config=cfg))
+                except:
+                    pass
+                try:
+                    if hasattr(pytesseract, "Output"):
+                        data = pytesseract.image_to_data(im, config=cfg, output_type=pytesseract.Output.DICT)
+                        if isinstance(data, dict) and "text" in data:
+                            for s in data["text"]:
+                                if s and re.fullmatch(r"\d+", s):
+                                    texts.append(s)
+                except:
+                    pass
+        joined = " ".join([t for t in texts if t])
+        digits = re.findall(r"\d+", joined)
+        values = []
+        seen = set()
+        for d in digits:
+            try:
+                v = int(d)
+                if v >= 0 and v not in seen:
+                    seen.add(v)
+                    values.append(v)
+            except:
+                continue
+        return values
+    except:
+        return []
+def update_number_list_ui():
+    global number_row_widgets
+    for w in number_row_widgets:
+        try:
+            w.destroy()
+        except:
+            pass
+    number_row_widgets = []
+    with recognized_lock:
+        data = list(recognized_values)
+        attempted = recognition_attempted
+    if not data:
+        text = "尚未识别到数值，请在学习模式下点击“识别”按钮。"
+        if attempted:
+            text = "识别完成，但未检测到任何非负整数，请检查窗口内容或识别区域。"
+        label = ttk.Label(numbers_inner, text=text, style="Status.TLabel")
+        label.grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        number_row_widgets.append(label)
+        return
+    for idx, item in enumerate(data):
+        row = ttk.Frame(numbers_inner, style="App.TFrame")
+        row.grid(row=idx, column=0, sticky="we", padx=4, pady=2)
+        label = ttk.Label(row, text=f"{idx + 1}. 数值: {item['value']}", style="Status.TLabel")
+        label.pack(side="left")
+        var = tk.StringVar(value=item.get("category", "无关"))
+        combo = ttk.Combobox(row, textvariable=var, values=category_choices, state="readonly", width=18)
+        combo.pack(side="left", padx=(8, 0))
+        def on_select(event, i=idx, v=var):
+            with recognized_lock:
+                if i < len(recognized_values):
+                    recognized_values[i]["category"] = v.get()
+        combo.bind("<<ComboboxSelected>>", on_select)
+        number_row_widgets.append(row)
+
+def on_recognize_clicked():
+    global recognition_running, recognition_progress
+    if recognition_running:
+        return
+    if window_a_handle is None:
+        messagebox.showerror("错误", "请先选择窗口 A。")
+        return
+    if get_mode() != MODE_LEARN:
+        messagebox.showerror("提示", "仅在学习模式下才能进行数值识别。")
+        return
+    if not window_a_visible:
+        messagebox.showerror("提示", "窗口 A 当前不可见或不完整，无法识别。")
+        return
+    if pytesseract is None or Image is None:
+        messagebox.showerror("错误", "需要安装 Pillow 和 pytesseract 才能识别数值，请先安装后重试。")
+        return
+    set_mode(MODE_RECOG)
+    def worker():
+        global recognition_running, recognition_attempted, recognition_progress, recognition_finished_flag
+        recognition_running = True
+        recognition_progress = 0.0
+        try:
+            hwnd = window_a_handle
+            img = None
+            if hwnd is not None:
+                recognition_progress = 10.0
+                img = capture_window_image(hwnd)
+            values = []
+            if img is not None:
+                recognition_progress = 50.0
+                values = recognize_numbers_from_image(img)
+            recognition_progress = 90.0
+            new_list = []
+            for v in values:
+                new_list.append({"value": v, "category": "无关"})
+            with recognized_lock:
+                recognized_values.clear()
+                recognized_values.extend(new_list)
+                recognition_attempted = True
+            recognition_progress = 100.0
+        finally:
+            recognition_running = False
+            recognition_finished_flag = True
+        try:
+            root.after(0, update_number_list_ui)
+        except:
+            pass
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+
+def update_ui_loop():
+    global canvas_image_ref, optimization_finished_flag, optimization_finished_cancelled, optimization_progress, optimization_cancel_requested, recognition_finished_flag, recognition_progress
+    if not program_running:
+        try:
+            root.quit()
+        except:
+            pass
+        return
+    try:
+        if window_a_title:
+            window_label_var.set("窗口 A: " + window_a_title)
+        else:
+            window_label_var.set("窗口 A: 未选择")
+        visible_label_var.set("可见且完整: " + ("是" if window_a_visible else "否"))
+        w = window_a_rect[2] - window_a_rect[0]
+        h = window_a_rect[3] - window_a_rect[1]
+        size_label_var.set(f"窗口大小: {w} x {h}")
+        fps_label_var.set(f"截图频率: {screenshot_fps:.1f} Hz")
+        cpu_label_var.set(f"CPU 占用: {hardware_stats['cpu']:.1f}%")
+        mem_label_var.set(f"内存占用: {hardware_stats['mem']:.1f}%")
+        gpu_label_var.set(f"GPU 占用: {hardware_stats['gpu']:.1f}%")
+        vram_label_var.set(f"显存占用: {hardware_stats['vram']:.1f}%")
+        mode_map = {MODE_INIT: "初始化", MODE_LEARN: "学习模式", MODE_TRAIN: "训练模式", MODE_OPT: "优化中", MODE_RECOG: "识别中"}
+        mode_now = get_mode()
+        mode_label_var.set("模式: " + mode_map.get(mode_now, mode_now))
+        if optimization_running:
+            progress_bar["value"] = optimization_progress
+            progress_label_var.set(f"正在优化 AI 模型: {optimization_progress:.1f}%")
+        elif recognition_running:
+            progress_bar["value"] = recognition_progress
+            progress_label_var.set(f"正在识别窗口 A 数值: {recognition_progress:.1f}%")
+        else:
+            if mode_now == MODE_OPT:
+                progress_bar["value"] = optimization_progress
+                progress_label_var.set("优化准备中...")
+            elif mode_now == MODE_RECOG:
+                progress_bar["value"] = recognition_progress
+                progress_label_var.set("识别准备中...")
+            else:
+                progress_bar["value"] = 0.0
+                progress_label_var.set("")
+        with last_frame_lock:
+            frame = last_frame_np
+        if frame is not None and ImageTk is not None and Image is not None:
+            img = Image.fromarray(frame)
+            cw = canvas.winfo_width()
+            ch = canvas.winfo_height()
+            if cw > 10 and ch > 10:
+                fw, fh = img.size
+                if fw > 0 and fh > 0:
+                    scale = min(cw / fw, ch / fh)
+                    nw = max(1, int(fw * scale))
+                    nh = max(1, int(fh * scale))
+                    img = img.resize((nw, nh), Image.BILINEAR)
+            img_tk = ImageTk.PhotoImage(img)
+            canvas.configure(image=img_tk)
+            canvas_image_ref = img_tk
+        if mode_now == MODE_LEARN and window_a_handle is not None and not optimization_running and not recognition_running:
+            sleep_btn.state(["!disabled"])
+        else:
+            sleep_btn.state(["disabled"])
+        if mode_now == MODE_LEARN and window_a_handle is not None and window_a_visible and not optimization_running and not recognition_running:
+            recognize_btn.state(["!disabled"])
+        else:
+            recognize_btn.state(["disabled"])
+        if optimization_running:
+            getup_btn.state(["!disabled"])
+        else:
+            getup_btn.state(["disabled"])
+        if optimization_finished_flag:
+            optimization_finished_flag = False
+            if optimization_finished_cancelled:
+                optimization_cancel_requested = False
+                optimization_progress = 0.0
+                progress_bar["value"] = 0.0
+                progress_label_var.set("")
+                set_mode(MODE_LEARN)
+            else:
+                res = messagebox.showinfo("优化完成", "模型优化完成，点击 Confirm 继续学习。")
+                if res is not None:
+                    optimization_progress = 0.0
+                    progress_bar["value"] = 0.0
+                    progress_label_var.set("")
+                    set_mode(MODE_LEARN)
+        if recognition_finished_flag:
+            recognition_finished_flag = False
+            res = messagebox.showinfo("识别完成", "数值识别完成，点击 Confirm 返回学习模式。")
+            if res is not None:
+                recognition_progress = 0.0
+                progress_bar["value"] = 0.0
+                progress_label_var.set("")
+                set_mode(MODE_LEARN)
+        root.after(100, update_ui_loop)
+    except:
+        try:
+            root.after(200, update_ui_loop)
+        except:
+            pass
+
+def select_window():
+    global window_a_handle, window_a_title
+    if win32gui is None:
+        messagebox.showerror("错误", "win32gui 不可用，无法选择窗口")
+        return
+    windows = []
+    def enum_handler(hwnd, lParam):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if title:
+                windows.append((hwnd, title))
+    win32gui.EnumWindows(enum_handler, None)
+    if not windows:
+        messagebox.showerror("错误", "没有找到可用窗口")
+        return
+    top = tk.Toplevel(root)
+    top.title("选择窗口 A")
+    top.configure(bg="#020617")
+    listbox = tk.Listbox(top, width=80, height=20, bg="#020617", fg="#e5e7eb", selectbackground="#38bdf8", highlightthickness=0, borderwidth=0)
+    listbox.pack(fill="both", expand=True, padx=8, pady=8)
+    for hwnd, title in windows:
+        listbox.insert("end", f"{hwnd} - {title}")
+    def on_ok():
+        global window_a_handle, window_a_title
+        sel = listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        hwnd_sel, title_sel = windows[idx]
+        window_a_handle = hwnd_sel
+        window_a_title = title_sel
+        set_mode(MODE_LEARN)
+        top.destroy()
+    ok_btn = ttk.Button(top, text="确定", style="Accent.TButton", command=on_ok)
+    ok_btn.pack(pady=(0, 8))
+
+def on_sleep_clicked():
+    global optimization_cancel_requested
+    if window_a_handle is None:
+        return
+    mode = get_mode()
+    if mode != MODE_LEARN:
+        return
+    if optimization_running:
+        return
+    optimization_cancel_requested = False
+    set_mode(MODE_OPT)
+    t = threading.Thread(target=optimize_model_thread, daemon=True)
+    t.start()
+
+def on_getup_clicked():
+    global optimization_cancel_requested
+    if not optimization_running:
+        return
+    optimization_cancel_requested = True
+
+def terminate_program():
+    global program_running
+    program_running = False
+    flush_experience_buffer()
+    try:
+        root.quit()
+    except:
+        pass
+
 def main():
-    app=App();app.run()
-if __name__=="__main__":
+    ensure_model_exists()
+    th_hw = threading.Thread(target=hardware_monitor_loop, daemon=True)
+    th_hw.start()
+    th_frame = threading.Thread(target=frame_loop, daemon=True)
+    th_frame.start()
+    th_input = threading.Thread(target=global_input_loop, daemon=True)
+    th_input.start()
+    if keyboard is not None:
+        th_kb = threading.Thread(target=keyboard_listener_loop, daemon=True)
+        th_kb.start()
+    if mouse is not None:
+        th_mouse = threading.Thread(target=mouse_listener_loop, daemon=True)
+        th_mouse.start()
+    select_btn.configure(command=select_window)
+    sleep_btn.configure(command=on_sleep_clicked)
+    getup_btn.configure(command=on_getup_clicked)
+    recognize_btn.configure(command=on_recognize_clicked)
+    update_number_list_ui()
+    root.after(100, update_ui_loop)
+    root.after(500, idle_mode_manager)
+    root.protocol("WM_DELETE_WINDOW", lambda: terminate_program())
+    root.bind("<Escape>", lambda e: terminate_program())
+    root.mainloop()
+    flush_experience_buffer()
+
+if __name__ == "__main__":
     main()
