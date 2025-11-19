@@ -61,6 +61,7 @@ except ImportError:
 # Tesseract 路径自动查找
 try:
     import pytesseract
+    from pytesseract import Output as TesseractOutput
     import os as _os_tess
     if hasattr(pytesseract, "pytesseract") and hasattr(pytesseract.pytesseract, "tesseract_cmd"):
         # 如果默认路径为空或不存在，尝试常见路径
@@ -81,6 +82,7 @@ try:
                     break
 except ImportError:
     pytesseract = None
+    TesseractOutput = None
 
 MODE_INIT = "init"
 MODE_LEARN = "learning"
@@ -891,81 +893,90 @@ def recognize_numbers_from_image(img):
     processed_list = []
     try:
         recognition_progress = 10.0
-        # 1. 基础转换
         if img.mode != "RGB":
             img = img.convert("RGB")
-        
-        # 2. 放大图片（Upscaling）：对于小数字非常关键，放大3倍
         w, h = img.size
-        large_img = img.resize((w * 3, h * 3), Image.Resampling.BICUBIC)
-        
-        # 3. 增强对比度
+        large_img = img.resize((max(1, w * 3), max(1, h * 3)), Image.Resampling.BICUBIC)
         enhancer = ImageEnhance.Contrast(large_img)
         high_contrast = enhancer.enhance(2.0)
-        
-        # 4. 转灰度
         gray = high_contrast.convert("L")
-        
         recognition_progress = 20.0
-        
-        # 5. 构建处理队列
-        # 原图灰度
         processed_list.append(gray)
-        # 反色（黑底白字）
         processed_list.append(ImageOps.invert(gray))
-        
-        # 二值化处理（阈值扫描）
+        auto_gray = ImageOps.autocontrast(gray)
+        processed_list.append(auto_gray)
+        processed_list.append(ImageEnhance.Sharpness(auto_gray).enhance(2.0))
+        processed_list.append(auto_gray.filter(ImageFilter.MedianFilter(size=3)))
         recognition_progress = 30.0
-        for th in [100, 128, 160]:
-            # 普通二值化
-            bin_img = gray.point(lambda x: 255 if x > th else 0, mode="1")
+        for th in [80, 100, 128, 160, 200]:
+            bin_img = gray.point(lambda x, t=th: 255 if x > t else 0, mode="L")
             processed_list.append(bin_img)
-            # 反色二值化
-            processed_list.append(ImageOps.invert(bin_img.convert("L")).convert("1"))
-        
+            processed_list.append(ImageOps.invert(bin_img))
         recognition_progress = 50.0
         candidates = set()
-        
-        # 6. 配置参数：PSM 6 (块文本), PSM 11 (稀疏文本), PSM 7 (单行)
-        # 放宽白名单，防止误判为空，但后处理只取数字
         cfgs = [
             r"--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
             r"--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789",
-            r"--oem 3 --psm 3 -c tessedit_char_whitelist=0123456789" 
+            r"--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"
         ]
-        
-        total_ops = len(processed_list) * len(cfgs)
+        data_cfgs = []
+        if TesseractOutput is not None:
+            data_cfgs = [
+                r"--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
+                r"--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789"
+            ]
+        total_ops = max(1, len(processed_list) * (len(cfgs) + len(data_cfgs)))
         op_cnt = 0
-        
-        for pm in processed_list:
-            # 增加白边（Padding），防止数字贴边导致识别失败
-            pw, ph = pm.size
-            padded = Image.new(pm.mode, (pw + 40, ph + 40), 255 if pm.mode == "L" else 1)
-            # 如果是二值图且大部分是黑色，则填充黑色背景
-            if pm.mode == "1":
-                # 简单采样判断背景色
-                stat = ImageOps.invert(pm.convert("L"))
-                if np.mean(np.array(stat)) < 128:
-                    padded = Image.new(pm.mode, (pw + 40, ph + 40), 0)
-            
-            padded.paste(pm, (20, 20))
-            
-            for c in cfgs:
+        def extract_by_string(image, config):
+            result = set()
+            try:
+                txt = pytesseract.image_to_string(image, config=config)
+                for n in re.findall(r"\d+", txt):
+                    try:
+                        result.add(int(n))
+                    except:
+                        pass
+            except:
+                return set()
+            return result
+        def extract_by_data(image, config):
+            result = set()
+            if TesseractOutput is None:
+                return result
+            try:
+                data = pytesseract.image_to_data(image, config=config, output_type=TesseractOutput.DICT)
+            except:
+                return result
+            texts = data.get("text", [])
+            confs = data.get("conf", [])
+            for txt, cf in zip(texts, confs):
                 try:
-                    txt = pytesseract.image_to_string(padded, config=c)
-                    # 正则提取所有数字
-                    nums = re.findall(r"\d+", txt)
-                    for n in nums:
-                        if n:
-                            val = int(n)
-                            # 过滤掉过于离谱的超大整数（可选，视游戏而定）
-                            candidates.add(val)
+                    conf_val = float(cf)
                 except:
-                    pass
+                    conf_val = -1.0
+                if not txt or conf_val < 25.0:
+                    continue
+                for n in re.findall(r"\d+", txt):
+                    try:
+                        result.add(int(n))
+                    except:
+                        pass
+            return result
+        for pm in processed_list:
+            work_img = pm
+            if work_img.mode != "L":
+                work_img = work_img.convert("L")
+            pw, ph = work_img.size
+            padded = Image.new("L", (pw + 40, ph + 40), 255)
+            padded.paste(work_img, (20, 20))
+            for c in cfgs:
+                candidates.update(extract_by_string(padded, c))
                 op_cnt += 1
-                # 更新进度条（50% - 90%）
                 recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
-                
+            for c in data_cfgs:
+                candidates.update(extract_by_data(padded, c))
+                op_cnt += 1
+                recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
         return sorted(list(candidates))
     except Exception as e:
         print(f"OCR Error: {e}")
