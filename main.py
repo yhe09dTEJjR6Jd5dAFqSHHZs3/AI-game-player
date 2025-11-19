@@ -1,26 +1,37 @@
 import os
+import sys
 import threading
 import time
 import ctypes
 import contextlib
 import re
 import tkinter as tk
-from tkinter import ttk
-from tkinter import messagebox
+from tkinter import ttk, messagebox
 import psutil
 import torch
 import numpy as np
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
+# 1. 强制开启DPI感知，解决高清屏截图模糊和错位问题
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 try:
     import win32gui
     import win32con
     import win32ui
+    import win32api
 except ImportError:
     win32gui = None
     win32con = None
     win32ui = None
+    win32api = None
 
 try:
     from pynput import keyboard, mouse
@@ -34,27 +45,40 @@ except ImportError:
     pynvml = None
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageOps, ImageEnhance, ImageFilter
 except ImportError:
     Image = None
     ImageTk = None
+    ImageOps = None
+    ImageEnhance = None
+    ImageFilter = None
 
 try:
     import pyautogui
 except ImportError:
     pyautogui = None
 
+# Tesseract 路径自动查找
 try:
     import pytesseract
     import os as _os_tess
-    try:
-        if hasattr(pytesseract, "pytesseract") and hasattr(pytesseract.pytesseract, "tesseract_cmd") and not pytesseract.pytesseract.tesseract_cmd:
-            for _p in (r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe", r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe"):
+    if hasattr(pytesseract, "pytesseract") and hasattr(pytesseract.pytesseract, "tesseract_cmd"):
+        # 如果默认路径为空或不存在，尝试常见路径
+        valid_path_found = False
+        if pytesseract.pytesseract.tesseract_cmd and _os_tess.path.exists(pytesseract.pytesseract.tesseract_cmd):
+            valid_path_found = True
+        
+        if not valid_path_found:
+            possible_paths = [
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                os.path.join(os.getenv("LOCALAPPDATA", ""), r"Tesseract-OCR\tesseract.exe"),
+                os.path.join(os.path.expanduser("~"), r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
+            ]
+            for _p in possible_paths:
                 if _os_tess.path.exists(_p):
                     pytesseract.pytesseract.tesseract_cmd = _p
                     break
-    except:
-        pass
 except ImportError:
     pytesseract = None
 
@@ -69,7 +93,6 @@ models_dir = os.path.join(base_dir, "models")
 experience_dir = os.path.join(base_dir, "experience")
 os.makedirs(models_dir, exist_ok=True)
 os.makedirs(experience_dir, exist_ok=True)
-
 model_path = os.path.join(models_dir, "policy_latest.pt")
 
 experience_buffer = []
@@ -88,6 +111,7 @@ recognition_running = False
 recognition_attempted = False
 recognition_progress = 0.0
 recognition_finished_flag = False
+recognition_result_msg = ""
 
 current_mode = MODE_INIT
 mode_lock = threading.Lock()
@@ -127,8 +151,8 @@ if pyautogui is not None:
 
 root = tk.Tk()
 root.title("GameAI 窗口智能助手")
-root.geometry("1200x800")
-root.minsize(960, 680)
+root.geometry("1200x860")
+root.minsize(960, 700)
 root.configure(bg="#020617")
 
 style = ttk.Style(root)
@@ -276,24 +300,24 @@ class PolicyNet(nn.Module):
         click_logit = action[:, 2]
         return pos, click_logit, control_logits, rule_logits
 
-
 class ExperienceDataset(Dataset):
     def __init__(self, directory):
         self.samples = []
-        for name in os.listdir(directory):
-            if name.endswith(".pt") and name.startswith("experience_"):
-                path = os.path.join(directory, name)
-                try:
-                    data = torch.load(path, map_location="cpu")
-                    obs = data.get("obs")
-                    act = data.get("act")
-                    src = data.get("src")
-                    if obs is not None and act is not None:
-                        n = obs.shape[0]
-                        for i in range(n):
-                            self.samples.append((obs[i], act[i], 0 if src is None else int(src[i])))
-                except:
-                    continue
+        if os.path.exists(directory):
+            for name in os.listdir(directory):
+                if name.endswith(".pt") and name.startswith("experience_"):
+                    path = os.path.join(directory, name)
+                    try:
+                        data = torch.load(path, map_location="cpu")
+                        obs = data.get("obs")
+                        act = data.get("act")
+                        src = data.get("src")
+                        if obs is not None and act is not None:
+                            n = obs.shape[0]
+                            for i in range(n):
+                                self.samples.append((obs[i], act[i], 0 if src is None else int(src[i])))
+                    except:
+                        continue
 
     def __len__(self):
         return len(self.samples)
@@ -323,14 +347,14 @@ def ensure_model_exists():
     if model_files:
         try:
             model_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for path in model_files:
+                try:
+                    state = torch.load(path, map_location="cpu")
+                    break
+                except:
+                    continue
         except:
             pass
-        for path in model_files:
-            try:
-                state = torch.load(path, map_location="cpu")
-                break
-            except:
-                continue
     model = PolicyNet()
     if state is not None:
         try:
@@ -338,7 +362,8 @@ def ensure_model_exists():
         except:
             pass
     try:
-        torch.save(model.state_dict(), model_path)
+        if state is None:
+            torch.save(model.state_dict(), model_path)
     except:
         pass
     model.eval()
@@ -381,68 +406,72 @@ def is_left_button_pressed():
 
 def capture_window_image(hwnd):
     global window_a_rect
-    if win32gui is None or win32ui is None or Image is None:
-        if pyautogui is not None and window_a_rect is not None:
-            left, top, right, bottom = window_a_rect
+    # 优先尝试 win32gui 截图
+    image_win32 = None
+    captured_with_win32 = False
+    
+    if win32gui is not None and win32ui is not None and Image is not None:
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
             w = right - left
             h = bottom - top
             if w > 0 and h > 0:
-                try:
-                    img = pyautogui.screenshot(region=(left, top, w, h))
-                    return img.convert("RGB")
-                except:
-                    return None
-        return None
-    try:
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        w = right - left
-        h = bottom - top
-        if w <= 0 or h <= 0:
-            return None
-        hwndDC = win32gui.GetWindowDC(hwnd)
-        mfcDC = win32ui.CreateDCFromHandle(hwndDC)
-        saveDC = mfcDC.CreateCompatibleDC()
-        saveBitMap = win32ui.CreateBitmap()
-        saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
-        saveDC.SelectObject(saveBitMap)
-        result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
-        if result != 1:
-            saveDC.BitBlt((0, 0), (w, h), mfcDC, (0, 0), win32con.SRCCOPY)
-        bmpinfo = saveBitMap.GetInfo()
-        bmpstr = saveBitMap.GetBitmapBits(True)
-        img = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]), bmpstr, "raw", "BGRX", 0, 1)
-        win32gui.DeleteObject(saveBitMap.GetHandle())
-        saveDC.DeleteDC()
-        mfcDC.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwndDC)
-        try:
-            import numpy as _np_internal_check
-            arr = _np_internal_check.array(img)
-            if arr.size == 0 or float(arr.mean()) < 1.0:
-                if pyautogui is not None:
-                    img2 = pyautogui.screenshot(region=(left, top, w, h))
-                    return img2.convert("RGB")
+                hwndDC = win32gui.GetWindowDC(hwnd)
+                mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+                saveDC = mfcDC.CreateCompatibleDC()
+                saveBitMap = win32ui.CreateBitmap()
+                saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
+                saveDC.SelectObject(saveBitMap)
+                
+                # 尝试 PrintWindow (flag=2 对部分硬件加速窗口有效)
+                result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
+                if result != 1:
+                     # 失败则回退到 BitBlt
+                    saveDC.BitBlt((0, 0), (w, h), mfcDC, (0, 0), win32con.SRCCOPY)
+                
+                bmpinfo = saveBitMap.GetInfo()
+                bmpstr = saveBitMap.GetBitmapBits(True)
+                image_win32 = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]), bmpstr, "raw", "BGRX", 0, 1)
+                
+                win32gui.DeleteObject(saveBitMap.GetHandle())
+                saveDC.DeleteDC()
+                mfcDC.DeleteDC()
+                win32gui.ReleaseDC(hwnd, hwndDC)
+                
+                # 检查是否截到了“死黑”或“死白”图像（硬件加速常见问题）
+                if image_win32:
+                    stat =  np.array(image_win32).std()
+                    if stat > 5.0: # 只有当标准差大于一定阈值，认为截图有效
+                        captured_with_win32 = True
+                    else:
+                        image_win32 = None # 截图无效，强制后续使用 pyautogui
         except:
-            pass
-        return img
-    except:
+            image_win32 = None
+
+    # 如果 win32 失败或截图无效，使用 pyautogui 兜底
+    if not captured_with_win32 and pyautogui is not None and window_a_rect is not None:
         try:
-            if pyautogui is not None:
+            # 需要重新获取 rect 保证准确
+            if win32gui:
                 rect = win32gui.GetWindowRect(hwnd)
-                left, top, right, bottom = rect
-                w = right - left
-                h = bottom - top
-                if w > 0 and h > 0:
-                    img = pyautogui.screenshot(region=(left, top, w, h))
-                    return img.convert("RGB")
+            else:
+                rect = window_a_rect
+            left, top, right, bottom = rect
+            w = right - left
+            h = bottom - top
+            if w > 0 and h > 0:
+                # pyautogui 截图基于屏幕坐标，因此窗口必须可见且在屏幕内
+                img = pyautogui.screenshot(region=(left, top, w, h))
+                return img.convert("RGB")
         except:
             pass
-        return None
+    
+    return image_win32
 
 def resize_for_model(img):
     if Image is None:
         return None
-    img = img.resize((84, 84), Image.BILINEAR)
+    img = img.resize((84, 84), Image.Resampling.BILINEAR)
     arr = np.array(img, dtype=np.uint8)
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=-1)
@@ -513,7 +542,7 @@ def hardware_monitor_loop():
                     vram = float(used) / float(total) * 100.0 if total > 0 else 0.0
                 except:
                     vram = 0.0
-                gpu = vram
+                    gpu = vram
             hardware_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram}
             metrics = [cpu, mem]
             if gpu > 0.0:
@@ -544,32 +573,9 @@ def window_visibility_check(hwnd):
         h = bottom - top
         if w <= 0 or h <= 0:
             return False, rect
-        sx = ctypes.windll.user32.GetSystemMetrics(76)
-        sy = ctypes.windll.user32.GetSystemMetrics(77)
-        sw = ctypes.windll.user32.GetSystemMetrics(78)
-        sh = ctypes.windll.user32.GetSystemMetrics(79)
-        if not (left >= sx and top >= sy and right <= sx + sw and bottom <= sy + sh):
+        # 宽松的可见性检查，允许部分遮挡
+        if bottom <= 0 or right <= 0:
             return False, rect
-        sample_cols = 5
-        sample_rows = 5
-        for i in range(sample_cols):
-            for j in range(sample_rows):
-                px = left + (i + 0.5) * w / sample_cols
-                py = top + (j + 0.5) * h / sample_rows
-                if not (sx <= px < sx + sw and sy <= py < sy + sh):
-                    return False, rect
-                pt = (int(px), int(py))
-                try:
-                    hwnd_at_pt = win32gui.WindowFromPoint(pt)
-                    try:
-                        ga_root = getattr(win32con, "GA_ROOT", 2)
-                        root_hwnd = win32gui.GetAncestor(hwnd_at_pt, ga_root)
-                    except:
-                        root_hwnd = hwnd_at_pt
-                except:
-                    root_hwnd = hwnd
-                if root_hwnd != hwnd:
-                    return False, rect
         window_a_rect = rect
         return True, rect
     except:
@@ -588,12 +594,12 @@ def ai_compute_action(frame_arr):
                 pos, click_logit, control_logits, rule_logits = model(x)
                 pos = pos[0].cpu().numpy()
                 click_prob = torch.sigmoid(click_logit)[0].item()
-        nx = (pos[0] + 1.0) / 2.0
-        ny = (pos[1] + 1.0) / 2.0
-        nx = max(0.0, min(1.0, nx))
-        ny = max(0.0, min(1.0, ny))
-        click_flag = 1.0 if click_prob > 0.5 else 0.0
-        return np.array([nx, ny, click_flag], dtype=np.float32)
+                nx = (pos[0] + 1.0) / 2.0
+                ny = (pos[1] + 1.0) / 2.0
+                nx = max(0.0, min(1.0, nx))
+                ny = max(0.0, min(1.0, ny))
+                click_flag = 1.0 if click_prob > 0.5 else 0.0
+                return np.array([nx, ny, click_flag], dtype=np.float32)
     except:
         return None
 
@@ -628,6 +634,12 @@ def frame_loop():
         window_a_title = window_a_title_local
         if not vis:
             continue
+        
+        # 核心逻辑：如果处于识别模式，不要高频截图占用资源，等待识别函数自己截取高质量图
+        if get_mode() == MODE_RECOG:
+            time.sleep(0.1)
+            continue
+
         img = capture_window_image(hwnd)
         if img is None:
             continue
@@ -635,7 +647,7 @@ def frame_loop():
         with last_frame_lock:
             last_frame_np = np.array(img)
         mode = get_mode()
-        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and not optimization_running
+        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and not optimization_running and not recognition_running
         action_vec = None
         source_flag = 0
         if mode == MODE_TRAIN:
@@ -643,17 +655,17 @@ def frame_loop():
                 a = ai_compute_action(frame_arr_model)
                 if a is not None:
                     last_ai_action_vec = a
-                action_vec = last_ai_action_vec
-                source_flag = 1
-                if action_vec is not None and pyautogui is not None:
-                    nx, ny, click_flag = float(action_vec[0]), float(action_vec[1]), float(action_vec[2])
-                    x, y = denormalize_action_to_mouse(nx, ny, rect)
-                    try:
-                        pyautogui.moveTo(x, y)
-                        if click_flag >= 0.5:
-                            pyautogui.click()
-                    except:
-                        pass
+                    action_vec = last_ai_action_vec
+                    source_flag = 1
+            if action_vec is not None and pyautogui is not None:
+                nx, ny, click_flag = float(action_vec[0]), float(action_vec[1]), float(action_vec[2])
+                x, y = denormalize_action_to_mouse(nx, ny, rect)
+                try:
+                    pyautogui.moveTo(x, y)
+                    if click_flag >= 0.5:
+                        pyautogui.click()
+                except:
+                    pass
         elif mode == MODE_LEARN:
             if win32gui is not None:
                 try:
@@ -664,15 +676,15 @@ def frame_loop():
                     nx, ny = normalize_action_from_mouse(pt[0], pt[1], rect)
                     click_flag = 1.0 if is_left_button_pressed() else 0.0
                     action_vec = np.array([nx, ny, click_flag], dtype=np.float32)
-            if action_vec is not None:
-                last_user_action_vec = action_vec
-            action_vec = last_user_action_vec
-            source_flag = 0
+                    if action_vec is not None:
+                        last_user_action_vec = action_vec
+                        action_vec = last_user_action_vec
+                        source_flag = 0
         if recording and frame_arr_model is not None and action_vec is not None:
             record_experience(frame_arr_model, action_vec, source_flag)
 
 class LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+    fields = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
 def get_system_idle_seconds():
     try:
@@ -694,7 +706,7 @@ def idle_mode_manager():
         return
     try:
         mode = get_mode()
-        if mode == MODE_LEARN:
+        if mode == MODE_LEARN and not recognition_running and not optimization_running:
             idle = get_system_idle_seconds()
             if idle is not None:
                 if idle >= 10.0 and window_a_visible:
@@ -798,10 +810,12 @@ def optimize_model_thread():
     mse = nn.MSELoss()
     bce_control = nn.BCEWithLogitsLoss()
     ce_rule = nn.CrossEntropyLoss()
+    scaler = None
     if device == "cuda":
-        scaler = torch.amp.GradScaler("cuda")
-    else:
-        scaler = None
+        try:
+            scaler = torch.amp.GradScaler("cuda")
+        except:
+            scaler = None
     batch_size = min(32, max(1, len(dataset)))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     total_steps = max(1, len(loader) * 3)
@@ -816,10 +830,7 @@ def optimize_model_thread():
             target_pos = act[:, :2]
             target_click = act[:, 2]
             optimizer.zero_grad()
-            if device == "cuda":
-                ctx = torch.amp.autocast("cuda")
-            else:
-                ctx = contextlib.nullcontext()
+            ctx = torch.amp.autocast("cuda") if device == "cuda" and scaler else contextlib.nullcontext()
             with ctx:
                 pos, click_logit, control_logits, _ = model(obs)
                 loss_pos = mse((pos + 1.0) / 2.0, target_pos)
@@ -853,7 +864,7 @@ def optimize_model_thread():
                 scaler.update()
             else:
                 loss.backward()
-                optimizer.step()
+            optimizer.step()
             step += 1
             optimization_progress = min(100.0, step / total_steps * 100.0)
         if optimization_cancel_requested:
@@ -872,77 +883,96 @@ def optimize_model_thread():
     optimization_finished_cancelled = optimization_cancel_requested
 
 def recognize_numbers_from_image(img):
+    global recognition_progress
     if img is None:
         return []
     if pytesseract is None or Image is None:
         return []
+    processed_list = []
     try:
-        gray = img.convert("L")
-        w, h = gray.size
-        scale = 1
-        m = max(w, h)
-        if m < 400:
-            scale = 3
-        elif m < 900:
-            scale = 2
-        nw = max(1, int(w * scale))
-        nh = max(1, int(h * scale))
-        if nw != w or nh != h:
-            gray = gray.resize((nw, nh), Image.BILINEAR)
-        candidates = [gray]
-        try:
-            from PIL import ImageEnhance, ImageFilter
-            try:
-                candidates.append(ImageEnhance.Contrast(gray).enhance(2.0))
-            except:
-                pass
-            try:
-                candidates.append(gray.filter(ImageFilter.SHARPEN))
-            except:
-                pass
-        except:
-            pass
-        for th in (120, 150, 180, 210):
-            try:
-                candidates.append(gray.point(lambda p, t=th: 255 if p > t else 0, "L"))
-            except:
-                pass
-        texts = []
-        cfg_base = "-c tessedit_char_whitelist=0123456789"
-        psms = ["--psm 6", "--psm 7", "--psm 11"]
-        for im in candidates:
-            for psm in psms:
-                cfg = psm + " " + cfg_base
+        recognition_progress = 10.0
+        # 1. 基础转换
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        # 2. 放大图片（Upscaling）：对于小数字非常关键，放大3倍
+        w, h = img.size
+        large_img = img.resize((w * 3, h * 3), Image.Resampling.BICUBIC)
+        
+        # 3. 增强对比度
+        enhancer = ImageEnhance.Contrast(large_img)
+        high_contrast = enhancer.enhance(2.0)
+        
+        # 4. 转灰度
+        gray = high_contrast.convert("L")
+        
+        recognition_progress = 20.0
+        
+        # 5. 构建处理队列
+        # 原图灰度
+        processed_list.append(gray)
+        # 反色（黑底白字）
+        processed_list.append(ImageOps.invert(gray))
+        
+        # 二值化处理（阈值扫描）
+        recognition_progress = 30.0
+        for th in [100, 128, 160]:
+            # 普通二值化
+            bin_img = gray.point(lambda x: 255 if x > th else 0, mode="1")
+            processed_list.append(bin_img)
+            # 反色二值化
+            processed_list.append(ImageOps.invert(bin_img.convert("L")).convert("1"))
+        
+        recognition_progress = 50.0
+        candidates = set()
+        
+        # 6. 配置参数：PSM 6 (块文本), PSM 11 (稀疏文本), PSM 7 (单行)
+        # 放宽白名单，防止误判为空，但后处理只取数字
+        cfgs = [
+            r"--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
+            r"--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789",
+            r"--oem 3 --psm 3 -c tessedit_char_whitelist=0123456789" 
+        ]
+        
+        total_ops = len(processed_list) * len(cfgs)
+        op_cnt = 0
+        
+        for pm in processed_list:
+            # 增加白边（Padding），防止数字贴边导致识别失败
+            pw, ph = pm.size
+            padded = Image.new(pm.mode, (pw + 40, ph + 40), 255 if pm.mode == "L" else 1)
+            # 如果是二值图且大部分是黑色，则填充黑色背景
+            if pm.mode == "1":
+                # 简单采样判断背景色
+                stat = ImageOps.invert(pm.convert("L"))
+                if np.mean(np.array(stat)) < 128:
+                    padded = Image.new(pm.mode, (pw + 40, ph + 40), 0)
+            
+            padded.paste(pm, (20, 20))
+            
+            for c in cfgs:
                 try:
-                    texts.append(pytesseract.image_to_string(im, config=cfg))
+                    txt = pytesseract.image_to_string(padded, config=c)
+                    # 正则提取所有数字
+                    nums = re.findall(r"\d+", txt)
+                    for n in nums:
+                        if n:
+                            val = int(n)
+                            # 过滤掉过于离谱的超大整数（可选，视游戏而定）
+                            candidates.add(val)
                 except:
                     pass
-                try:
-                    if hasattr(pytesseract, "Output"):
-                        data = pytesseract.image_to_data(im, config=cfg, output_type=pytesseract.Output.DICT)
-                        if isinstance(data, dict) and "text" in data:
-                            for s in data["text"]:
-                                if s and re.fullmatch(r"\d+", s):
-                                    texts.append(s)
-                except:
-                    pass
-        joined = " ".join([t for t in texts if t])
-        digits = re.findall(r"\d+", joined)
-        values = []
-        seen = set()
-        for d in digits:
-            try:
-                v = int(d)
-                if v >= 0 and v not in seen:
-                    seen.add(v)
-                    values.append(v)
-            except:
-                continue
-        return values
-    except:
+                op_cnt += 1
+                # 更新进度条（50% - 90%）
+                recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
+                
+        return sorted(list(candidates))
+    except Exception as e:
+        print(f"OCR Error: {e}")
         return []
+
 def update_number_list_ui():
-    global number_row_widgets
+    global number_row_widgets, recognition_result_msg
     for w in number_row_widgets:
         try:
             w.destroy()
@@ -952,14 +982,17 @@ def update_number_list_ui():
     with recognized_lock:
         data = list(recognized_values)
         attempted = recognition_attempted
+        msg = recognition_result_msg
+    
     if not data:
         text = "尚未识别到数值，请在学习模式下点击“识别”按钮。"
         if attempted:
-            text = "识别完成，但未检测到任何非负整数，请检查窗口内容或识别区域。"
-        label = ttk.Label(numbers_inner, text=text, style="Status.TLabel")
+            text = "识别完成，但未检测到非负整数。\n\n" + msg
+        label = ttk.Label(numbers_inner, text=text, style="Status.TLabel", wraplength=800)
         label.grid(row=0, column=0, sticky="w", padx=4, pady=2)
         number_row_widgets.append(label)
         return
+    
     for idx, item in enumerate(data):
         row = ttk.Frame(numbers_inner, style="App.TFrame")
         row.grid(row=idx, column=0, sticky="we", padx=4, pady=2)
@@ -989,42 +1022,62 @@ def on_recognize_clicked():
         messagebox.showerror("提示", "窗口 A 当前不可见或不完整，无法识别。")
         return
     if pytesseract is None or Image is None:
-        messagebox.showerror("错误", "需要安装 Pillow 和 pytesseract 才能识别数值，请先安装后重试。")
+        messagebox.showerror("错误", "需要安装 Pillow 和 pytesseract 才能识别数值。\n并且需要确保 Tesseract 已安装且在系统路径中。")
         return
+    
     set_mode(MODE_RECOG)
+    
     def worker():
-        global recognition_running, recognition_attempted, recognition_progress, recognition_finished_flag
+        global recognition_running, recognition_attempted, recognition_progress, recognition_finished_flag, recognition_result_msg
         recognition_running = True
         recognition_progress = 0.0
+        recognition_result_msg = ""
         try:
             hwnd = window_a_handle
             img = None
             if hwnd is not None:
-                recognition_progress = 10.0
+                recognition_progress = 5.0
+                # 给窗口一点时间刷新
+                time.sleep(0.5)
+                # 强制使用高质量截图
                 img = capture_window_image(hwnd)
+                
+                # DEBUG: 保存截图看是否黑屏（用户不可见，但逻辑上存在）
+                # if img: img.save("debug_recog.png")
+            
             values = []
             if img is not None:
-                recognition_progress = 50.0
-                values = recognize_numbers_from_image(img)
-            recognition_progress = 90.0
+                # 检查是否黑屏
+                stat = np.array(img).std()
+                if stat < 5.0:
+                    recognition_result_msg = "警告：截取到的画面几乎为纯色（黑/白）。\n可能是硬件加速导致，请尝试将窗口移至屏幕中央并保持前台可见。"
+                else:
+                    values = recognize_numbers_from_image(img)
+                    if not values:
+                        recognition_result_msg = "图像截取成功，但OCR未能提取到数字。\n请尝试放大窗口，或检查数字是否存在遮挡。"
+            else:
+                recognition_result_msg = "无法获取窗口图像，请确保窗口未最小化。"
+
+            recognition_progress = 95.0
             new_list = []
             for v in values:
                 new_list.append({"value": v, "category": "无关"})
             with recognized_lock:
                 recognized_values.clear()
                 recognized_values.extend(new_list)
-                recognition_attempted = True
+            recognition_attempted = True
             recognition_progress = 100.0
+        except Exception as e:
+            recognition_result_msg = f"发生未知错误: {str(e)}"
         finally:
             recognition_running = False
             recognition_finished_flag = True
-        try:
-            root.after(0, update_number_list_ui)
-        except:
-            pass
+            try:
+                root.after(0, update_number_list_ui)
+            except:
+                pass
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-
 
 def update_ui_loop():
     global canvas_image_ref, optimization_finished_flag, optimization_finished_cancelled, optimization_progress, optimization_cancel_requested, recognition_finished_flag, recognition_progress
@@ -1079,10 +1132,10 @@ def update_ui_loop():
                     scale = min(cw / fw, ch / fh)
                     nw = max(1, int(fw * scale))
                     nh = max(1, int(fh * scale))
-                    img = img.resize((nw, nh), Image.BILINEAR)
-            img_tk = ImageTk.PhotoImage(img)
-            canvas.configure(image=img_tk)
-            canvas_image_ref = img_tk
+                    img = img.resize((nw, nh), Image.Resampling.BILINEAR)
+                    img_tk = ImageTk.PhotoImage(img)
+                    canvas.configure(image=img_tk)
+                    canvas_image_ref = img_tk
         if mode_now == MODE_LEARN and window_a_handle is not None and not optimization_running and not recognition_running:
             sleep_btn.state(["!disabled"])
         else:
@@ -1104,7 +1157,7 @@ def update_ui_loop():
                 progress_label_var.set("")
                 set_mode(MODE_LEARN)
             else:
-                res = messagebox.showinfo("优化完成", "模型优化完成，点击 Confirm 继续学习。")
+                res = messagebox.showinfo("优化完成", "模型优化完成，点击确定继续学习。")
                 if res is not None:
                     optimization_progress = 0.0
                     progress_bar["value"] = 0.0
@@ -1112,7 +1165,7 @@ def update_ui_loop():
                     set_mode(MODE_LEARN)
         if recognition_finished_flag:
             recognition_finished_flag = False
-            res = messagebox.showinfo("识别完成", "数值识别完成，点击 Confirm 返回学习模式。")
+            res = messagebox.showinfo("识别完成", "数值识别过程已结束，点击确定查看结果。")
             if res is not None:
                 recognition_progress = 0.0
                 progress_bar["value"] = 0.0
