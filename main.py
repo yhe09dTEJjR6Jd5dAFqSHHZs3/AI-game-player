@@ -39,23 +39,7 @@ ImageOps = getattr(pil_module, "ImageOps", None) if pil_module else None
 ImageEnhance = getattr(pil_module, "ImageEnhance", None) if pil_module else None
 ImageFilter = getattr(pil_module, "ImageFilter", None) if pil_module else None
 pyautogui = optional_import("pyautogui")
-pytesseract = optional_import("pytesseract")
-TesseractOutput = getattr(pytesseract, "Output", None) if pytesseract else None
-if pytesseract is not None and hasattr(pytesseract, "pytesseract") and hasattr(pytesseract.pytesseract, "tesseract_cmd"):
-    valid_path_found = False
-    if pytesseract.pytesseract.tesseract_cmd and os.path.exists(pytesseract.pytesseract.tesseract_cmd):
-        valid_path_found = True
-    if not valid_path_found:
-        possible_paths = [
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            os.path.join(os.getenv("LOCALAPPDATA", ""), r"Tesseract-OCR\tesseract.exe"),
-            os.path.join(os.path.expanduser("~"), r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
-        ]
-        for _p in possible_paths:
-            if os.path.exists(_p):
-                pytesseract.pytesseract.tesseract_cmd = _p
-                break
+easyocr = optional_import("easyocr")
 keyboard = pynput_keyboard
 mouse = pynput_mouse
 MODE_INIT = "init"
@@ -82,6 +66,8 @@ model_lock = threading.Lock()
 
 recognized_values = []
 recognized_lock = threading.Lock()
+ocr_reader = None
+ocr_lock = threading.Lock()
 category_choices = ["越高越好", "越低越好", "变化越小越好", "变化越大越好", "无关", "识别错误"]
 recognition_running = False
 recognition_attempted = False
@@ -862,7 +848,7 @@ def recognize_numbers_from_image(img):
     global recognition_progress
     if img is None:
         return []
-    if pytesseract is None or Image is None:
+    if easyocr is None or Image is None:
         return []
     processed_list = []
     try:
@@ -888,69 +874,37 @@ def recognize_numbers_from_image(img):
             processed_list.append(ImageOps.invert(bin_img))
         recognition_progress = 50.0
         candidates = set()
-        cfgs = [
-            r"--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
-            r"--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789",
-            r"--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"
-        ]
-        data_cfgs = []
-        if TesseractOutput is not None:
-            data_cfgs = [
-                r"--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
-                r"--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789"
-            ]
-        total_ops = max(1, len(processed_list) * (len(cfgs) + len(data_cfgs)))
-        op_cnt = 0
-        def extract_by_string(image, config):
-            result = set()
-            try:
-                txt = pytesseract.image_to_string(image, config=config)
-                for n in re.findall(r"\d+", txt):
-                    try:
-                        result.add(int(n))
-                    except:
-                        pass
-            except:
-                return set()
-            return result
-        def extract_by_data(image, config):
-            result = set()
-            if TesseractOutput is None:
-                return result
-            try:
-                data = pytesseract.image_to_data(image, config=config, output_type=TesseractOutput.DICT)
-            except:
-                return result
-            texts = data.get("text", [])
-            confs = data.get("conf", [])
-            for txt, cf in zip(texts, confs):
+        reader = None
+        with ocr_lock:
+            global ocr_reader
+            if ocr_reader is None:
                 try:
-                    conf_val = float(cf)
+                    ocr_reader = easyocr.Reader(["en"], gpu=gpu_available)
                 except:
-                    conf_val = -1.0
-                if not txt or conf_val < 25.0:
-                    continue
-                for n in re.findall(r"\d+", txt):
-                    try:
-                        result.add(int(n))
-                    except:
-                        pass
-            return result
+                    ocr_reader = None
+            reader = ocr_reader
+        if reader is None:
+            return []
+        total_ops = max(1, len(processed_list))
+        op_cnt = 0
         for pm in processed_list:
             work_img = pm
-            if work_img.mode != "L":
-                work_img = work_img.convert("L")
-            pw, ph = work_img.size
-            padded = Image.new("L", (pw + 40, ph + 40), 255)
-            padded.paste(work_img, (20, 20))
-            for c in cfgs:
-                candidates.update(extract_by_string(padded, c))
-                op_cnt += 1
-                recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
-            for c in data_cfgs:
-                candidates.update(extract_by_data(padded, c))
-                op_cnt += 1
-                recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
+            if work_img.mode != "RGB":
+                work_img = work_img.convert("RGB")
+            try:
+                res = reader.readtext(np.array(work_img), detail=1, allowlist="0123456789")
+                for _, text, conf in res:
+                    if conf < 0.35:
+                        continue
+                    for n in re.findall(r"\d+", text):
+                        try:
+                            candidates.add(int(n))
+                        except:
+                            pass
+            except Exception as e:
+                print(f"OCR Error: {e}")
+            op_cnt += 1
+            recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
         return sorted(list(candidates))
     except Exception as e:
         print(f"OCR Error: {e}")
@@ -1006,8 +960,8 @@ def on_recognize_clicked():
     if not window_a_visible:
         messagebox.showerror("提示", "窗口 A 当前不可见或不完整，无法识别。")
         return
-    if pytesseract is None or Image is None:
-        messagebox.showerror("错误", "需要安装 Pillow 和 pytesseract 才能识别数值。\n并且需要确保 Tesseract 已安装且在系统路径中。")
+    if easyocr is None or Image is None:
+        messagebox.showerror("错误", "需要安装 Pillow 和 easyocr 才能识别数值。")
         return
     
     set_mode(MODE_RECOG)
