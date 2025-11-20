@@ -7,83 +7,57 @@ import contextlib
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox
+import importlib
 import psutil
 import torch
 import numpy as np
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-# 1. 强制开启DPI感知，解决高清屏截图模糊和错位问题
-try:
+with contextlib.suppress(Exception):
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
+with contextlib.suppress(Exception):
+    ctypes.windll.user32.SetProcessDPIAware()
 
-try:
-    import win32gui
-    import win32con
-    import win32ui
-    import win32api
-except ImportError:
-    win32gui = None
-    win32con = None
-    win32ui = None
-    win32api = None
+def optional_import(module_name):
+    spec = importlib.util.find_spec(module_name)
+    if spec is None:
+        return None
+    return importlib.import_module(module_name)
 
-try:
-    from pynput import keyboard, mouse
-except ImportError:
-    keyboard = None
-    mouse = None
-
-try:
-    import pynvml
-except ImportError:
-    pynvml = None
-
-try:
-    from PIL import Image, ImageTk, ImageOps, ImageEnhance, ImageFilter
-except ImportError:
-    Image = None
-    ImageTk = None
-    ImageOps = None
-    ImageEnhance = None
-    ImageFilter = None
-
-try:
-    import pyautogui
-except ImportError:
-    pyautogui = None
-
-# Tesseract 路径自动查找
-try:
-    import pytesseract
-    from pytesseract import Output as TesseractOutput
-    import os as _os_tess
-    if hasattr(pytesseract, "pytesseract") and hasattr(pytesseract.pytesseract, "tesseract_cmd"):
-        # 如果默认路径为空或不存在，尝试常见路径
-        valid_path_found = False
-        if pytesseract.pytesseract.tesseract_cmd and _os_tess.path.exists(pytesseract.pytesseract.tesseract_cmd):
-            valid_path_found = True
-        
-        if not valid_path_found:
-            possible_paths = [
-                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-                os.path.join(os.getenv("LOCALAPPDATA", ""), r"Tesseract-OCR\tesseract.exe"),
-                os.path.join(os.path.expanduser("~"), r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
-            ]
-            for _p in possible_paths:
-                if _os_tess.path.exists(_p):
-                    pytesseract.pytesseract.tesseract_cmd = _p
-                    break
-except ImportError:
-    pytesseract = None
-    TesseractOutput = None
-
+win32gui = optional_import("win32gui")
+win32con = optional_import("win32con")
+win32ui = optional_import("win32ui")
+win32api = optional_import("win32api")
+pynput_keyboard = optional_import("pynput.keyboard")
+pynput_mouse = optional_import("pynput.mouse")
+pynvml = optional_import("pynvml")
+pil_module = optional_import("PIL")
+Image = getattr(pil_module, "Image", None) if pil_module else None
+ImageTk = getattr(pil_module, "ImageTk", None) if pil_module else None
+ImageOps = getattr(pil_module, "ImageOps", None) if pil_module else None
+ImageEnhance = getattr(pil_module, "ImageEnhance", None) if pil_module else None
+ImageFilter = getattr(pil_module, "ImageFilter", None) if pil_module else None
+pyautogui = optional_import("pyautogui")
+pytesseract = optional_import("pytesseract")
+TesseractOutput = getattr(pytesseract, "Output", None) if pytesseract else None
+if pytesseract is not None and hasattr(pytesseract, "pytesseract") and hasattr(pytesseract.pytesseract, "tesseract_cmd"):
+    valid_path_found = False
+    if pytesseract.pytesseract.tesseract_cmd and os.path.exists(pytesseract.pytesseract.tesseract_cmd):
+        valid_path_found = True
+    if not valid_path_found:
+        possible_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            os.path.join(os.getenv("LOCALAPPDATA", ""), r"Tesseract-OCR\tesseract.exe"),
+            os.path.join(os.path.expanduser("~"), r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
+        ]
+        for _p in possible_paths:
+            if os.path.exists(_p):
+                pytesseract.pytesseract.tesseract_cmd = _p
+                break
+keyboard = pynput_keyboard
+mouse = pynput_mouse
 MODE_INIT = "init"
 MODE_LEARN = "learning"
 MODE_TRAIN = "training"
@@ -408,7 +382,7 @@ def is_left_button_pressed():
 
 def capture_window_image(hwnd):
     global window_a_rect
-    # 优先尝试 win32gui 截图
+                      
     image_win32 = None
     captured_with_win32 = False
     
@@ -425,10 +399,10 @@ def capture_window_image(hwnd):
                 saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
                 saveDC.SelectObject(saveBitMap)
                 
-                # 尝试 PrintWindow (flag=2 对部分硬件加速窗口有效)
+                                                     
                 result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
                 if result != 1:
-                     # 失败则回退到 BitBlt
+                                    
                     saveDC.BitBlt((0, 0), (w, h), mfcDC, (0, 0), win32con.SRCCOPY)
                 
                 bmpinfo = saveBitMap.GetInfo()
@@ -440,20 +414,20 @@ def capture_window_image(hwnd):
                 mfcDC.DeleteDC()
                 win32gui.ReleaseDC(hwnd, hwndDC)
                 
-                # 检查是否截到了“死黑”或“死白”图像（硬件加速常见问题）
+                                              
                 if image_win32:
                     stat =  np.array(image_win32).std()
-                    if stat > 5.0: # 只有当标准差大于一定阈值，认为截图有效
+                    if stat > 5.0:                      
                         captured_with_win32 = True
                     else:
-                        image_win32 = None # 截图无效，强制后续使用 pyautogui
+                        image_win32 = None                        
         except:
             image_win32 = None
 
-    # 如果 win32 失败或截图无效，使用 pyautogui 兜底
+                                      
     if not captured_with_win32 and pyautogui is not None and window_a_rect is not None:
         try:
-            # 需要重新获取 rect 保证准确
+                              
             if win32gui:
                 rect = win32gui.GetWindowRect(hwnd)
             else:
@@ -462,7 +436,7 @@ def capture_window_image(hwnd):
             w = right - left
             h = bottom - top
             if w > 0 and h > 0:
-                # pyautogui 截图基于屏幕坐标，因此窗口必须可见且在屏幕内
+                                                  
                 img = pyautogui.screenshot(region=(left, top, w, h))
                 return img.convert("RGB")
         except:
@@ -575,7 +549,7 @@ def window_visibility_check(hwnd):
         h = bottom - top
         if w <= 0 or h <= 0:
             return False, rect
-        # 宽松的可见性检查，允许部分遮挡
+                         
         if bottom <= 0 or right <= 0:
             return False, rect
         window_a_rect = rect
@@ -637,7 +611,7 @@ def frame_loop():
         if not vis:
             continue
         
-        # 核心逻辑：如果处于识别模式，不要高频截图占用资源，等待识别函数自己截取高质量图
+                                                 
         if get_mode() == MODE_RECOG:
             time.sleep(0.1)
             continue
@@ -1048,17 +1022,17 @@ def on_recognize_clicked():
             img = None
             if hwnd is not None:
                 recognition_progress = 5.0
-                # 给窗口一点时间刷新
+                           
                 time.sleep(0.5)
-                # 强制使用高质量截图
+                           
                 img = capture_window_image(hwnd)
                 
-                # DEBUG: 保存截图看是否黑屏（用户不可见，但逻辑上存在）
-                # if img: img.save("debug_recog.png")
+                                                
+                                                     
             
             values = []
             if img is not None:
-                # 检查是否黑屏
+                        
                 stat = np.array(img).std()
                 if stat < 5.0:
                     recognition_result_msg = "警告：截取到的画面几乎为纯色（黑/白）。\n可能是硬件加速导致，请尝试将窗口移至屏幕中央并保持前台可见。"
