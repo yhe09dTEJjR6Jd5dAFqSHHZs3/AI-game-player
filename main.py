@@ -94,7 +94,7 @@ last_user_input_time = time.monotonic()
 program_running = True
 
 screenshot_fps = 10.0
-hardware_stats = {"cpu": 0.0, "mem": 0.0, "gpu": 0.0, "vram": 0.0}
+hardware_stats = {"cpu": 0.0, "mem": 0.0, "gpu": 0.0, "vram": 0.0, "gpu_known": False, "vram_known": False, "gpu_hint": ""}
 
 optimization_progress = 0.0
 optimization_running = False
@@ -104,6 +104,7 @@ optimization_finished_cancelled = False
 
 gpu_available = torch.cuda.is_available()
 gpu_handle = None
+ai_interrupt_event = threading.Event()
 
 if pynvml is not None:
     try:
@@ -395,6 +396,89 @@ def get_value_color(v):
     recognized_color_map[v] = (r, g, b)
     return recognized_color_map[v]
 
+def rect_intersection(a, b):
+    lx = max(a[0], b[0])
+    ly = max(a[1], b[1])
+    rx = min(a[2], b[2])
+    ry = min(a[3], b[3])
+    if rx <= lx or ry <= ly:
+        return None
+    return (lx, ly, rx, ry)
+
+def rect_area(r):
+    return max(0, r[2] - r[0]) * max(0, r[3] - r[1])
+
+def union_area(rects):
+    if not rects:
+        return 0
+    xs = []
+    ys = []
+    for l, t, r, b in rects:
+        xs.extend([l, r])
+        ys.extend([t, b])
+    xs = sorted(set(xs))
+    ys = sorted(set(ys))
+    total = 0
+    for i in range(len(xs) - 1):
+        for j in range(len(ys) - 1):
+            cell = (xs[i], ys[j], xs[i + 1], ys[j + 1])
+            for l, t, r, b in rects:
+                if l < cell[2] and r > cell[0] and t < cell[3] and b > cell[1]:
+                    total += (cell[2] - cell[0]) * (cell[3] - cell[1])
+                    break
+    return total
+
+def get_virtual_screen_rect():
+    try:
+        left = ctypes.windll.user32.GetSystemMetrics(76)
+        top = ctypes.windll.user32.GetSystemMetrics(77)
+        width = ctypes.windll.user32.GetSystemMetrics(78)
+        height = ctypes.windll.user32.GetSystemMetrics(79)
+        return (left, top, left + width, top + height)
+    except:
+        return (0, 0, 0, 0)
+
+def sleep_with_interrupt(duration):
+    end = time.time() + max(0.0, duration)
+    while time.time() < end:
+        if ai_interrupt_event.is_set():
+            return False
+        remaining = end - time.time()
+        time.sleep(max(0.0, min(0.02, remaining)))
+    return not ai_interrupt_event.is_set()
+
+def move_with_interrupt(x, y, duration):
+    if pyautogui is None:
+        return False
+    steps = max(1, int(max(0.01, duration) / 0.02))
+    try:
+        cx, cy = pyautogui.position()
+    except:
+        cx, cy = x, y
+    for i in range(steps):
+        if ai_interrupt_event.is_set():
+            return False
+        ratio = (i + 1) / steps
+        nx = int(cx + (x - cx) * ratio)
+        ny = int(cy + (y - cy) * ratio)
+        try:
+            pyautogui.moveTo(nx, ny)
+        except:
+            return False
+        time.sleep(max(0.0, min(0.02, duration / steps)))
+    if not ai_interrupt_event.is_set():
+        try:
+            pyautogui.moveTo(x, y)
+        except:
+            return False
+    return not ai_interrupt_event.is_set()
+
+def request_ai_stop():
+    ai_interrupt_event.set()
+    if pyautogui is not None:
+        with contextlib.suppress(Exception):
+            pyautogui.mouseUp()
+
 def is_left_button_pressed():
     try:
         return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
@@ -528,12 +612,17 @@ def hardware_monitor_loop():
             mem = psutil.virtual_memory().percent
             gpu = 0.0
             vram = 0.0
+            gpu_known = False
+            vram_known = False
+            gpu_hint = ""
             if gpu_handle is not None and pynvml is not None:
                 try:
                     util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
                     meminfo = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
                     gpu = float(util.gpu)
                     vram = float(meminfo.used) / float(meminfo.total) * 100.0 if meminfo.total > 0 else 0.0
+                    gpu_known = True
+                    vram_known = True
                 except:
                     gpu = 0.0
                     vram = 0.0
@@ -542,20 +631,32 @@ def hardware_monitor_loop():
                     total = torch.cuda.get_device_properties(0).total_memory
                     used = torch.cuda.memory_allocated(0)
                     vram = float(used) / float(total) * 100.0 if total > 0 else 0.0
+                    vram_known = True
                 except:
                     vram = 0.0
-                    gpu = vram
-            hardware_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram}
+                util_fn = getattr(torch.cuda, "utilization", None)
+                if util_fn is not None:
+                    try:
+                        gpu = float(util_fn(0))
+                        gpu_known = True
+                    except:
+                        gpu = 0.0
+                if not gpu_known and not vram_known:
+                    gpu_hint = "GPU 指标不可用，请安装 pynvml 或更新驱动"
+            hardware_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram, "gpu_known": gpu_known, "vram_known": vram_known, "gpu_hint": gpu_hint}
             metrics = [cpu, mem]
             if gpu > 0.0:
                 metrics.append(gpu)
             if vram > 0.0:
                 metrics.append(vram)
+            base_fps = 120.0
+            if gpu_available and not gpu_known and not vram_known:
+                base_fps = 60.0
             if metrics:
                 stress = max(metrics)
-                fps = 120.0 * max(0.0, min(1.0, 1.0 - stress / 100.0))
+                fps = base_fps * max(0.0, min(1.0, 1.0 - stress / 100.0))
             else:
-                fps = 60.0
+                fps = base_fps / 2.0
             screenshot_fps = max(0.0, min(120.0, fps))
         except:
             pass
@@ -570,28 +671,40 @@ def window_visibility_check(hwnd):
         if win32gui.IsIconic(hwnd):
             return False, (0, 0, 0, 0), 1.0
         rect = win32gui.GetWindowRect(hwnd)
-        left, top, right, bottom = rect
-        w = right - left
-        h = bottom - top
-        if w <= 0 or h <= 0:
+        screen_rect = get_virtual_screen_rect()
+        clipped = rect_intersection(rect, screen_rect)
+        if clipped is None or rect_area(clipped) <= 0:
+            window_a_rect = rect
             return False, rect, 1.0
-        if bottom <= 0 or right <= 0:
-            return False, rect, 1.0
-        occlusion_ratio = 0.0
-        fg = win32gui.GetForegroundWindow() if win32gui else None
-        if fg is not None and fg != hwnd:
-            try:
-                fg_rect = win32gui.GetWindowRect(fg)
-                lx = max(left, fg_rect[0])
-                ly = max(top, fg_rect[1])
-                rx = min(right, fg_rect[2])
-                ry = min(bottom, fg_rect[3])
-                if rx > lx and ry > ly:
-                    inter_area = (rx - lx) * (ry - ly)
-                    total_area = max(1, w * h)
-                    occlusion_ratio = min(1.0, inter_area / total_area)
-            except:
-                occlusion_ratio = 0.0
+        occluders = []
+        try:
+            hwnd_list = []
+            wtop = win32gui.GetTopWindow(None)
+            while wtop:
+                hwnd_list.append(wtop)
+                wtop = win32gui.GetWindow(wtop, win32con.GW_HWNDNEXT)
+            if hwnd in hwnd_list:
+                idx = hwnd_list.index(hwnd)
+                blockers = hwnd_list[:idx]
+                for h in blockers:
+                    try:
+                        if h == hwnd:
+                            continue
+                        if not win32gui.IsWindowVisible(h):
+                            continue
+                        if win32gui.IsIconic(h):
+                            continue
+                        r = win32gui.GetWindowRect(h)
+                        inter = rect_intersection(clipped, r)
+                        if inter is not None:
+                            occluders.append(inter)
+                    except:
+                        continue
+        except:
+            pass
+        occlusion_area = union_area(occluders)
+        visible_area = max(1, rect_area(clipped))
+        occlusion_ratio = min(1.0, occlusion_area / visible_area)
         window_a_rect = rect
         return occlusion_ratio < 0.6, rect, occlusion_ratio
     except:
@@ -669,17 +782,19 @@ def frame_loop():
         with last_frame_lock:
             last_frame_np = np.array(img)
         mode = get_mode()
+        if mode != MODE_TRAIN:
+            ai_interrupt_event.clear()
         recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and occlusion_ratio < 0.6 and not optimization_running and not recognition_running
         action_vec = None
         source_flag = 0
         if mode == MODE_TRAIN:
-            if frame_arr_model is not None:
+            if not ai_interrupt_event.is_set() and frame_arr_model is not None:
                 a = ai_compute_action(frame_arr_model)
                 if a is not None:
                     last_ai_action_vec = a
                     action_vec = last_ai_action_vec
                     source_flag = 1
-            if action_vec is not None and pyautogui is not None:
+            if action_vec is not None and pyautogui is not None and not ai_interrupt_event.is_set():
                 nx1, ny1, nx2, ny2, nxm, nym, press_val, hold_val, t = [float(v) for v in action_vec]
                 sx, sy = denormalize_action_to_mouse(nx1, ny1, rect)
                 ex, ey = denormalize_action_to_mouse(nx2, ny2, rect)
@@ -687,43 +802,67 @@ def frame_loop():
                 act_type = max(0, min(3, int(round(t))))
                 hold_time = 0.05 + hold_val * 1.5
                 press_delay = 0.02 + press_val * 0.2
+                mouse_down = False
+                interrupted = False
                 try:
                     if act_type == 0:
-                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
+                        interrupted = not move_with_interrupt(sx, sy, hold_time * 0.2)
                     elif act_type == 1:
-                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
-                        pyautogui.mouseDown()
-                        time.sleep(press_delay)
-                        time.sleep(hold_time * 0.3)
-                        pyautogui.mouseUp()
+                        interrupted = not move_with_interrupt(sx, sy, hold_time * 0.2)
+                        if not interrupted:
+                            pyautogui.mouseDown()
+                            mouse_down = True
+                            if not sleep_with_interrupt(press_delay):
+                                interrupted = True
+                            if not interrupted and not sleep_with_interrupt(hold_time * 0.3):
+                                interrupted = True
                     elif act_type == 2:
-                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
-                        pyautogui.mouseDown()
-                        time.sleep(press_delay + hold_time)
-                        pyautogui.mouseUp()
+                        interrupted = not move_with_interrupt(sx, sy, hold_time * 0.2)
+                        if not interrupted:
+                            pyautogui.mouseDown()
+                            mouse_down = True
+                            if not sleep_with_interrupt(press_delay + hold_time):
+                                interrupted = True
                     else:
-                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
-                        pyautogui.mouseDown()
-                        path_pts = [(sx, sy), (mx, my), (ex, ey)]
-                        filtered = []
-                        for p in path_pts:
-                            if not filtered or filtered[-1] != p:
-                                filtered.append(p)
-                        total_steps = max(5, int(8 + press_val * 20))
-                        for i in range(len(filtered) - 1):
-                            p0 = filtered[i]
-                            p1 = filtered[i + 1]
-                            steps = max(2, total_steps // max(1, len(filtered) - 1))
-                            for s in range(1, steps + 1):
-                                ratio = s / steps
-                                curve = 0.5 - 0.5 * np.cos(np.pi * ratio)
-                                px = int(p0[0] + (p1[0] - p0[0]) * curve)
-                                py = int(p0[1] + (p1[1] - p0[1]) * curve)
-                                pyautogui.moveTo(px, py)
-                                time.sleep(max(0.0, hold_time / total_steps))
-                        pyautogui.mouseUp()
+                        interrupted = not move_with_interrupt(sx, sy, hold_time * 0.2)
+                        if not interrupted:
+                            pyautogui.mouseDown()
+                            mouse_down = True
+                            path_pts = [(sx, sy), (mx, my), (ex, ey)]
+                            filtered = []
+                            for p in path_pts:
+                                if not filtered or filtered[-1] != p:
+                                    filtered.append(p)
+                            total_steps = max(5, int(8 + press_val * 20))
+                            for i in range(len(filtered) - 1):
+                                if ai_interrupt_event.is_set():
+                                    interrupted = True
+                                    break
+                                p0 = filtered[i]
+                                p1 = filtered[i + 1]
+                                steps = max(2, total_steps // max(1, len(filtered) - 1))
+                                for s in range(1, steps + 1):
+                                    if ai_interrupt_event.is_set():
+                                        interrupted = True
+                                        break
+                                    ratio = s / steps
+                                    curve = 0.5 - 0.5 * np.cos(np.pi * ratio)
+                                    px = int(p0[0] + (p1[0] - p0[0]) * curve)
+                                    py = int(p0[1] + (p1[1] - p0[1]) * curve)
+                                    pyautogui.moveTo(px, py)
+                                    if not sleep_with_interrupt(max(0.0, hold_time / total_steps)):
+                                        interrupted = True
+                                        break
+                                if interrupted:
+                                    break
                 except:
-                    pass
+                    interrupted = True
+                finally:
+                    if mouse_down:
+                        with contextlib.suppress(Exception):
+                            pyautogui.mouseUp()
+                    if interrupted:
+                        request_ai_stop()
         elif mode == MODE_LEARN:
             if win32gui is not None:
                 try:
@@ -818,6 +957,7 @@ def keyboard_listener_loop():
         except:
             pass
         if get_mode() == MODE_TRAIN:
+            request_ai_stop()
             set_mode(MODE_LEARN)
     with keyboard.Listener(on_press=on_press) as listener:
         listener.join()
@@ -852,6 +992,7 @@ def global_input_loop():
                         return
                     else:
                         if get_mode() == MODE_TRAIN:
+                            request_ai_stop()
                             set_mode(MODE_LEARN)
                     break
             if any_key:
@@ -1201,8 +1342,18 @@ def update_ui_loop():
         fps_label_var.set(f"截图频率: {screenshot_fps:.1f} Hz")
         cpu_label_var.set(f"CPU 占用: {hardware_stats['cpu']:.1f}%")
         mem_label_var.set(f"内存占用: {hardware_stats['mem']:.1f}%")
-        gpu_label_var.set(f"GPU 占用: {hardware_stats['gpu']:.1f}%")
-        vram_label_var.set(f"显存占用: {hardware_stats['vram']:.1f}%")
+        gpu_known = hardware_stats.get("gpu_known", False)
+        vram_known = hardware_stats.get("vram_known", False)
+        gpu_hint = hardware_stats.get("gpu_hint", "")
+        if gpu_known:
+            gpu_label_var.set(f"GPU 占用: {hardware_stats['gpu']:.1f}%")
+        else:
+            hint = f" ({gpu_hint})" if gpu_hint else ""
+            gpu_label_var.set(f"GPU 占用: 未知{hint}")
+        if vram_known:
+            vram_label_var.set(f"显存占用: {hardware_stats['vram']:.1f}%")
+        else:
+            vram_label_var.set("显存占用: 未知")
         mode_map = {MODE_INIT: "初始化", MODE_LEARN: "学习模式", MODE_TRAIN: "训练模式", MODE_OPT: "优化中", MODE_RECOG: "识别中"}
         mode_now = get_mode()
         mode_label_var.set("模式: " + mode_map.get(mode_now, mode_now))
