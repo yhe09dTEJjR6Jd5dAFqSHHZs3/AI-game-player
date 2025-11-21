@@ -17,6 +17,15 @@ from collections import deque
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
+pil_module = None
+Image = None
+ImageTk = None
+ImageOps = None
+ImageEnhance = None
+ImageFilter = None
+ImageDraw = None
+ImageFont = None
+
 with contextlib.suppress(Exception):
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 with contextlib.suppress(Exception):
@@ -38,10 +47,10 @@ def ensure_module(module_name, package_name=None):
         mod = optional_import(module_name)
     return mod
 
-def ensure_dependencies():
-    global win32gui, win32con, win32ui, win32api, pil_module, Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageFont, pyautogui
-    pil_module_local = ensure_module("PIL", "Pillow")
+def ensure_pillow_available():
+    global pil_module, Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageFont
     pil_targets = ["Image", "ImageTk", "ImageOps", "ImageEnhance", "ImageFilter", "ImageDraw", "ImageFont"]
+    pil_module_local = ensure_module("PIL", "Pillow")
     pil_module = pil_module_local
     Image = ImageTk = ImageOps = ImageEnhance = ImageFilter = ImageDraw = ImageFont = None
     if pil_module_local is not None:
@@ -61,6 +70,11 @@ def ensure_dependencies():
                 ImageDraw = val
             elif name == "ImageFont":
                 ImageFont = val
+    return Image is not None
+
+def ensure_dependencies():
+    global win32gui, win32con, win32ui, win32api, pyautogui
+    ensure_pillow_available()
     win32gui = ensure_module("win32gui", "pywin32")
     win32con = optional_import("win32con") if win32gui is not None else None
     win32ui = optional_import("win32ui") if win32gui is not None else None
@@ -2033,7 +2047,7 @@ def on_recognize_clicked():
     if not window_a_visible:
         messagebox.showerror("提示", "窗口 A 当前不可见或不完整，无法识别。")
         return
-    if Image is None:
+    if not ensure_pillow_available():
         messagebox.showerror("错误", "需要安装 Pillow 才能识别数值。")
         return
     
