@@ -13,7 +13,7 @@ import torch
 import numpy as np
 import subprocess
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 with contextlib.suppress(Exception):
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -26,22 +26,51 @@ def optional_import(module_name):
         return None
     return importlib.import_module(module_name)
 
-win32gui = optional_import("win32gui")
-win32con = optional_import("win32con")
-win32ui = optional_import("win32ui")
-win32api = optional_import("win32api")
+def ensure_module(module_name, package_name=None):
+    mod = optional_import(module_name)
+    if mod is None and package_name is not None:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", package_name])
+        except:
+            return None
+        mod = optional_import(module_name)
+    return mod
+
+def ensure_dependencies():
+    global win32gui, win32con, win32ui, win32api, pil_module, Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageFont, pyautogui
+    pil_module_local = ensure_module("PIL", "Pillow")
+    pil_targets = ["Image", "ImageTk", "ImageOps", "ImageEnhance", "ImageFilter", "ImageDraw", "ImageFont"]
+    pil_module = pil_module_local
+    Image = ImageTk = ImageOps = ImageEnhance = ImageFilter = ImageDraw = ImageFont = None
+    if pil_module_local is not None:
+        for name in pil_targets:
+            val = getattr(pil_module_local, name, None)
+            if name == "Image":
+                Image = val
+            elif name == "ImageTk":
+                ImageTk = val
+            elif name == "ImageOps":
+                ImageOps = val
+            elif name == "ImageEnhance":
+                ImageEnhance = val
+            elif name == "ImageFilter":
+                ImageFilter = val
+            elif name == "ImageDraw":
+                ImageDraw = val
+            elif name == "ImageFont":
+                ImageFont = val
+    win32gui = ensure_module("win32gui", "pywin32")
+    win32con = optional_import("win32con") if win32gui is not None else None
+    win32ui = optional_import("win32ui") if win32gui is not None else None
+    win32api = optional_import("win32api") if win32gui is not None else None
+    pyautogui_local = ensure_module("pyautogui", "pyautogui")
+    pyautogui = pyautogui_local
+
+ensure_dependencies()
+
 pynput_keyboard = optional_import("pynput.keyboard")
 pynput_mouse = optional_import("pynput.mouse")
 pynvml = optional_import("pynvml")
-pil_module = optional_import("PIL")
-Image = getattr(pil_module, "Image", None) if pil_module else None
-ImageTk = getattr(pil_module, "ImageTk", None) if pil_module else None
-ImageOps = getattr(pil_module, "ImageOps", None) if pil_module else None
-ImageEnhance = getattr(pil_module, "ImageEnhance", None) if pil_module else None
-ImageFilter = getattr(pil_module, "ImageFilter", None) if pil_module else None
-ImageDraw = getattr(pil_module, "ImageDraw", None) if pil_module else None
-ImageFont = getattr(pil_module, "ImageFont", None) if pil_module else None
-pyautogui = optional_import("pyautogui")
 easyocr = optional_import("easyocr")
 wmi = optional_import("wmi")
 keyboard = pynput_keyboard
@@ -1257,10 +1286,18 @@ def optimize_model_thread():
     optimization_finished_flag = False
     optimization_finished_cancelled = False
     flush_experience_buffer()
-    dataset = ExperienceDataset(experience_dir)
-    synthetic_only = len(dataset) == 0
+    dataset_real = ExperienceDataset(experience_dir)
+    real_count = len(dataset_real)
+    synthetic_only = real_count == 0
+    mix_synthetic = real_count < 64
     if synthetic_only:
         dataset = SyntheticDataset(320)
+    elif mix_synthetic:
+        synthetic_size = max(160, real_count * 3)
+        synthetic_dataset = SyntheticDataset(synthetic_size)
+        dataset = ConcatDataset([dataset_real, synthetic_dataset])
+    else:
+        dataset = dataset_real
     device = "cuda" if gpu_available else "cpu"
     model = PolicyNet()
     try:
