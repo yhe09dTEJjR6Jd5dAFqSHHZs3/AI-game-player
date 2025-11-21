@@ -5,6 +5,7 @@ import time
 import ctypes
 import contextlib
 import re
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox
 import importlib
@@ -12,6 +13,7 @@ import psutil
 import torch
 import numpy as np
 import subprocess
+from collections import deque
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
@@ -75,6 +77,7 @@ easyocr = optional_import("easyocr")
 wmi = optional_import("wmi")
 keyboard = pynput_keyboard
 mouse = pynput_mouse
+sounddevice = optional_import("sounddevice")
 MODE_INIT = "init"
 MODE_LEARN = "learning"
 MODE_TRAIN = "training"
@@ -112,6 +115,15 @@ recognition_progress = 0.0
 recognition_finished_flag = False
 recognition_result_msg = ""
 
+seq_len = 4
+text_vocab = "abcdefghijklmnopqrstuvwxyz0123456789:+-_/ .,?" \
+    "!@#$%^&*()[]{}<>""\"""'"
+text_token_map = {c: i + 1 for i, c in enumerate(text_vocab)}
+text_max_len = 96
+text_pad_id = 0
+text_unk_id = len(text_vocab) + 1
+audio_feature_dim = 16
+
 current_mode = MODE_INIT
 mode_lock = threading.Lock()
 
@@ -135,6 +147,9 @@ optimization_running = False
 optimization_cancel_requested = False
 optimization_finished_flag = False
 optimization_finished_cancelled = False
+
+frame_history = deque(maxlen=seq_len)
+last_audio_feature = np.zeros(audio_feature_dim, dtype=np.float32)
 
 gpu_available = torch.cuda.is_available()
 gpu_handle = None
@@ -281,49 +296,66 @@ class PolicyNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=8, stride=4, padding=2),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU()
+            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1),
+            nn.SiLU()
         )
-        self.fc_img = nn.Sequential(
-            nn.Linear(64 * 10 * 10, 256),
-            nn.ReLU()
-        )
+        self.frame_proj = nn.Linear(96 * 11 * 11, 256)
+        self.temporal_gru = nn.GRU(256, 256, batch_first=True)
         self.fc_num = nn.Sequential(
-            nn.Linear(numeric_dim, 128),
-            nn.ReLU()
+            nn.Linear(numeric_dim, 160),
+            nn.SiLU(),
+            nn.Linear(160, 128),
+            nn.SiLU()
         )
+        self.text_embed = nn.Embedding(text_unk_id + 1, 64, padding_idx=text_pad_id)
+        self.text_gru = nn.GRU(64, 128, batch_first=True)
+        self.audio_proj = nn.Sequential(nn.Linear(audio_feature_dim, 128), nn.SiLU())
         self.grid_h = 21
         self.grid_w = 21
-        merged = 256 + 128
+        merged = 256 + 128 + 128 + 128
+        self.fusion_gate = nn.Linear(merged, merged)
         self.action_head = nn.Linear(merged, 8)
         self.control_head = nn.Linear(merged, self.grid_h * self.grid_w)
-        self.rule_head = nn.Linear(merged, 4)
+        self.rule_head = nn.Linear(256, 4)
         self.action_type_head = nn.Linear(merged, 4)
         self.pref_head = nn.Linear(merged, numeric_dim)
+        self.value_head = nn.Linear(merged, 1)
 
-    def forward(self, x, num_feat):
-        x = x.float() / 255.0
+    def forward(self, x_seq, num_feat, text_tokens, audio_feat):
+        b, t = x_seq.shape[:2]
+        x = x_seq.float() / 255.0
+        x = x.view(b * t, x_seq.size(2), x_seq.size(3), x_seq.size(4))
         x = self.conv(x)
         x = x.view(x.size(0), -1)
-        x = self.fc_img(x)
+        x = self.frame_proj(x)
+        x = x.view(b, t, -1)
+        _, h = self.temporal_gru(x)
+        img_feat = h[-1]
         num_feat = num_feat.float()
         num_feat = self.fc_num(num_feat)
-        merged = torch.cat([x, num_feat], dim=1)
+        text_tokens = text_tokens.long()
+        text_emb, _ = self.text_gru(self.text_embed(text_tokens))
+        text_feat = text_emb[:, -1, :]
+        audio_feat = self.audio_proj(audio_feat.float())
+        merged = torch.cat([img_feat, num_feat, text_feat, audio_feat], dim=1)
+        gate = torch.sigmoid(self.fusion_gate(merged))
+        merged = merged * gate
         action = self.action_head(merged)
         control_logits = self.control_head(merged).view(-1, 1, self.grid_h, self.grid_w)
-        rule_logits = self.rule_head(merged)
+        rule_logits = self.rule_head(img_feat)
         type_logits = self.action_type_head(merged)
         pref_recon = self.pref_head(merged)
+        value_pred = self.value_head(merged).squeeze(-1)
         pos_start = torch.tanh(action[:, :2])
         pos_end = torch.tanh(action[:, 2:4])
         pos_mid = torch.tanh(action[:, 4:6])
         press_logit = action[:, 6]
         hold_logit = action[:, 7]
-        return pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, rule_logits, type_logits, pref_recon
+        return pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, rule_logits, type_logits, pref_recon, value_pred
 
 class ExperienceDataset(Dataset):
     def __init__(self, directory):
@@ -338,23 +370,56 @@ class ExperienceDataset(Dataset):
                         act = data.get("act")
                         src = data.get("src")
                         num = data.get("num")
-                        if obs is not None and act is not None:
-                            n = obs.shape[0]
-                            for i in range(n):
-                                a = act[i]
-                                if a.ndim == 0:
+                        text = data.get("text")
+                        audio = data.get("audio")
+                        if obs is None or act is None:
+                            continue
+                        n = obs.shape[0]
+                        seq_buffer = []
+                        for i in range(n):
+                            a = act[i]
+                            if a.ndim == 0:
+                                continue
+                            if a.numel() < 9:
+                                pad = torch.zeros(9 - a.numel())
+                                a = torch.cat([a.view(-1), pad], dim=0)
+                            elif a.numel() > 9:
+                                a = a.view(-1)[:9]
+                            num_vec = None
+                            if num is not None and i < num.shape[0]:
+                                num_vec = num[i].view(-1)
+                            if num_vec is None or num_vec.numel() != numeric_dim:
+                                num_vec = torch.zeros(numeric_dim)
+                            seq_item = obs[i]
+                            if seq_item.ndim == 3:
+                                seq_buffer.append(seq_item)
+                                if len(seq_buffer) < seq_len:
                                     continue
-                                if a.numel() < 9:
-                                    pad = torch.zeros(9 - a.numel())
-                                    a = torch.cat([a.view(-1), pad], dim=0)
-                                elif a.numel() > 9:
-                                    a = a.view(-1)[:9]
-                                num_vec = None
-                                if num is not None and i < num.shape[0]:
-                                    num_vec = num[i].view(-1)
-                                if num_vec is None or num_vec.numel() != numeric_dim:
-                                    num_vec = torch.zeros(numeric_dim)
-                                self.samples.append((obs[i], a, 0 if src is None else int(src[i]), num_vec))
+                                seq_stack = torch.stack(list(seq_buffer)[-seq_len:], dim=0)
+                            else:
+                                seq_stack = seq_item
+                                seq_buffer.append(seq_item[-1])
+                            text_tokens = None
+                            if text is not None and i < text.shape[0]:
+                                text_tokens = text[i]
+                            if text_tokens is None or text_tokens.numel() != text_max_len:
+                                text_tokens = torch.from_numpy(build_numeric_text_tokens(num_vec.numpy())).long()
+                            audio_vec = None
+                            if audio is not None and i < audio.shape[0]:
+                                audio_vec = audio[i]
+                            if audio_vec is None or audio_vec.numel() != audio_feature_dim:
+                                pad_audio = torch.zeros(audio_feature_dim)
+                                act_vals = torch.tanh(a.view(-1))
+                                k = min(audio_feature_dim, act_vals.numel())
+                                pad_audio[:k] = act_vals[:k]
+                                if k < audio_feature_dim:
+                                    extra = torch.tanh(num_vec.view(-1))
+                                    if extra.numel() > 0:
+                                        m = min(audio_feature_dim - k, extra.numel())
+                                        pad_audio[k:k + m] = extra[:m]
+                                audio_vec = pad_audio
+                            utility = torch.tensor(compute_numeric_utility(num_vec.numpy(), 0 if src is None else int(src[i])), dtype=torch.float32)
+                            self.samples.append((seq_stack, a, 0 if src is None else int(src[i]), num_vec, text_tokens, audio_vec, utility))
                     except:
                         continue
 
@@ -362,15 +427,18 @@ class ExperienceDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        o, a, s, n = self.samples[idx]
-        return o, a, s, n
+        o, a, s, n, t, au, u = self.samples[idx]
+        return o, a, s, n, t, au, u
 
 class SyntheticDataset(Dataset):
     def __init__(self, count=256):
-        obs = torch.randint(0, 256, (count, 3, 84, 84), dtype=torch.uint8)
+        obs = torch.randint(0, 256, (count, seq_len, 3, 84, 84), dtype=torch.uint8)
         acts = []
         nums = []
         src = torch.zeros(count, dtype=torch.int64)
+        texts = []
+        audios = []
+        utils = []
         for i in range(count):
             val = float((i * 17) % 1000)
             cat = i % len(category_choices)
@@ -390,17 +458,35 @@ class SyntheticDataset(Dataset):
                     num_vec.extend([0.0] * (1 + len(category_choices) + 1))
             num_vec.append(1.0 / float(max_numbers))
             num_vec.append(1.0)
-            nums.append(torch.tensor(num_vec, dtype=torch.float32))
+            num_tensor = torch.tensor(num_vec, dtype=torch.float32)
+            nums.append(num_tensor)
+            text_tokens = torch.from_numpy(build_numeric_text_tokens(num_tensor.numpy())).long()
+            texts.append(text_tokens)
+            audio_vec = torch.zeros(audio_feature_dim)
+            vals = torch.tanh(action_vec)
+            k = min(audio_feature_dim, vals.numel())
+            audio_vec[:k] = vals[:k]
+            if k < audio_feature_dim:
+                extra = torch.tanh(num_tensor.view(-1))
+                if extra.numel() > 0:
+                    m = min(audio_feature_dim - k, extra.numel())
+                    audio_vec[k:k + m] = extra[:m]
+            audios.append(audio_vec)
+            util_val = compute_numeric_utility(num_tensor.numpy(), 0)
+            utils.append(torch.tensor(util_val, dtype=torch.float32))
         self.obs = obs
         self.act = torch.stack(acts, dim=0)
         self.num = torch.stack(nums, dim=0)
         self.src = src
+        self.text = torch.stack(texts, dim=0)
+        self.audio = torch.stack(audios, dim=0)
+        self.utility = torch.stack(utils, dim=0)
 
     def __len__(self):
         return self.obs.shape[0]
 
     def __getitem__(self, idx):
-        return self.obs[idx], self.act[idx], self.src[idx], self.num[idx]
+        return self.obs[idx], self.act[idx], self.src[idx], self.num[idx], self.text[idx], self.audio[idx], self.utility[idx]
 
 def ensure_model_exists():
     global policy_model, experience_file_index
@@ -507,6 +593,107 @@ def build_numeric_feature_vector():
     feat.append(count / float(max_numbers))
     feat.append(1.0 - min(1.0, window_a_occlusion))
     return np.array(feat, dtype=np.float32)
+
+def encode_text_tokens(text):
+    tokens = []
+    for ch in text.lower():
+        if len(tokens) >= text_max_len:
+            break
+        tokens.append(text_token_map.get(ch, text_unk_id))
+    if not tokens:
+        tokens = [text_unk_id]
+    if len(tokens) < text_max_len:
+        tokens.extend([text_pad_id] * (text_max_len - len(tokens)))
+    return np.array(tokens, dtype=np.int64)
+
+def build_live_text_tokens(num_vec):
+    parts = []
+    if window_a_title:
+        parts.append(window_a_title[:48])
+    with recognized_lock:
+        vals = list(recognized_values)
+    for item in vals[:6]:
+        parts.append(f"{item.get('value', '?')}:{item.get('category', '?')}")
+    if num_vec is not None and num_vec.size > 0:
+        sample_vals = [str(round(float(x), 2)) for x in num_vec[:8]]
+        parts.append("nums:" + ",".join(sample_vals))
+    if not parts:
+        parts.append("state")
+    return encode_text_tokens(" | ".join(parts))
+
+def build_numeric_text_tokens(num_vec):
+    arr = np.array(num_vec, dtype=np.float32).flatten()
+    stride = 1 + len(category_choices) + 1
+    phrases = []
+    for i in range(max_numbers):
+        base = i * stride
+        if base + stride > len(arr):
+            break
+        val_norm = arr[base]
+        cat_slice = arr[base + 1: base + 1 + len(category_choices)]
+        cat_id = int(np.argmax(cat_slice)) if cat_slice.size else 0
+        locked = arr[base + 1 + len(category_choices)] if base + stride <= len(arr) else 0.0
+        phrases.append(f"n{i}:{round(float(val_norm), 3)}:{cat_id}:{int(locked > 0.5)}")
+    coverage = arr[-2] if len(arr) >= 2 else 0.0
+    visibility = arr[-1] if len(arr) >= 1 else 0.0
+    phrases.append(f"cvg:{round(float(coverage), 3)}")
+    phrases.append(f"vis:{round(float(visibility), 3)}")
+    return encode_text_tokens(" ".join(phrases))
+
+def compute_numeric_utility(num_vec, src_flag):
+    arr = np.array(num_vec, dtype=np.float32).flatten()
+    stride = 1 + len(category_choices) + 1
+    utility = 0.0
+    for i in range(max_numbers):
+        base = i * stride
+        if base + stride > len(arr):
+            break
+        val_norm = arr[base]
+        cat_slice = arr[base + 1: base + 1 + len(category_choices)]
+        cat_id = int(np.argmax(cat_slice)) if cat_slice.size else 0
+        locked = arr[base + 1 + len(category_choices)] if base + stride <= len(arr) else 0.0
+        weight = 0.0
+        if cat_id == category_to_id.get("越高越好", 0):
+            weight = 1.0
+        elif cat_id == category_to_id.get("越低越好", 1):
+            weight = -1.0
+        elif cat_id == category_to_id.get("变化越小越好", 2):
+            weight = -0.3
+        elif cat_id == category_to_id.get("变化越大越好", 3):
+            weight = 0.3
+        elif cat_id == category_to_id.get("识别错误", 5):
+            weight = -0.6
+        utility += weight * val_norm * (1.0 + locked * 0.1)
+    coverage = arr[-2] if len(arr) >= 2 else 0.0
+    visibility = arr[-1] if len(arr) >= 1 else 0.0
+    utility += (coverage - 0.5) * 0.3 + (visibility - 0.5) * 0.4
+    utility += -0.1 if src_flag else 0.05
+    return float(np.tanh(utility))
+
+def hardware_audio_vector():
+    feats = [hardware_stats.get("cpu", 0.0) / 100.0, hardware_stats.get("mem", 0.0) / 100.0, hardware_stats.get("gpu", 0.0) / 100.0, hardware_stats.get("vram", 0.0) / 100.0]
+    feats.append(1.0 if hardware_stats.get("gpu_known", False) else 0.0)
+    feats.append(1.0 if hardware_stats.get("vram_known", False) else 0.0)
+    feats.append(len(recognized_values) / float(max_numbers))
+    while len(feats) < audio_feature_dim:
+        feats.append(math.sin(len(feats)) * 0.1)
+    return np.array(feats[:audio_feature_dim], dtype=np.float32)
+
+def capture_audio_snapshot():
+    if sounddevice is not None:
+        try:
+            sr = 16000
+            duration = 0.2
+            frames = int(sr * duration)
+            audio = sounddevice.rec(frames, samplerate=sr, channels=1, blocking=True)
+            audio = np.array(audio).flatten()
+            if audio.size > 0:
+                splits = np.array_split(audio, audio_feature_dim)
+                feats = [float(np.log1p(np.mean(np.abs(s)) + 1e-6)) for s in splits]
+                return np.array(feats, dtype=np.float32)
+        except:
+            pass
+    return hardware_audio_vector()
 
 def rect_intersection(a, b):
     lx = max(a[0], b[0])
@@ -671,32 +858,52 @@ def resize_for_model(img):
     arr = np.transpose(arr, (2, 0, 1))
     return arr
 
-def record_experience(frame_arr, action_vec, source_flag, num_vec):
+def build_frame_sequence(frame_arr):
+    if frame_arr is None:
+        return None
+    frame_history.append(frame_arr)
+    if not frame_history:
+        return None
+    frames = list(frame_history)
+    while len(frames) < seq_len:
+        frames.insert(0, frames[0])
+    frames = frames[-seq_len:]
+    return np.stack(frames, axis=0)
+
+def record_experience(frame_seq, action_vec, source_flag, num_vec, text_tokens, audio_vec):
     global experience_buffer, experience_file_index
-    if frame_arr is None or action_vec is None:
+    if frame_seq is None or action_vec is None:
         return
     if num_vec is None:
         num_vec = np.zeros(numeric_dim, dtype=np.float32)
+    if text_tokens is None:
+        text_tokens = encode_text_tokens("state")
+    if audio_vec is None:
+        audio_vec = np.copy(last_audio_feature)
     if len(action_vec) < 9:
         pad_len = 9 - len(action_vec)
         action_vec = np.concatenate([action_vec, np.zeros(pad_len, dtype=np.float32)])
     elif len(action_vec) > 9:
         action_vec = action_vec[:9]
     with experience_lock:
-        experience_buffer.append((frame_arr, action_vec, source_flag, num_vec))
+        experience_buffer.append((frame_seq, action_vec, source_flag, num_vec, text_tokens, audio_vec))
         if len(experience_buffer) >= 128:
             try:
                 obs = np.stack([x[0] for x in experience_buffer], axis=0)
                 act = np.stack([x[1] for x in experience_buffer], axis=0).astype(np.float32)
                 src = np.array([x[2] for x in experience_buffer], dtype=np.int64)
                 num = np.stack([x[3] for x in experience_buffer], axis=0).astype(np.float32)
+                text = np.stack([x[4] for x in experience_buffer], axis=0).astype(np.int64)
+                audio = np.stack([x[5] for x in experience_buffer], axis=0).astype(np.float32)
                 tensor_obs = torch.from_numpy(obs)
                 tensor_act = torch.from_numpy(act)
                 tensor_src = torch.from_numpy(src)
                 tensor_num = torch.from_numpy(num)
+                tensor_text = torch.from_numpy(text)
+                tensor_audio = torch.from_numpy(audio)
                 path = os.path.join(experience_dir, f"experience_{experience_file_index}.pt")
                 experience_file_index += 1
-                torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src, "num": tensor_num}, path)
+                torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src, "num": tensor_num, "text": tensor_text, "audio": tensor_audio}, path)
             except:
                 pass
             experience_buffer = []
@@ -711,13 +918,17 @@ def flush_experience_buffer():
             act = np.stack([x[1] for x in experience_buffer], axis=0).astype(np.float32)
             src = np.array([x[2] for x in experience_buffer], dtype=np.int64)
             num = np.stack([x[3] for x in experience_buffer], axis=0).astype(np.float32)
+            text = np.stack([x[4] for x in experience_buffer], axis=0).astype(np.int64)
+            audio = np.stack([x[5] for x in experience_buffer], axis=0).astype(np.float32)
             tensor_obs = torch.from_numpy(obs)
             tensor_act = torch.from_numpy(act)
             tensor_src = torch.from_numpy(src)
             tensor_num = torch.from_numpy(num)
+            tensor_text = torch.from_numpy(text)
+            tensor_audio = torch.from_numpy(audio)
             path = os.path.join(experience_dir, f"experience_{experience_file_index}.pt")
             experience_file_index += 1
-            torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src, "num": tensor_num}, path)
+            torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src, "num": tensor_num, "text": tensor_text, "audio": tensor_audio}, path)
         except:
             pass
         experience_buffer = []
@@ -916,6 +1127,9 @@ def hardware_monitor_loop():
             if not gpu_known and not vram_known:
                 gpu_hint = gpu_hint or "GPU 指标不可用，请安装 pynvml 或更新驱动"
             hardware_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram, "gpu_known": gpu_known, "vram_known": vram_known, "gpu_hint": gpu_hint}
+            audio_vec = hardware_audio_vector()
+            global last_audio_feature
+            last_audio_feature = audio_vec
             metrics = [cpu, mem]
             if gpu > 0.0:
                 metrics.append(gpu)
@@ -986,7 +1200,7 @@ def window_visibility_check(hwnd):
     except:
         return False, (0, 0, 0, 0), 1.0
 
-def ai_compute_action(frame_arr, num_vec):
+def ai_compute_action(frame_seq, num_vec, text_tokens, audio_vec):
     global policy_model
     if policy_model is None:
         return None
@@ -994,10 +1208,12 @@ def ai_compute_action(frame_arr, num_vec):
         with model_lock:
             model = policy_model
             model.eval()
-            x = torch.from_numpy(frame_arr).unsqueeze(0)
+            x = torch.from_numpy(frame_seq).unsqueeze(0)
             n = torch.from_numpy(num_vec).unsqueeze(0)
+            t = torch.from_numpy(text_tokens).unsqueeze(0)
+            a = torch.from_numpy(audio_vec).unsqueeze(0)
             with torch.no_grad():
-                pos_start, pos_end, pos_mid, press_logit, hold_logit, _, _, type_logits, _ = model(x, n)
+                pos_start, pos_end, pos_mid, press_logit, hold_logit, _, _, type_logits, _, _ = model(x, n, t, a)
                 pos_start = pos_start[0].cpu().numpy()
                 pos_end = pos_end[0].cpu().numpy()
                 pos_mid = pos_mid[0].cpu().numpy()
@@ -1015,7 +1231,7 @@ def ai_compute_action(frame_arr, num_vec):
         return None
 
 def frame_loop():
-    global window_a_visible, window_a_title, window_a_rect, last_frame_np, program_running, last_user_action_vec, last_ai_action_vec, window_a_occlusion, user_pressing, user_press_start, user_press_path, user_press_time
+    global window_a_visible, window_a_title, window_a_rect, last_frame_np, program_running, last_user_action_vec, last_ai_action_vec, window_a_occlusion, user_pressing, user_press_start, user_press_path, user_press_time, last_audio_feature
     last_time = time.time()
     while program_running:
         fps = screenshot_fps
@@ -1056,7 +1272,11 @@ def frame_loop():
         if img is None:
             continue
         frame_arr_model = resize_for_model(img)
+        frame_seq_model = build_frame_sequence(frame_arr_model)
         num_vec = build_numeric_feature_vector()
+        text_tokens = build_live_text_tokens(num_vec)
+        audio_vec = capture_audio_snapshot()
+        last_audio_feature = audio_vec
         with last_frame_lock:
             last_frame_np = np.array(img)
         mode = get_mode()
@@ -1066,8 +1286,8 @@ def frame_loop():
         action_vec = None
         source_flag = 0
         if mode == MODE_TRAIN:
-            if not ai_interrupt_event.is_set() and frame_arr_model is not None:
-                a = ai_compute_action(frame_arr_model, num_vec)
+            if not ai_interrupt_event.is_set() and frame_seq_model is not None:
+                a = ai_compute_action(frame_seq_model, num_vec, text_tokens, audio_vec)
                 if a is not None:
                     last_ai_action_vec = a
                     action_vec = last_ai_action_vec
@@ -1182,8 +1402,8 @@ def frame_loop():
                         last_user_action_vec = action_vec
                         action_vec = last_user_action_vec
                         source_flag = 0
-        if recording and frame_arr_model is not None and action_vec is not None:
-            record_experience(frame_arr_model, action_vec, source_flag, num_vec)
+        if recording and frame_seq_model is not None and action_vec is not None:
+            record_experience(frame_seq_model, action_vec, source_flag, num_vec, text_tokens, audio_vec)
 
 class LASTINPUTINFO(ctypes.Structure):
     fields = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
@@ -1313,6 +1533,7 @@ def optimize_model_thread():
     ce_rule = nn.CrossEntropyLoss()
     ce_type = nn.CrossEntropyLoss()
     mse_pref = nn.MSELoss()
+    mse_value = nn.MSELoss()
     scaler = None
     if device == "cuda":
         try:
@@ -1328,10 +1549,13 @@ def optimize_model_thread():
         for batch in loader:
             if optimization_cancel_requested:
                 break
-            obs, act, src, num = batch
+            obs, act, src, num, text_tokens, audio_feat, utility = batch
             obs = obs.to(device)
             act = act.to(device)
             num = num.to(device)
+            text_tokens = text_tokens.to(device)
+            audio_feat = audio_feat.to(device)
+            utility = utility.to(device)
             target_start = act[:, :2]
             target_end = act[:, 2:4]
             target_mid = act[:, 4:6]
@@ -1341,7 +1565,7 @@ def optimize_model_thread():
             optimizer.zero_grad()
             ctx = torch.amp.autocast("cuda") if device == "cuda" and scaler else contextlib.nullcontext()
             with ctx:
-                pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, _, type_logits, pref_recon = model(obs, num)
+                pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, rule_logits_main, type_logits, pref_recon, value_pred = model(obs, num, text_tokens, audio_feat)
                 loss_start = mse((pos_start + 1.0) / 2.0, target_start)
                 loss_end = mse((pos_end + 1.0) / 2.0, target_end)
                 loss_mid = mse((pos_mid + 1.0) / 2.0, target_mid)
@@ -1359,17 +1583,21 @@ def optimize_model_thread():
                 loss_control = bce_control(control_logits, control_target)
                 loss_type = ce_type(type_logits, target_type)
                 loss_pref = mse_pref(pref_recon, num)
-                loss = loss_start + loss_end + loss_mid + loss_press + 0.5 * loss_hold + 0.1 * loss_control + 0.25 * loss_type + 0.2 * loss_pref
+                loss_value = mse_value(value_pred, utility)
+                loss = loss_start + loss_end + loss_mid + loss_press + 0.5 * loss_hold + 0.1 * loss_control + 0.25 * loss_type + 0.2 * loss_pref + 0.3 * loss_value
                 if obs.size(0) > 0:
                     aug_list = []
                     label_list = []
                     for k in range(4):
-                        aug = torch.rot90(obs, k, dims=(2, 3))
+                        aug = torch.rot90(obs, k, dims=(3, 4))
                         aug_list.append(aug)
                         label_list.append(torch.full((obs.size(0),), k, dtype=torch.long, device=device))
                     obs_aug = torch.cat(aug_list, dim=0)
                     rot_labels = torch.cat(label_list, dim=0)
-                    _, _, _, rule_logits = model(obs_aug)
+                    num_aug = num.repeat(4, 1)
+                    text_aug = text_tokens.repeat(4, 1)
+                    audio_aug = audio_feat.repeat(4, 1)
+                    _, _, _, _, _, _, rule_logits, _, _, _ = model(obs_aug, num_aug, text_aug, audio_aug)
                     loss_rule = ce_rule(rule_logits, rot_labels)
                     loss = loss + 0.1 * loss_rule
             if scaler is not None:
