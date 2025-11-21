@@ -244,6 +244,10 @@ user_press_start = None
 user_press_path = []
 user_press_time = 0.0
 
+max_numbers = 8
+category_to_id = {c: i for i, c in enumerate(category_choices)}
+numeric_dim = max_numbers * (1 + len(category_choices) + 1) + 2
+
 class PolicyNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -255,32 +259,42 @@ class PolicyNet(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU()
         )
-        self.fc = nn.Sequential(
+        self.fc_img = nn.Sequential(
             nn.Linear(64 * 10 * 10, 256),
+            nn.ReLU()
+        )
+        self.fc_num = nn.Sequential(
+            nn.Linear(numeric_dim, 128),
             nn.ReLU()
         )
         self.grid_h = 21
         self.grid_w = 21
-        self.action_head = nn.Linear(256, 8)
-        self.control_head = nn.Linear(256, self.grid_h * self.grid_w)
-        self.rule_head = nn.Linear(256, 4)
-        self.action_type_head = nn.Linear(256, 4)
+        merged = 256 + 128
+        self.action_head = nn.Linear(merged, 8)
+        self.control_head = nn.Linear(merged, self.grid_h * self.grid_w)
+        self.rule_head = nn.Linear(merged, 4)
+        self.action_type_head = nn.Linear(merged, 4)
+        self.pref_head = nn.Linear(merged, numeric_dim)
 
-    def forward(self, x):
+    def forward(self, x, num_feat):
         x = x.float() / 255.0
         x = self.conv(x)
         x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        action = self.action_head(x)
-        control_logits = self.control_head(x).view(-1, 1, self.grid_h, self.grid_w)
-        rule_logits = self.rule_head(x)
-        type_logits = self.action_type_head(x)
+        x = self.fc_img(x)
+        num_feat = num_feat.float()
+        num_feat = self.fc_num(num_feat)
+        merged = torch.cat([x, num_feat], dim=1)
+        action = self.action_head(merged)
+        control_logits = self.control_head(merged).view(-1, 1, self.grid_h, self.grid_w)
+        rule_logits = self.rule_head(merged)
+        type_logits = self.action_type_head(merged)
+        pref_recon = self.pref_head(merged)
         pos_start = torch.tanh(action[:, :2])
         pos_end = torch.tanh(action[:, 2:4])
         pos_mid = torch.tanh(action[:, 4:6])
         press_logit = action[:, 6]
         hold_logit = action[:, 7]
-        return pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, rule_logits, type_logits
+        return pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, rule_logits, type_logits, pref_recon
 
 class ExperienceDataset(Dataset):
     def __init__(self, directory):
@@ -294,6 +308,7 @@ class ExperienceDataset(Dataset):
                         obs = data.get("obs")
                         act = data.get("act")
                         src = data.get("src")
+                        num = data.get("num")
                         if obs is not None and act is not None:
                             n = obs.shape[0]
                             for i in range(n):
@@ -305,7 +320,12 @@ class ExperienceDataset(Dataset):
                                     a = torch.cat([a.view(-1), pad], dim=0)
                                 elif a.numel() > 9:
                                     a = a.view(-1)[:9]
-                                self.samples.append((obs[i], a, 0 if src is None else int(src[i])))
+                                num_vec = None
+                                if num is not None and i < num.shape[0]:
+                                    num_vec = num[i].view(-1)
+                                if num_vec is None or num_vec.numel() != numeric_dim:
+                                    num_vec = torch.zeros(numeric_dim)
+                                self.samples.append((obs[i], a, 0 if src is None else int(src[i]), num_vec))
                     except:
                         continue
 
@@ -313,8 +333,45 @@ class ExperienceDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        o, a, s = self.samples[idx]
-        return o, a, s
+        o, a, s, n = self.samples[idx]
+        return o, a, s, n
+
+class SyntheticDataset(Dataset):
+    def __init__(self, count=256):
+        obs = torch.randint(0, 256, (count, 3, 84, 84), dtype=torch.uint8)
+        acts = []
+        nums = []
+        src = torch.zeros(count, dtype=torch.int64)
+        for i in range(count):
+            val = float((i * 17) % 1000)
+            cat = i % len(category_choices)
+            press = 1.0
+            hold = (cat + 1) / len(category_choices)
+            pos_seed = (cat * 13 + i * 7) % 100
+            nx = (pos_seed % 10) / 10.0
+            ny = ((pos_seed // 10) % 10) / 10.0
+            action_vec = torch.tensor([nx, ny, 1.0 - nx, 1.0 - ny, 0.5, 0.5, press, hold, float(cat % 4)], dtype=torch.float32)
+            acts.append(action_vec)
+            num_vec = []
+            for j in range(max_numbers):
+                if j == 0:
+                    onehot = [1.0 if k == cat else 0.0 for k in range(len(category_choices))]
+                    num_vec.extend([np.tanh(val / 1000.0)] + onehot + [0.0])
+                else:
+                    num_vec.extend([0.0] * (1 + len(category_choices) + 1))
+            num_vec.append(1.0 / float(max_numbers))
+            num_vec.append(1.0)
+            nums.append(torch.tensor(num_vec, dtype=torch.float32))
+        self.obs = obs
+        self.act = torch.stack(acts, dim=0)
+        self.num = torch.stack(nums, dim=0)
+        self.src = src
+
+    def __len__(self):
+        return self.obs.shape[0]
+
+    def __getitem__(self, idx):
+        return self.obs[idx], self.act[idx], self.src[idx], self.num[idx]
 
 def ensure_model_exists():
     global policy_model, experience_file_index
@@ -348,7 +405,7 @@ def ensure_model_exists():
     model = PolicyNet()
     if state is not None:
         try:
-            model.load_state_dict(state)
+            model.load_state_dict(state, strict=False)
         except:
             pass
     else:
@@ -400,6 +457,27 @@ def get_value_color(v):
     b = max(80, b)
     recognized_color_map[v] = (r, g, b)
     return recognized_color_map[v]
+
+def build_numeric_feature_vector():
+    feat = []
+    with recognized_lock:
+        items = list(recognized_values)
+    count = min(max_numbers, len(items))
+    for i in range(max_numbers):
+        if i < count:
+            item = items[i]
+            val = float(item.get("value", 0.0))
+            category = item.get("category", "无关")
+            cat_id = category_to_id.get(category, category_to_id.get("无关", 0))
+            locked_flag = 1.0 if item.get("locked", False) else 0.0
+            val_norm = np.tanh(val / 1000.0)
+            cat_onehot = [1.0 if j == cat_id else 0.0 for j in range(len(category_choices))]
+            feat.extend([val_norm] + cat_onehot + [locked_flag])
+        else:
+            feat.extend([0.0] * (1 + len(category_choices) + 1))
+    feat.append(count / float(max_numbers))
+    feat.append(1.0 - min(1.0, window_a_occlusion))
+    return np.array(feat, dtype=np.float32)
 
 def rect_intersection(a, b):
     lx = max(a[0], b[0])
@@ -564,28 +642,32 @@ def resize_for_model(img):
     arr = np.transpose(arr, (2, 0, 1))
     return arr
 
-def record_experience(frame_arr, action_vec, source_flag):
+def record_experience(frame_arr, action_vec, source_flag, num_vec):
     global experience_buffer, experience_file_index
     if frame_arr is None or action_vec is None:
         return
+    if num_vec is None:
+        num_vec = np.zeros(numeric_dim, dtype=np.float32)
     if len(action_vec) < 9:
         pad_len = 9 - len(action_vec)
         action_vec = np.concatenate([action_vec, np.zeros(pad_len, dtype=np.float32)])
     elif len(action_vec) > 9:
         action_vec = action_vec[:9]
     with experience_lock:
-        experience_buffer.append((frame_arr, action_vec, source_flag))
+        experience_buffer.append((frame_arr, action_vec, source_flag, num_vec))
         if len(experience_buffer) >= 128:
             try:
                 obs = np.stack([x[0] for x in experience_buffer], axis=0)
                 act = np.stack([x[1] for x in experience_buffer], axis=0).astype(np.float32)
                 src = np.array([x[2] for x in experience_buffer], dtype=np.int64)
+                num = np.stack([x[3] for x in experience_buffer], axis=0).astype(np.float32)
                 tensor_obs = torch.from_numpy(obs)
                 tensor_act = torch.from_numpy(act)
                 tensor_src = torch.from_numpy(src)
+                tensor_num = torch.from_numpy(num)
                 path = os.path.join(experience_dir, f"experience_{experience_file_index}.pt")
                 experience_file_index += 1
-                torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src}, path)
+                torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src, "num": tensor_num}, path)
             except:
                 pass
             experience_buffer = []
@@ -599,12 +681,14 @@ def flush_experience_buffer():
             obs = np.stack([x[0] for x in experience_buffer], axis=0)
             act = np.stack([x[1] for x in experience_buffer], axis=0).astype(np.float32)
             src = np.array([x[2] for x in experience_buffer], dtype=np.int64)
+            num = np.stack([x[3] for x in experience_buffer], axis=0).astype(np.float32)
             tensor_obs = torch.from_numpy(obs)
             tensor_act = torch.from_numpy(act)
             tensor_src = torch.from_numpy(src)
+            tensor_num = torch.from_numpy(num)
             path = os.path.join(experience_dir, f"experience_{experience_file_index}.pt")
             experience_file_index += 1
-            torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src}, path)
+            torch.save({"obs": tensor_obs, "act": tensor_act, "src": tensor_src, "num": tensor_num}, path)
         except:
             pass
         experience_buffer = []
@@ -672,6 +756,54 @@ def gather_nvidia_smi_metrics():
         return []
     return metrics
 
+def gather_perfmon_metrics():
+    metrics = []
+    if os.name != "nt":
+        return metrics
+    try:
+        cmd = ["powershell", "-Command", "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage').CounterSamples | Select-Object CookedValue"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if res.returncode == 0:
+            vals = []
+            for line in res.stdout.splitlines():
+                try:
+                    vals.append(float(line.strip()))
+                except:
+                    continue
+            if vals:
+                metrics.append({"util": max(vals), "vram": None})
+    except:
+        return []
+    return metrics
+
+def gather_dxdiag_metrics():
+    metrics = []
+    if os.name != "nt":
+        return metrics
+    try:
+        tmp_path = os.path.join(os.getenv("TEMP", ""), f"dxdiag_{int(time.time())}.txt")
+        res = subprocess.run(["dxdiag", "/t", tmp_path], timeout=8)
+        if res.returncode == 0 and os.path.exists(tmp_path):
+            used = None
+            total = None
+            with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "Dedicated Memory:" in line and total is None:
+                        parts = re.findall(r"\d+", line)
+                        if parts:
+                            total = float(parts[0]) * 1024 * 1024
+                    if "Current Usage:" in line and used is None:
+                        parts = re.findall(r"\d+", line)
+                        if parts:
+                            used = float(parts[0]) * 1024 * 1024
+            if used is not None and total not in (None, 0):
+                metrics.append({"util": None, "used": used, "total": total})
+        with contextlib.suppress(Exception):
+            os.remove(tmp_path)
+    except:
+        return []
+    return metrics
+
 def gather_wmi_metrics():
     metrics = []
     if wmi is None:
@@ -707,33 +839,42 @@ def collect_gpu_metrics():
     gpu_vals = []
     vram_vals = []
     hint_parts = []
+    fail_parts = []
     sources = [
         (gather_pynvml_metrics, "pynvml"),
         (gather_torch_metrics, "torch"),
         (gather_nvidia_smi_metrics, "nvidia-smi"),
         (gather_wmi_metrics, "wmi"),
+        (gather_perfmon_metrics, "perfmon"),
+        (gather_dxdiag_metrics, "dxdiag"),
     ]
     for fn, label in sources:
-        data = fn()
-        if not data:
-            continue
-        hint_parts.append(label)
-        for item in data:
-            util_val = item.get("util")
-            if util_val is not None:
-                gpu_vals.append(util_val)
-            used = item.get("used")
-            total = item.get("total")
-            vram_ratio = item.get("vram")
-            if vram_ratio is None and used is not None and total not in (None, 0):
-                vram_ratio = float(used) / float(total) * 100.0
-            if vram_ratio is not None:
-                vram_vals.append(vram_ratio)
+        try:
+            data = fn()
+            if not data:
+                fail_parts.append(f"{label}:无数据")
+                continue
+            hint_parts.append(label)
+            for item in data:
+                util_val = item.get("util")
+                if util_val is not None:
+                    gpu_vals.append(util_val)
+                used = item.get("used")
+                total = item.get("total")
+                vram_ratio = item.get("vram")
+                if vram_ratio is None and used is not None and total not in (None, 0):
+                    vram_ratio = float(used) / float(total) * 100.0
+                if vram_ratio is not None:
+                    vram_vals.append(vram_ratio)
+        except Exception as e:
+            fail_parts.append(f"{label}:" + str(e))
     gpu_known = bool(gpu_vals)
     vram_known = bool(vram_vals)
     gpu = max(gpu_vals) if gpu_vals else 0.0
     vram = max(vram_vals) if vram_vals else 0.0
     hint = "/".join(hint_parts)
+    if fail_parts:
+        hint = (hint + " | " if hint else "") + ";".join(fail_parts)
     return gpu, vram, gpu_known, vram_known, hint
 
 def hardware_monitor_loop():
@@ -816,7 +957,7 @@ def window_visibility_check(hwnd):
     except:
         return False, (0, 0, 0, 0), 1.0
 
-def ai_compute_action(frame_arr):
+def ai_compute_action(frame_arr, num_vec):
     global policy_model
     if policy_model is None:
         return None
@@ -825,8 +966,9 @@ def ai_compute_action(frame_arr):
             model = policy_model
             model.eval()
             x = torch.from_numpy(frame_arr).unsqueeze(0)
+            n = torch.from_numpy(num_vec).unsqueeze(0)
             with torch.no_grad():
-                pos_start, pos_end, pos_mid, press_logit, hold_logit, _, _, type_logits = model(x)
+                pos_start, pos_end, pos_mid, press_logit, hold_logit, _, _, type_logits, _ = model(x, n)
                 pos_start = pos_start[0].cpu().numpy()
                 pos_end = pos_end[0].cpu().numpy()
                 pos_mid = pos_mid[0].cpu().numpy()
@@ -885,6 +1027,7 @@ def frame_loop():
         if img is None:
             continue
         frame_arr_model = resize_for_model(img)
+        num_vec = build_numeric_feature_vector()
         with last_frame_lock:
             last_frame_np = np.array(img)
         mode = get_mode()
@@ -895,7 +1038,7 @@ def frame_loop():
         source_flag = 0
         if mode == MODE_TRAIN:
             if not ai_interrupt_event.is_set() and frame_arr_model is not None:
-                a = ai_compute_action(frame_arr_model)
+                a = ai_compute_action(frame_arr_model, num_vec)
                 if a is not None:
                     last_ai_action_vec = a
                     action_vec = last_ai_action_vec
@@ -1011,7 +1154,7 @@ def frame_loop():
                         action_vec = last_user_action_vec
                         source_flag = 0
         if recording and frame_arr_model is not None and action_vec is not None:
-            record_experience(frame_arr_model, action_vec, source_flag)
+            record_experience(frame_arr_model, action_vec, source_flag, num_vec)
 
 class LASTINPUTINFO(ctypes.Structure):
     fields = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
@@ -1115,25 +1258,14 @@ def optimize_model_thread():
     optimization_finished_cancelled = False
     flush_experience_buffer()
     dataset = ExperienceDataset(experience_dir)
-    if len(dataset) == 0:
-        model = PolicyNet()
-        try:
-            torch.save(model.state_dict(), model_path)
-            ts_name = os.path.join(models_dir, f"policy_{int(time.time())}.pt")
-            torch.save(model.state_dict(), ts_name)
-        except:
-            pass
-        with model_lock:
-            policy_model = model
-        optimization_running = False
-        optimization_finished_flag = True
-        optimization_finished_cancelled = False
-        return
+    synthetic_only = len(dataset) == 0
+    if synthetic_only:
+        dataset = SyntheticDataset(320)
     device = "cuda" if gpu_available else "cpu"
     model = PolicyNet()
     try:
         state = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state)
+        model.load_state_dict(state, strict=False)
     except:
         pass
     model.to(device)
@@ -1143,6 +1275,7 @@ def optimize_model_thread():
     bce_control = nn.BCEWithLogitsLoss()
     ce_rule = nn.CrossEntropyLoss()
     ce_type = nn.CrossEntropyLoss()
+    mse_pref = nn.MSELoss()
     scaler = None
     if device == "cuda":
         try:
@@ -1151,15 +1284,17 @@ def optimize_model_thread():
             scaler = None
     batch_size = min(32, max(1, len(dataset)))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    total_steps = max(1, len(loader) * 3)
+    total_epochs = 4 if synthetic_only else 3
+    total_steps = max(1, len(loader) * total_epochs)
     step = 0
-    for epoch in range(3):
+    for epoch in range(total_epochs):
         for batch in loader:
             if optimization_cancel_requested:
                 break
-            obs, act, src = batch
+            obs, act, src, num = batch
             obs = obs.to(device)
             act = act.to(device)
+            num = num.to(device)
             target_start = act[:, :2]
             target_end = act[:, 2:4]
             target_mid = act[:, 4:6]
@@ -1169,7 +1304,7 @@ def optimize_model_thread():
             optimizer.zero_grad()
             ctx = torch.amp.autocast("cuda") if device == "cuda" and scaler else contextlib.nullcontext()
             with ctx:
-                pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, _, type_logits = model(obs)
+                pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, _, type_logits, pref_recon = model(obs, num)
                 loss_start = mse((pos_start + 1.0) / 2.0, target_start)
                 loss_end = mse((pos_end + 1.0) / 2.0, target_end)
                 loss_mid = mse((pos_mid + 1.0) / 2.0, target_mid)
@@ -1186,7 +1321,8 @@ def optimize_model_thread():
                     control_target[idx, 0, cy, cx] = 1.0
                 loss_control = bce_control(control_logits, control_target)
                 loss_type = ce_type(type_logits, target_type)
-                loss = loss_start + loss_end + loss_mid + loss_press + 0.5 * loss_hold + 0.1 * loss_control + 0.25 * loss_type
+                loss_pref = mse_pref(pref_recon, num)
+                loss = loss_start + loss_end + loss_mid + loss_press + 0.5 * loss_hold + 0.1 * loss_control + 0.25 * loss_type + 0.2 * loss_pref
                 if obs.size(0) > 0:
                     aug_list = []
                     label_list = []
@@ -1547,7 +1683,8 @@ def update_ui_loop():
         if vram_known:
             vram_label_var.set(f"显存占用: {hardware_stats['vram']:.1f}%")
         else:
-            vram_label_var.set("显存占用: 未知")
+            hint = f" ({gpu_hint})" if gpu_hint else ""
+            vram_label_var.set(f"显存占用: 未知{hint}")
         mode_map = {MODE_INIT: "初始化", MODE_LEARN: "学习模式", MODE_TRAIN: "训练模式", MODE_OPT: "优化中", MODE_RECOG: "识别中"}
         mode_now = get_mode()
         mode_label_var.set("模式: " + mode_map.get(mode_now, mode_now))
