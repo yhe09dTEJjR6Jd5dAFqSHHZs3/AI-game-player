@@ -38,6 +38,7 @@ ImageTk = getattr(pil_module, "ImageTk", None) if pil_module else None
 ImageOps = getattr(pil_module, "ImageOps", None) if pil_module else None
 ImageEnhance = getattr(pil_module, "ImageEnhance", None) if pil_module else None
 ImageFilter = getattr(pil_module, "ImageFilter", None) if pil_module else None
+ImageDraw = getattr(pil_module, "ImageDraw", None) if pil_module else None
 pyautogui = optional_import("pyautogui")
 easyocr = optional_import("easyocr")
 keyboard = pynput_keyboard
@@ -54,6 +55,7 @@ experience_dir = os.path.join(base_dir, "experience")
 os.makedirs(models_dir, exist_ok=True)
 os.makedirs(experience_dir, exist_ok=True)
 model_path = os.path.join(models_dir, "policy_latest.pt")
+init_model_path = os.path.join(models_dir, "policy_init.pt")
 
 experience_buffer = []
 experience_lock = threading.Lock()
@@ -69,6 +71,7 @@ recognized_lock = threading.Lock()
 ocr_reader = None
 ocr_lock = threading.Lock()
 category_choices = ["越高越好", "越低越好", "变化越小越好", "变化越大越好", "无关", "识别错误"]
+recognized_color_map = {}
 recognition_running = False
 recognition_attempted = False
 recognition_progress = 0.0
@@ -82,6 +85,7 @@ window_a_handle = None
 window_a_title = ""
 window_a_visible = False
 window_a_rect = (0, 0, 0, 0)
+window_a_occlusion = 1.0
 
 last_frame_np = None
 last_frame_lock = threading.Lock()
@@ -323,11 +327,12 @@ def ensure_model_exists():
             model.load_state_dict(state)
         except:
             pass
-    try:
-        if state is None:
+    else:
+        try:
+            torch.save(model.state_dict(), init_model_path)
             torch.save(model.state_dict(), model_path)
-    except:
-        pass
+        except:
+            pass
     model.eval()
     policy_model = model
 
@@ -359,6 +364,18 @@ def denormalize_action_to_mouse(nx, ny, rect):
     x = left + nx * w
     y = top + ny * h
     return int(x), int(y)
+
+def get_value_color(v):
+    if v in recognized_color_map:
+        return recognized_color_map[v]
+    r = (v * 73 + 90) % 255
+    g = (v * 37 + 160) % 255
+    b = (v * 191 + 40) % 255
+    r = max(80, r)
+    g = max(80, g)
+    b = max(80, b)
+    recognized_color_map[v] = (r, g, b)
+    return recognized_color_map[v]
 
 def is_left_button_pressed():
     try:
@@ -523,25 +540,39 @@ def hardware_monitor_loop():
 def window_visibility_check(hwnd):
     global window_a_rect
     if win32gui is None:
-        return False, (0, 0, 0, 0)
+        return False, (0, 0, 0, 0), 1.0
     try:
         if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
-            return False, (0, 0, 0, 0)
+            return False, (0, 0, 0, 0), 1.0
         if win32gui.IsIconic(hwnd):
-            return False, (0, 0, 0, 0)
+            return False, (0, 0, 0, 0), 1.0
         rect = win32gui.GetWindowRect(hwnd)
         left, top, right, bottom = rect
         w = right - left
         h = bottom - top
         if w <= 0 or h <= 0:
-            return False, rect
-                         
+            return False, rect, 1.0
         if bottom <= 0 or right <= 0:
-            return False, rect
+            return False, rect, 1.0
+        occlusion_ratio = 0.0
+        fg = win32gui.GetForegroundWindow() if win32gui else None
+        if fg is not None and fg != hwnd:
+            try:
+                fg_rect = win32gui.GetWindowRect(fg)
+                lx = max(left, fg_rect[0])
+                ly = max(top, fg_rect[1])
+                rx = min(right, fg_rect[2])
+                ry = min(bottom, fg_rect[3])
+                if rx > lx and ry > ly:
+                    inter_area = (rx - lx) * (ry - ly)
+                    total_area = max(1, w * h)
+                    occlusion_ratio = min(1.0, inter_area / total_area)
+            except:
+                occlusion_ratio = 0.0
         window_a_rect = rect
-        return True, rect
+        return occlusion_ratio < 0.6, rect, occlusion_ratio
     except:
-        return False, (0, 0, 0, 0)
+        return False, (0, 0, 0, 0), 1.0
 
 def ai_compute_action(frame_arr):
     global policy_model
@@ -566,7 +597,7 @@ def ai_compute_action(frame_arr):
         return None
 
 def frame_loop():
-    global window_a_visible, window_a_title, window_a_rect, last_frame_np, program_running, last_user_action_vec, last_ai_action_vec
+    global window_a_visible, window_a_title, window_a_rect, last_frame_np, program_running, last_user_action_vec, last_ai_action_vec, window_a_occlusion
     last_time = time.time()
     while program_running:
         fps = screenshot_fps
@@ -583,9 +614,10 @@ def frame_loop():
         if hwnd is None:
             window_a_visible = False
             continue
-        vis, rect = window_visibility_check(hwnd)
+        vis, rect, occlusion_ratio = window_visibility_check(hwnd)
         window_a_visible = vis
         window_a_rect = rect
+        window_a_occlusion = occlusion_ratio
         if win32gui is not None:
             try:
                 window_a_title_local = win32gui.GetWindowText(hwnd)
@@ -609,7 +641,7 @@ def frame_loop():
         with last_frame_lock:
             last_frame_np = np.array(img)
         mode = get_mode()
-        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and not optimization_running and not recognition_running
+        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and occlusion_ratio < 0.6 and not optimization_running and not recognition_running
         action_vec = None
         source_flag = 0
         if mode == MODE_TRAIN:
@@ -873,7 +905,7 @@ def recognize_numbers_from_image(img):
             processed_list.append(bin_img)
             processed_list.append(ImageOps.invert(bin_img))
         recognition_progress = 50.0
-        candidates = set()
+        candidates = []
         reader = None
         with ocr_lock:
             global ocr_reader
@@ -893,19 +925,32 @@ def recognize_numbers_from_image(img):
                 work_img = work_img.convert("RGB")
             try:
                 res = reader.readtext(np.array(work_img), detail=1, allowlist="0123456789")
-                for _, text, conf in res:
+                for bbox, text, conf in res:
                     if conf < 0.35:
                         continue
                     for n in re.findall(r"\d+", text):
                         try:
-                            candidates.add(int(n))
+                            v = int(n)
+                            xs = [p[0] for p in bbox]
+                            ys = [p[1] for p in bbox]
+                            bx1, by1, bx2, by2 = min(xs), min(ys), max(xs), max(ys)
+                            candidates.append({"value": v, "bbox": (bx1, by1, bx2, by2)})
                         except:
                             pass
             except Exception as e:
                 print(f"OCR Error: {e}")
             op_cnt += 1
             recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
-        return sorted(list(candidates))
+        merged = []
+        seen = set()
+        for item in candidates:
+            bbox = item.get("bbox")
+            key = (item["value"], bbox)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
     except Exception as e:
         print(f"OCR Error: {e}")
         return []
@@ -938,13 +983,28 @@ def update_number_list_ui():
         label = ttk.Label(row, text=f"{idx + 1}. 数值: {item['value']}", style="Status.TLabel")
         label.pack(side="left")
         var = tk.StringVar(value=item.get("category", "无关"))
-        combo = ttk.Combobox(row, textvariable=var, values=category_choices, state="readonly", width=18)
+        locked_state = bool(item.get("locked", False))
+        combo = ttk.Combobox(row, textvariable=var, values=category_choices, state="readonly" if not locked_state else "disabled", width=18)
         combo.pack(side="left", padx=(8, 0))
         def on_select(event, i=idx, v=var):
             with recognized_lock:
                 if i < len(recognized_values):
                     recognized_values[i]["category"] = v.get()
         combo.bind("<<ComboboxSelected>>", on_select)
+        lock_btn = ttk.Button(row, text="锁定" if not locked_state else "解锁", style="Accent.TButton")
+        def on_lock_toggle(i=idx, btn=lock_btn, cb=combo):
+            with recognized_lock:
+                if i < len(recognized_values):
+                    current = bool(recognized_values[i].get("locked", False))
+                    recognized_values[i]["locked"] = not current
+                    if not current:
+                        cb.state(["disabled"])
+                        btn.configure(text="解锁")
+                    else:
+                        cb.state(["!disabled"])
+                        btn.configure(text="锁定")
+        lock_btn.configure(command=on_lock_toggle)
+        lock_btn.pack(side="left", padx=8)
         number_row_widgets.append(row)
 
 def on_recognize_clicked():
@@ -986,7 +1046,7 @@ def on_recognize_clicked():
             
             values = []
             if img is not None:
-                        
+
                 stat = np.array(img).std()
                 if stat < 5.0:
                     recognition_result_msg = "警告：截取到的画面几乎为纯色（黑/白）。\n可能是硬件加速导致，请尝试将窗口移至屏幕中央并保持前台可见。"
@@ -999,8 +1059,11 @@ def on_recognize_clicked():
 
             recognition_progress = 95.0
             new_list = []
-            for v in values:
-                new_list.append({"value": v, "category": "无关"})
+            for item in values:
+                v = item.get("value")
+                bbox = item.get("bbox")
+                color = get_value_color(v)
+                new_list.append({"value": v, "category": "无关", "bbox": bbox, "color": color, "locked": False})
             with recognized_lock:
                 recognized_values.clear()
                 recognized_values.extend(new_list)
@@ -1031,7 +1094,7 @@ def update_ui_loop():
             window_label_var.set("窗口 A: " + window_a_title)
         else:
             window_label_var.set("窗口 A: 未选择")
-        visible_label_var.set("可见且完整: " + ("是" if window_a_visible else "否"))
+        visible_label_var.set(f"可见且完整: {'是' if window_a_visible else '否'} (遮挡 {int(window_a_occlusion * 100)}%)")
         w = window_a_rect[2] - window_a_rect[0]
         h = window_a_rect[3] - window_a_rect[1]
         size_label_var.set(f"窗口大小: {w} x {h}")
@@ -1063,6 +1126,24 @@ def update_ui_loop():
             frame = last_frame_np
         if frame is not None and ImageTk is not None and Image is not None:
             img = Image.fromarray(frame)
+            overlays = []
+            with recognized_lock:
+                for item in recognized_values:
+                    bbox = item.get("bbox")
+                    val = item.get("value")
+                    color = item.get("color", get_value_color(val))
+                    if bbox:
+                        overlays.append((bbox, color))
+            if overlays and ImageDraw is not None:
+                img = img.convert("RGBA")
+                dr = ImageDraw.Draw(img, "RGBA")
+                for bbox, color in overlays:
+                    x1, y1, x2, y2 = bbox
+                    fill = (color[0], color[1], color[2], 80)
+                    outline = (color[0], color[1], color[2], 200)
+                    dr.rectangle([x1, y1, x2, y2], outline=outline, width=2)
+                    dr.rectangle([x1, y1, x2, y2], fill=fill)
+                img = img.convert("RGB")
             cw = canvas.winfo_width()
             ch = canvas.winfo_height()
             if cw > 10 and ch > 10:
