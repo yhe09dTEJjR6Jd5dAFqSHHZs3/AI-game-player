@@ -11,6 +11,7 @@ import importlib
 import psutil
 import torch
 import numpy as np
+import subprocess
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
@@ -39,8 +40,10 @@ ImageOps = getattr(pil_module, "ImageOps", None) if pil_module else None
 ImageEnhance = getattr(pil_module, "ImageEnhance", None) if pil_module else None
 ImageFilter = getattr(pil_module, "ImageFilter", None) if pil_module else None
 ImageDraw = getattr(pil_module, "ImageDraw", None) if pil_module else None
+ImageFont = getattr(pil_module, "ImageFont", None) if pil_module else None
 pyautogui = optional_import("pyautogui")
 easyocr = optional_import("easyocr")
+wmi = optional_import("wmi")
 keyboard = pynput_keyboard
 mouse = pynput_mouse
 MODE_INIT = "init"
@@ -70,6 +73,8 @@ recognized_values = []
 recognized_lock = threading.Lock()
 ocr_reader = None
 ocr_lock = threading.Lock()
+simple_ocr_templates = None
+simple_ocr_size = (28, 36)
 category_choices = ["越高越好", "越低越好", "变化越小越好", "变化越大越好", "无关", "识别错误"]
 recognized_color_map = {}
 recognition_running = False
@@ -604,45 +609,142 @@ def flush_experience_buffer():
             pass
         experience_buffer = []
 
+def gather_pynvml_metrics():
+    metrics = []
+    if pynvml is None:
+        return metrics
+    try:
+        count = pynvml.nvmlDeviceGetCount()
+    except:
+        count = 0
+    for idx in range(max(0, count)):
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            metrics.append({"util": float(util.gpu), "used": float(meminfo.used), "total": float(meminfo.total)})
+        except:
+            continue
+    return metrics
+
+def gather_torch_metrics():
+    metrics = []
+    if not gpu_available:
+        return metrics
+    try:
+        count = torch.cuda.device_count()
+    except:
+        count = 0
+    util_fn = getattr(torch.cuda, "utilization", None)
+    for idx in range(max(0, count)):
+        try:
+            total = torch.cuda.get_device_properties(idx).total_memory
+            used = torch.cuda.memory_allocated(idx)
+            vram_ratio = float(used) / float(total) * 100.0 if total > 0 else None
+        except:
+            vram_ratio = None
+        util_val = None
+        if util_fn is not None:
+            try:
+                util_val = float(util_fn(idx))
+            except:
+                util_val = None
+        metrics.append({"util": util_val, "vram": vram_ratio})
+    return metrics
+
+def gather_nvidia_smi_metrics():
+    metrics = []
+    cmd = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        if res.returncode == 0:
+            for line in res.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 3:
+                    try:
+                        util = float(parts[0])
+                        used = float(parts[1]) * 1024 * 1024
+                        total = float(parts[2]) * 1024 * 1024
+                        metrics.append({"util": util, "used": used, "total": total})
+                    except:
+                        continue
+    except:
+        return []
+    return metrics
+
+def gather_wmi_metrics():
+    metrics = []
+    if wmi is None:
+        return metrics
+    try:
+        conn = wmi.WMI(namespace="root\\CIMV2")
+        engines = conn.Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine()
+        util_map = {}
+        for e in engines:
+            name = getattr(e, "Name", "")
+            util = getattr(e, "UtilizationPercentage", None)
+            if util is None:
+                continue
+            if "engtype_3D" in name or "engtype_Compute" in name:
+                gpu_name = name.split("_")[0]
+                util_map[gpu_name] = max(util_map.get(gpu_name, 0.0), float(util))
+        for _, util_val in util_map.items():
+            metrics.append({"util": util_val, "vram": None})
+        videos = conn.Win32_VideoController()
+        for idx, v in enumerate(videos):
+            total = getattr(v, "AdapterRAM", None)
+            used = getattr(v, "CurrentUsage", None)
+            if total is not None and used is not None:
+                try:
+                    metrics.append({"util": None, "used": float(used), "total": float(total)})
+                except:
+                    continue
+    except:
+        return []
+    return metrics
+
+def collect_gpu_metrics():
+    gpu_vals = []
+    vram_vals = []
+    hint_parts = []
+    sources = [
+        (gather_pynvml_metrics, "pynvml"),
+        (gather_torch_metrics, "torch"),
+        (gather_nvidia_smi_metrics, "nvidia-smi"),
+        (gather_wmi_metrics, "wmi"),
+    ]
+    for fn, label in sources:
+        data = fn()
+        if not data:
+            continue
+        hint_parts.append(label)
+        for item in data:
+            util_val = item.get("util")
+            if util_val is not None:
+                gpu_vals.append(util_val)
+            used = item.get("used")
+            total = item.get("total")
+            vram_ratio = item.get("vram")
+            if vram_ratio is None and used is not None and total not in (None, 0):
+                vram_ratio = float(used) / float(total) * 100.0
+            if vram_ratio is not None:
+                vram_vals.append(vram_ratio)
+    gpu_known = bool(gpu_vals)
+    vram_known = bool(vram_vals)
+    gpu = max(gpu_vals) if gpu_vals else 0.0
+    vram = max(vram_vals) if vram_vals else 0.0
+    hint = "/".join(hint_parts)
+    return gpu, vram, gpu_known, vram_known, hint
+
 def hardware_monitor_loop():
     global hardware_stats, screenshot_fps, program_running
     while program_running:
         try:
             cpu = psutil.cpu_percent(interval=0.5)
             mem = psutil.virtual_memory().percent
-            gpu = 0.0
-            vram = 0.0
-            gpu_known = False
-            vram_known = False
-            gpu_hint = ""
-            if gpu_handle is not None and pynvml is not None:
-                try:
-                    util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-                    meminfo = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-                    gpu = float(util.gpu)
-                    vram = float(meminfo.used) / float(meminfo.total) * 100.0 if meminfo.total > 0 else 0.0
-                    gpu_known = True
-                    vram_known = True
-                except:
-                    gpu = 0.0
-                    vram = 0.0
-            elif gpu_available:
-                try:
-                    total = torch.cuda.get_device_properties(0).total_memory
-                    used = torch.cuda.memory_allocated(0)
-                    vram = float(used) / float(total) * 100.0 if total > 0 else 0.0
-                    vram_known = True
-                except:
-                    vram = 0.0
-                util_fn = getattr(torch.cuda, "utilization", None)
-                if util_fn is not None:
-                    try:
-                        gpu = float(util_fn(0))
-                        gpu_known = True
-                    except:
-                        gpu = 0.0
-                if not gpu_known and not vram_known:
-                    gpu_hint = "GPU 指标不可用，请安装 pynvml 或更新驱动"
+            gpu, vram, gpu_known, vram_known, gpu_hint = collect_gpu_metrics()
+            if not gpu_known and not vram_known:
+                gpu_hint = gpu_hint or "GPU 指标不可用，请安装 pynvml 或更新驱动"
             hardware_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram, "gpu_known": gpu_known, "vram_known": vram_known, "gpu_hint": gpu_hint}
             metrics = [cpu, mem]
             if gpu > 0.0:
@@ -1121,11 +1223,92 @@ def optimize_model_thread():
     optimization_finished_flag = True
     optimization_finished_cancelled = optimization_cancel_requested
 
+def build_simple_ocr_templates():
+    global simple_ocr_templates
+    if simple_ocr_templates is not None:
+        return simple_ocr_templates
+    if Image is None or ImageDraw is None or ImageFont is None:
+        simple_ocr_templates = []
+        return simple_ocr_templates
+    templates = []
+    w, h = simple_ocr_size
+    try:
+        font = ImageFont.truetype("arial.ttf", h)
+    except:
+        try:
+            font = ImageFont.load_default()
+        except:
+            font = None
+    for d in range(10):
+        canvas = Image.new("L", (w, h), 255)
+        draw = ImageDraw.Draw(canvas)
+        text = str(d)
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+        except:
+            tw, th = draw.textsize(text, font=font)
+        x = (w - tw) // 2
+        y = (h - th) // 2
+        draw.text((x, y), text, font=font, fill=0)
+        arr = np.array(canvas, dtype=np.float32) / 255.0
+        templates.append(arr)
+    simple_ocr_templates = templates
+    return simple_ocr_templates
+
+def simple_ocr_recognize(img):
+    templates = build_simple_ocr_templates()
+    if Image is None or not templates:
+        return []
+    gray = img.convert("L")
+    arr = np.array(gray, dtype=np.uint8)
+    threshold = max(64, min(200, int(arr.mean())))
+    mask = arr < threshold
+    col_active = np.where(mask.sum(axis=0) > 0)[0]
+    if col_active.size == 0:
+        return []
+    regions = []
+    start = col_active[0]
+    prev = start
+    for c in col_active[1:]:
+        if c != prev + 1:
+            regions.append((start, prev))
+            start = c
+        prev = c
+    regions.append((start, prev))
+    results = []
+    for rs, re in regions:
+        if re - rs < 2:
+            continue
+        sub_mask = mask[:, rs:re + 1]
+        rows = np.where(sub_mask.any(axis=1))[0]
+        if rows.size == 0:
+            continue
+        top = rows.min()
+        bottom = rows.max()
+        if bottom - top < 4:
+            continue
+        crop_arr = arr[top:bottom + 1, rs:re + 1]
+        crop_img = Image.fromarray(crop_arr)
+        resized = crop_img.resize(simple_ocr_size, Image.Resampling.BILINEAR)
+        cand = np.array(resized, dtype=np.float32) / 255.0
+        best_digit = None
+        best_err = None
+        for d, tmpl in enumerate(templates):
+            diff = np.mean(np.abs(cand - tmpl))
+            if best_err is None or diff < best_err:
+                best_err = diff
+                best_digit = d
+        if best_digit is not None and best_err is not None and best_err < 0.45:
+            results.append({"value": int(best_digit), "bbox": (float(rs), float(top), float(re), float(bottom))})
+    return results
+
 def recognize_numbers_from_image(img):
     global recognition_progress
     if img is None:
         return []
-    if easyocr is None or Image is None:
+    if Image is None:
         return []
     processed_list = []
     try:
@@ -1152,45 +1335,50 @@ def recognize_numbers_from_image(img):
         recognition_progress = 50.0
         candidates = []
         reader = None
-        with ocr_lock:
-            global ocr_reader
-            if ocr_reader is None:
-                try:
-                    ocr_reader = easyocr.Reader(["en"], gpu=gpu_available)
-                except:
-                    ocr_reader = None
-            reader = ocr_reader
-        if reader is None:
-            return []
+        if easyocr is not None:
+            with ocr_lock:
+                global ocr_reader
+                if ocr_reader is None:
+                    try:
+                        ocr_reader = easyocr.Reader(["en"], gpu=gpu_available)
+                    except:
+                        ocr_reader = None
+                reader = ocr_reader
         total_ops = max(1, len(processed_list))
         op_cnt = 0
         for pm in processed_list:
             work_img = pm
-            if work_img.mode != "RGB":
-                work_img = work_img.convert("RGB")
-            try:
-                res = reader.readtext(np.array(work_img), detail=1, allowlist="0123456789")
-                for bbox, text, conf in res:
-                    if conf < 0.35:
-                        continue
-                    for n in re.findall(r"\d+", text):
-                        try:
-                            v = int(n)
-                            xs = [p[0] for p in bbox]
-                            ys = [p[1] for p in bbox]
-                            bx1, by1, bx2, by2 = min(xs), min(ys), max(xs), max(ys)
-                            candidates.append({"value": v, "bbox": (bx1, by1, bx2, by2)})
-                        except:
-                            pass
-            except Exception as e:
-                print(f"OCR Error: {e}")
+            if reader is not None:
+                if work_img.mode != "RGB":
+                    work_img = work_img.convert("RGB")
+                try:
+                    res = reader.readtext(np.array(work_img), detail=1, allowlist="0123456789")
+                    for bbox, text, conf in res:
+                        if conf < 0.35:
+                            continue
+                        for n in re.findall(r"\d+", text):
+                            try:
+                                v = int(n)
+                                xs = [p[0] for p in bbox]
+                                ys = [p[1] for p in bbox]
+                                bx1, by1, bx2, by2 = min(xs), min(ys), max(xs), max(ys)
+                                candidates.append({"value": v, "bbox": (bx1, by1, bx2, by2)})
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"OCR Error: {e}")
+            else:
+                basic_candidates = simple_ocr_recognize(work_img)
+                candidates.extend(basic_candidates)
             op_cnt += 1
             recognition_progress = 50.0 + (float(op_cnt) / total_ops * 40.0)
+        if not candidates and reader is not None:
+            candidates = simple_ocr_recognize(gray)
         merged = []
         seen = set()
         for item in candidates:
             bbox = item.get("bbox")
-            key = (item["value"], bbox)
+            key = (item.get("value"), tuple(bbox) if bbox is not None else None)
             if key in seen:
                 continue
             seen.add(key)
@@ -1265,8 +1453,8 @@ def on_recognize_clicked():
     if not window_a_visible:
         messagebox.showerror("提示", "窗口 A 当前不可见或不完整，无法识别。")
         return
-    if easyocr is None or Image is None:
-        messagebox.showerror("错误", "需要安装 Pillow 和 easyocr 才能识别数值。")
+    if Image is None:
+        messagebox.showerror("错误", "需要安装 Pillow 才能识别数值。")
         return
     
     set_mode(MODE_RECOG)
@@ -1299,6 +1487,8 @@ def on_recognize_clicked():
                     values = recognize_numbers_from_image(img)
                     if not values:
                         recognition_result_msg = "图像截取成功，但OCR未能提取到数字。\n请尝试放大窗口，或检查数字是否存在遮挡。"
+                    elif easyocr is None:
+                        recognition_result_msg = "已使用内置数字识别引擎完成处理。"
             else:
                 recognition_result_msg = "无法获取窗口图像，请确保窗口未最小化。"
 
