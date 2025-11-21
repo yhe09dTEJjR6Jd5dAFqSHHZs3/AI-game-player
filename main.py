@@ -449,8 +449,9 @@ class ExperienceDataset(Dataset):
                                         m = min(audio_feature_dim - k, extra.numel())
                                         pad_audio[k:k + m] = extra[:m]
                                 audio_vec = pad_audio
-                            utility = torch.tensor(compute_numeric_utility(num_vec.numpy(), 0 if src is None else int(src[i])), dtype=torch.float32)
-                            self.samples.append((seq_stack, a, 0 if src is None else int(src[i]), num_vec, text_tokens, audio_vec, utility))
+                            src_val = torch.tensor(0 if src is None else int(src[i]), dtype=torch.int64)
+                            utility = torch.tensor(compute_numeric_utility(num_vec.numpy(), int(src_val.item())), dtype=torch.float32)
+                            self.samples.append((seq_stack, a, src_val, num_vec, text_tokens, audio_vec, utility))
                     except:
                         continue
 
