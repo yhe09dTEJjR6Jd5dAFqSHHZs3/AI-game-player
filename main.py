@@ -702,11 +702,15 @@ def window_visibility_check(hwnd):
                         continue
         except:
             pass
+        total_area = max(1, rect_area(rect))
+        clipped_area = rect_area(clipped)
+        missing_area = max(0, total_area - clipped_area)
         occlusion_area = union_area(occluders)
-        visible_area = max(1, rect_area(clipped))
-        occlusion_ratio = min(1.0, occlusion_area / visible_area)
+        hidden_area = missing_area + occlusion_area
+        occlusion_ratio = min(1.0, hidden_area / total_area)
+        visible_full = clipped_area >= total_area * 0.999 and occlusion_ratio <= 0.001
         window_a_rect = rect
-        return occlusion_ratio < 0.6, rect, occlusion_ratio
+        return visible_full, rect, occlusion_ratio
     except:
         return False, (0, 0, 0, 0), 1.0
 
@@ -784,7 +788,7 @@ def frame_loop():
         mode = get_mode()
         if mode != MODE_TRAIN:
             ai_interrupt_event.clear()
-        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and occlusion_ratio < 0.6 and not optimization_running and not recognition_running
+        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and occlusion_ratio <= 0.001 and not optimization_running and not recognition_running
         action_vec = None
         source_flag = 0
         if mode == MODE_TRAIN:
