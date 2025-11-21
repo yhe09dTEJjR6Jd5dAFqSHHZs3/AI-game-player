@@ -114,6 +114,11 @@ recognition_attempted = False
 recognition_progress = 0.0
 recognition_finished_flag = False
 recognition_result_msg = ""
+error_log = deque(maxlen=8)
+latest_error = ""
+visibility_basis = ""
+visibility_confidence = 0.0
+dpi_scale_state = (1.0, 1.0)
 
 seq_len = 4
 text_vocab = "abcdefghijklmnopqrstuvwxyz0123456789:+-_/ .,?" \
@@ -147,6 +152,7 @@ optimization_running = False
 optimization_cancel_requested = False
 optimization_finished_flag = False
 optimization_finished_cancelled = False
+optimization_status_text = ""
 
 frame_history = deque(maxlen=seq_len)
 last_audio_feature = np.zeros(audio_feature_dim, dtype=np.float32)
@@ -201,6 +207,8 @@ gpu_label_var = tk.StringVar()
 vram_label_var = tk.StringVar()
 mode_label_var = tk.StringVar(value="模式: 初始化")
 progress_label_var = tk.StringVar()
+error_label_var = tk.StringVar(value="可能的错误: 正常")
+visibility_detail_var = tk.StringVar(value="可见性依据: 未初始化")
 
 main_frame = ttk.Frame(root, style="App.TFrame")
 main_frame.pack(fill="both", expand=True, padx=14, pady=14)
@@ -239,6 +247,10 @@ gpu_label = ttk.Label(status_right, textvariable=gpu_label_var, style="Metric.TL
 gpu_label.pack(anchor="w")
 vram_label = ttk.Label(status_right, textvariable=vram_label_var, style="Metric.TLabel")
 vram_label.pack(anchor="w")
+error_label = ttk.Label(status_right, textvariable=error_label_var, style="Status.TLabel")
+error_label.pack(anchor="w", pady=(4, 0))
+vis_detail_label = ttk.Label(status_right, textvariable=visibility_detail_var, style="Status.TLabel")
+vis_detail_label.pack(anchor="w")
 
 controls_frame = ttk.LabelFrame(main_frame, text="控制与训练", style="Card.TLabelframe")
 controls_frame.pack(fill="x", pady=(0, 10))
@@ -309,7 +321,8 @@ class PolicyNet(nn.Module):
             nn.Linear(numeric_dim, 160),
             nn.SiLU(),
             nn.Linear(160, 128),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Dropout(0.1)
         )
         self.text_embed = nn.Embedding(text_unk_id + 1, 64, padding_idx=text_pad_id)
         self.text_gru = nn.GRU(64, 128, batch_first=True)
@@ -317,6 +330,8 @@ class PolicyNet(nn.Module):
         self.grid_h = 21
         self.grid_w = 21
         merged = 256 + 128 + 128 + 128
+        self.fusion_norm = nn.LayerNorm(merged)
+        self.fusion_mlp = nn.Sequential(nn.Linear(merged, 512), nn.SiLU(), nn.Dropout(0.1), nn.Linear(512, merged), nn.SiLU())
         self.fusion_gate = nn.Linear(merged, merged)
         self.action_head = nn.Linear(merged, 8)
         self.control_head = nn.Linear(merged, self.grid_h * self.grid_w)
@@ -342,8 +357,10 @@ class PolicyNet(nn.Module):
         text_feat = text_emb[:, -1, :]
         audio_feat = self.audio_proj(audio_feat.float())
         merged = torch.cat([img_feat, num_feat, text_feat, audio_feat], dim=1)
+        merged = self.fusion_norm(merged)
         gate = torch.sigmoid(self.fusion_gate(merged))
         merged = merged * gate
+        merged = merged + self.fusion_mlp(merged)
         action = self.action_head(merged)
         control_logits = self.control_head(merged).view(-1, 1, self.grid_h, self.grid_w)
         rule_logits = self.rule_head(img_feat)
@@ -679,6 +696,26 @@ def hardware_audio_vector():
         feats.append(math.sin(len(feats)) * 0.1)
     return np.array(feats[:audio_feature_dim], dtype=np.float32)
 
+def push_error_message(msg):
+    global latest_error
+    latest_error = msg
+    error_log.append((time.time(), msg))
+    if 'error_label_var' in globals():
+        try:
+            error_label_var.set(f"可能的错误: {msg}")
+        except:
+            pass
+
+def set_visibility_basis(basis, confidence):
+    global visibility_basis, visibility_confidence
+    visibility_basis = basis
+    visibility_confidence = confidence
+    if 'visibility_detail_var' in globals():
+        try:
+            visibility_detail_var.set(f"可见性依据: {basis} | 置信度 {confidence:.2f}")
+        except:
+            pass
+
 def capture_audio_snapshot():
     if sounddevice is not None:
         try:
@@ -745,6 +782,20 @@ def sleep_with_interrupt(duration):
         remaining = end - time.time()
         time.sleep(max(0.0, min(0.02, remaining)))
     return not ai_interrupt_event.is_set()
+
+def split_train_val(dataset, val_fraction=0.15):
+    n = len(dataset)
+    if n <= 1:
+        return dataset, None
+    val_size = max(1, int(n * val_fraction))
+    if val_size >= n:
+        val_size = n - 1
+    train_size = n - val_size
+    if train_size <= 0:
+        return dataset, None
+    gen = torch.Generator().manual_seed(int(time.time()))
+    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size], generator=gen)
+    return train_set, val_set
 
 def move_with_interrupt(x, y, duration):
     if pyautogui is None:
@@ -1148,20 +1199,39 @@ def hardware_monitor_loop():
             pass
 
 def window_visibility_check(hwnd):
-    global window_a_rect
+    global window_a_rect, dpi_scale_state
     if win32gui is None:
-        return False, (0, 0, 0, 0), 1.0
+        return False, (0, 0, 0, 0), 1.0, "win32gui 不可用", 0.0
     try:
         if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
-            return False, (0, 0, 0, 0), 1.0
+            return False, (0, 0, 0, 0), 1.0, "窗口不可见", 0.0
         if win32gui.IsIconic(hwnd):
-            return False, (0, 0, 0, 0), 1.0
+            return False, (0, 0, 0, 0), 1.0, "窗口最小化", 0.0
+        dpi_x = 1.0
+        dpi_y = 1.0
+        try:
+            dpi_val = ctypes.windll.user32.GetDpiForWindow(hwnd)
+            dpi_x = max(0.5, dpi_val / 96.0)
+            dpi_y = dpi_x
+        except:
+            try:
+                hdc = ctypes.windll.user32.GetDC(hwnd)
+                dx = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
+                dy = ctypes.windll.gdi32.GetDeviceCaps(hdc, 90)
+                dpi_x = max(0.5, dx / 96.0)
+                dpi_y = max(0.5, dy / 96.0)
+                ctypes.windll.user32.ReleaseDC(hwnd, hdc)
+            except:
+                dpi_x = dpi_y = 1.0
+        dpi_scale_state = (dpi_x, dpi_y)
         rect = win32gui.GetWindowRect(hwnd)
         screen_rect = get_virtual_screen_rect()
         clipped = rect_intersection(rect, screen_rect)
         if clipped is None or rect_area(clipped) <= 0:
             window_a_rect = rect
-            return False, rect, 1.0
+            set_visibility_basis(f"DPI {dpi_x:.2f}/{dpi_y:.2f} | 离开可视桌面", 0.0)
+            push_error_message("窗口超出桌面，暂停记录")
+            return False, rect, 1.0, "窗口超出桌面", 0.0
         occluders = []
         try:
             hwnd_list = []
@@ -1188,17 +1258,53 @@ def window_visibility_check(hwnd):
                         continue
         except:
             pass
+        fg = False
+        try:
+            fg = win32gui.GetForegroundWindow() == hwnd
+        except:
+            fg = False
+        fullscreen = False
+        monitor_rect = screen_rect
+        if win32api is not None:
+            try:
+                hmon = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+                info = win32api.GetMonitorInfo(hmon)
+                monitor_rect = info.get("Monitor", screen_rect)
+                ar = rect_area(rect_intersection(rect, monitor_rect) or (0, 0, 0, 0))
+                fullscreen = ar >= rect_area(monitor_rect) * 0.98
+            except:
+                monitor_rect = screen_rect
+        cloaked = False
+        try:
+            dwmapi = ctypes.WinDLL("dwmapi")
+            cloaked_val = ctypes.c_int(0)
+            dwmapi.DwmGetWindowAttribute(ctypes.wintypes.HWND(hwnd), 14, ctypes.byref(cloaked_val), ctypes.sizeof(cloaked_val))
+            cloaked = cloaked_val.value != 0
+        except:
+            cloaked = False
         total_area = max(1, rect_area(rect))
         clipped_area = rect_area(clipped)
         missing_area = max(0, total_area - clipped_area)
         occlusion_area = union_area(occluders)
         hidden_area = missing_area + occlusion_area
         occlusion_ratio = min(1.0, hidden_area / total_area)
-        visible_full = clipped_area >= total_area * 0.999 and occlusion_ratio <= 0.001
+        visible_full = clipped_area >= total_area * 0.999 and occlusion_ratio <= 0.001 and not cloaked
+        confidence = max(0.0, min(1.0, 1.0 - occlusion_ratio))
+        if not fg:
+            confidence *= 0.8
+        if cloaked:
+            confidence *= 0.5
+        basis_parts = [f"前台:{'是' if fg else '否'}", f"遮挡:{int(occlusion_ratio * 100)}%", f"DPI:{dpi_x:.2f}/{dpi_y:.2f}", f"全屏:{'是' if fullscreen else '否'}"]
+        set_visibility_basis(" | ".join(basis_parts), confidence)
+        if occlusion_ratio > 0.2 or not fg:
+            push_error_message("窗口可见性下降，已暂停")
+        if cloaked:
+            push_error_message("窗口被系统隐藏或加速，暂停操作")
         window_a_rect = rect
-        return visible_full, rect, occlusion_ratio
+        return visible_full, rect, occlusion_ratio, " | ".join(basis_parts), confidence
     except:
-        return False, (0, 0, 0, 0), 1.0
+        push_error_message("可见性检测异常")
+        return False, (0, 0, 0, 0), 1.0, "检测异常", 0.0
 
 def ai_compute_action(frame_seq, num_vec, text_tokens, audio_vec):
     global policy_model
@@ -1248,7 +1354,7 @@ def frame_loop():
         if hwnd is None:
             window_a_visible = False
             continue
-        vis, rect, occlusion_ratio = window_visibility_check(hwnd)
+        vis, rect, occlusion_ratio, vis_basis, vis_conf = window_visibility_check(hwnd)
         window_a_visible = vis
         window_a_rect = rect
         window_a_occlusion = occlusion_ratio
@@ -1500,11 +1606,12 @@ def global_input_loop():
         time.sleep(0.05)
 
 def optimize_model_thread():
-    global optimization_running, optimization_progress, optimization_cancel_requested, optimization_finished_flag, optimization_finished_cancelled, policy_model
+    global optimization_running, optimization_progress, optimization_cancel_requested, optimization_finished_flag, optimization_finished_cancelled, policy_model, optimization_status_text
     optimization_running = True
     optimization_progress = 0.0
     optimization_finished_flag = False
     optimization_finished_cancelled = False
+    optimization_status_text = ""
     flush_experience_buffer()
     dataset_real = ExperienceDataset(experience_dir)
     real_count = len(dataset_real)
@@ -1518,6 +1625,7 @@ def optimize_model_thread():
         dataset = ConcatDataset([dataset_real, synthetic_dataset])
     else:
         dataset = dataset_real
+    train_set, val_set = split_train_val(dataset)
     device = "cuda" if gpu_available else "cpu"
     model = PolicyNet()
     try:
@@ -1526,7 +1634,7 @@ def optimize_model_thread():
     except:
         pass
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
     bce = nn.BCEWithLogitsLoss()
     mse = nn.MSELoss()
     bce_control = nn.BCEWithLogitsLoss()
@@ -1540,12 +1648,19 @@ def optimize_model_thread():
             scaler = torch.amp.GradScaler("cuda")
         except:
             scaler = None
-    batch_size = min(32, max(1, len(dataset)))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    total_epochs = 4 if synthetic_only else 3
+    batch_size = min(32, max(1, len(train_set)))
+    loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=max(1, min(16, batch_size)), shuffle=False) if val_set is not None else None
+    total_epochs = 6 if synthetic_only else 5
     total_steps = max(1, len(loader) * total_epochs)
     step = 0
+    best_state = None
+    best_metric = float("inf")
+    stale_epochs = 0
+    patience = 2
     for epoch in range(total_epochs):
+        epoch_loss = 0.0
+        batches = 0
         for batch in loader:
             if optimization_cancel_requested:
                 break
@@ -1602,15 +1717,79 @@ def optimize_model_thread():
                     loss = loss + 0.1 * loss_rule
             if scaler is not None:
                 scaler.scale(loss).backward()
+                if device == "cuda":
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-            optimizer.step()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+                optimizer.step()
+            epoch_loss += float(loss.item())
+            batches += 1
             step += 1
             optimization_progress = min(100.0, step / total_steps * 100.0)
         if optimization_cancel_requested:
             break
+        avg_train = epoch_loss / max(1, batches)
+        val_metric = avg_train
+        if val_loader is not None:
+            model.eval()
+            with torch.no_grad():
+                val_loss = 0.0
+                val_batches = 0
+                for batch in val_loader:
+                    obs, act, src, num, text_tokens, audio_feat, utility = batch
+                    obs = obs.to(device)
+                    act = act.to(device)
+                    num = num.to(device)
+                    text_tokens = text_tokens.to(device)
+                    audio_feat = audio_feat.to(device)
+                    utility = utility.to(device)
+                    target_start = act[:, :2]
+                    target_end = act[:, 2:4]
+                    target_mid = act[:, 4:6]
+                    target_press = act[:, 6]
+                    target_hold = act[:, 7]
+                    target_type = act[:, 8].long().clamp(0, 3)
+                    pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, rule_logits_main, type_logits, pref_recon, value_pred = model(obs, num, text_tokens, audio_feat)
+                    loss_start = mse((pos_start + 1.0) / 2.0, target_start)
+                    loss_end = mse((pos_end + 1.0) / 2.0, target_end)
+                    loss_mid = mse((pos_mid + 1.0) / 2.0, target_mid)
+                    loss_press = bce(press_logit, target_press)
+                    loss_hold = bce(hold_logit, target_hold)
+                    gh = model.grid_h
+                    gw = model.grid_w
+                    control_target = torch.zeros((obs.size(0), 1, gh, gw), device=device)
+                    click_mask = target_press >= 0.5
+                    if click_mask.any():
+                        idx = torch.nonzero(click_mask, as_tuple=False).squeeze(1)
+                        cx = (target_start[idx, 0] * (gw - 1)).long().clamp(0, gw - 1)
+                        cy = (target_start[idx, 1] * (gh - 1)).long().clamp(0, gh - 1)
+                        control_target[idx, 0, cy, cx] = 1.0
+                    loss_control = bce_control(control_logits, control_target)
+                    loss_type = ce_type(type_logits, target_type)
+                    loss_pref = mse_pref(pref_recon, num)
+                    loss_value = mse_value(value_pred, utility)
+                    loss = loss_start + loss_end + loss_mid + loss_press + 0.5 * loss_hold + 0.1 * loss_control + 0.25 * loss_type + 0.2 * loss_pref + 0.3 * loss_value
+                    val_loss += float(loss.item())
+                    val_batches += 1
+                val_metric = val_loss / max(1, val_batches)
+            model.train()
+        optimization_status_text = f"Train {avg_train:.4f} | Val {val_metric:.4f}"
+        if val_loader is not None:
+            if val_metric < best_metric:
+                best_metric = val_metric
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+                if stale_epochs > patience:
+                    optimization_cancel_requested = True
+                    break
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=False)
     model_cpu = model.to("cpu")
     try:
         torch.save(model_cpu.state_dict(), model_path)
@@ -1930,7 +2109,7 @@ def update_ui_loop():
             window_label_var.set("窗口 A: " + window_a_title)
         else:
             window_label_var.set("窗口 A: 未选择")
-        visible_label_var.set(f"可见且完整: {'是' if window_a_visible else '否'} (遮挡 {int(window_a_occlusion * 100)}%)")
+        visible_label_var.set(f"可见且完整: {'是' if window_a_visible else '否'} (遮挡 {int(window_a_occlusion * 100)}%) | 置信度 {visibility_confidence:.2f}")
         w = window_a_rect[2] - window_a_rect[0]
         h = window_a_rect[3] - window_a_rect[1]
         size_label_var.set(f"窗口大小: {w} x {h}")
@@ -1953,9 +2132,17 @@ def update_ui_loop():
         mode_map = {MODE_INIT: "初始化", MODE_LEARN: "学习模式", MODE_TRAIN: "训练模式", MODE_OPT: "优化中", MODE_RECOG: "识别中"}
         mode_now = get_mode()
         mode_label_var.set("模式: " + mode_map.get(mode_now, mode_now))
+        if latest_error:
+            error_label_var.set(f"可能的错误: {latest_error}")
+        else:
+            error_label_var.set("可能的错误: 正常")
+        if visibility_basis:
+            visibility_detail_var.set(f"可见性依据: {visibility_basis} | 置信度 {visibility_confidence:.2f}")
         if optimization_running:
             progress_bar["value"] = optimization_progress
-            progress_label_var.set(f"正在优化 AI 模型: {optimization_progress:.1f}%")
+            status_line = optimization_status_text if optimization_status_text else ""
+            suffix = f" | {status_line}" if status_line else ""
+            progress_label_var.set(f"正在优化 AI 模型: {optimization_progress:.1f}%{suffix}")
         elif recognition_running:
             progress_bar["value"] = recognition_progress
             progress_label_var.set(f"正在识别窗口 A 数值: {recognition_progress:.1f}%")
