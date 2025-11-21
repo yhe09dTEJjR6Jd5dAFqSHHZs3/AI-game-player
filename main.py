@@ -785,9 +785,27 @@ def get_virtual_screen_rect():
         top = ctypes.windll.user32.GetSystemMetrics(77)
         width = ctypes.windll.user32.GetSystemMetrics(78)
         height = ctypes.windll.user32.GetSystemMetrics(79)
-        return (left, top, left + width, top + height)
+        if width > 0 and height > 0:
+            return (left, top, left + width, top + height)
     except:
-        return (0, 0, 0, 0)
+        pass
+    if win32api is not None:
+        try:
+            hmon = win32api.MonitorFromPoint((0, 0), win32con.MONITOR_DEFAULTTOPRIMARY)
+            info = win32api.GetMonitorInfo(hmon)
+            l, t, r, b = info.get("Monitor", (0, 0, 0, 0))
+            if r > l and b > t:
+                return (l, t, r, b)
+        except:
+            pass
+    if pyautogui is not None:
+        try:
+            sz = pyautogui.size()
+            if sz.width > 0 and sz.height > 0:
+                return (0, 0, sz.width, sz.height)
+        except:
+            pass
+    return (0, 0, 1920, 1080)
 
 def sleep_with_interrupt(duration):
     end = time.time() + max(0.0, duration)
@@ -1243,10 +1261,13 @@ def window_visibility_check(hwnd):
         screen_rect = get_virtual_screen_rect()
         clipped = rect_intersection(rect, screen_rect)
         if clipped is None or rect_area(clipped) <= 0:
+            fallback_rect = screen_rect if rect_area(screen_rect) > 0 else rect
             window_a_rect = rect
             set_visibility_basis(f"DPI {dpi_x:.2f}/{dpi_y:.2f} | 离开可视桌面", 0.0)
             push_error_message("窗口超出桌面，暂停记录")
-            return False, rect, 1.0, "窗口超出桌面", 0.0
+            clipped = rect_intersection(rect, fallback_rect)
+            if clipped is None or rect_area(clipped) <= 0:
+                return False, rect, 1.0, "窗口超出桌面", 0.0
         occluders = []
         try:
             hwnd_list = []
