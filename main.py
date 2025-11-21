@@ -60,8 +60,8 @@ init_model_path = os.path.join(models_dir, "policy_init.pt")
 experience_buffer = []
 experience_lock = threading.Lock()
 experience_file_index = 0
-last_user_action_vec = np.array([0.5, 0.5, 0.0], dtype=np.float32)
-last_ai_action_vec = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+last_user_action_vec = np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0], dtype=np.float32)
+last_ai_action_vec = np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0], dtype=np.float32)
 
 policy_model = None
 model_lock = threading.Lock()
@@ -233,6 +233,11 @@ numbers_scrollbar.pack(side="right", fill="y")
 numbers_inner.bind("<Configure>", lambda e: numbers_canvas.configure(scrollregion=numbers_canvas.bbox("all")))
 number_row_widgets = []
 
+user_pressing = False
+user_press_start = None
+user_press_path = []
+user_press_time = 0.0
+
 class PolicyNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -250,9 +255,10 @@ class PolicyNet(nn.Module):
         )
         self.grid_h = 21
         self.grid_w = 21
-        self.action_head = nn.Linear(256, 3)
+        self.action_head = nn.Linear(256, 8)
         self.control_head = nn.Linear(256, self.grid_h * self.grid_w)
         self.rule_head = nn.Linear(256, 4)
+        self.action_type_head = nn.Linear(256, 4)
 
     def forward(self, x):
         x = x.float() / 255.0
@@ -262,9 +268,13 @@ class PolicyNet(nn.Module):
         action = self.action_head(x)
         control_logits = self.control_head(x).view(-1, 1, self.grid_h, self.grid_w)
         rule_logits = self.rule_head(x)
-        pos = torch.tanh(action[:, :2])
-        click_logit = action[:, 2]
-        return pos, click_logit, control_logits, rule_logits
+        type_logits = self.action_type_head(x)
+        pos_start = torch.tanh(action[:, :2])
+        pos_end = torch.tanh(action[:, 2:4])
+        pos_mid = torch.tanh(action[:, 4:6])
+        press_logit = action[:, 6]
+        hold_logit = action[:, 7]
+        return pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, rule_logits, type_logits
 
 class ExperienceDataset(Dataset):
     def __init__(self, directory):
@@ -281,7 +291,15 @@ class ExperienceDataset(Dataset):
                         if obs is not None and act is not None:
                             n = obs.shape[0]
                             for i in range(n):
-                                self.samples.append((obs[i], act[i], 0 if src is None else int(src[i])))
+                                a = act[i]
+                                if a.ndim == 0:
+                                    continue
+                                if a.numel() < 9:
+                                    pad = torch.zeros(9 - a.numel())
+                                    a = torch.cat([a.view(-1), pad], dim=0)
+                                elif a.numel() > 9:
+                                    a = a.view(-1)[:9]
+                                self.samples.append((obs[i], a, 0 if src is None else int(src[i])))
                     except:
                         continue
 
@@ -461,6 +479,11 @@ def record_experience(frame_arr, action_vec, source_flag):
     global experience_buffer, experience_file_index
     if frame_arr is None or action_vec is None:
         return
+    if len(action_vec) < 9:
+        pad_len = 9 - len(action_vec)
+        action_vec = np.concatenate([action_vec, np.zeros(pad_len, dtype=np.float32)])
+    elif len(action_vec) > 9:
+        action_vec = action_vec[:9]
     with experience_lock:
         experience_buffer.append((frame_arr, action_vec, source_flag))
         if len(experience_buffer) >= 128:
@@ -584,20 +607,25 @@ def ai_compute_action(frame_arr):
             model.eval()
             x = torch.from_numpy(frame_arr).unsqueeze(0)
             with torch.no_grad():
-                pos, click_logit, control_logits, rule_logits = model(x)
-                pos = pos[0].cpu().numpy()
-                click_prob = torch.sigmoid(click_logit)[0].item()
-                nx = (pos[0] + 1.0) / 2.0
-                ny = (pos[1] + 1.0) / 2.0
-                nx = max(0.0, min(1.0, nx))
-                ny = max(0.0, min(1.0, ny))
-                click_flag = 1.0 if click_prob > 0.5 else 0.0
-                return np.array([nx, ny, click_flag], dtype=np.float32)
+                pos_start, pos_end, pos_mid, press_logit, hold_logit, _, _, type_logits = model(x)
+                pos_start = pos_start[0].cpu().numpy()
+                pos_end = pos_end[0].cpu().numpy()
+                pos_mid = pos_mid[0].cpu().numpy()
+                press_prob = torch.sigmoid(press_logit)[0].item()
+                hold_prob = torch.sigmoid(hold_logit)[0].item()
+                type_idx = int(torch.argmax(type_logits, dim=1)[0].item())
+                nx1 = max(0.0, min(1.0, (pos_start[0] + 1.0) / 2.0))
+                ny1 = max(0.0, min(1.0, (pos_start[1] + 1.0) / 2.0))
+                nx2 = max(0.0, min(1.0, (pos_end[0] + 1.0) / 2.0))
+                ny2 = max(0.0, min(1.0, (pos_end[1] + 1.0) / 2.0))
+                nxm = max(0.0, min(1.0, (pos_mid[0] + 1.0) / 2.0))
+                nym = max(0.0, min(1.0, (pos_mid[1] + 1.0) / 2.0))
+                return np.array([nx1, ny1, nx2, ny2, nxm, nym, press_prob, hold_prob, float(type_idx)], dtype=np.float32)
     except:
         return None
 
 def frame_loop():
-    global window_a_visible, window_a_title, window_a_rect, last_frame_np, program_running, last_user_action_vec, last_ai_action_vec, window_a_occlusion
+    global window_a_visible, window_a_title, window_a_rect, last_frame_np, program_running, last_user_action_vec, last_ai_action_vec, window_a_occlusion, user_pressing, user_press_start, user_press_path, user_press_time
     last_time = time.time()
     while program_running:
         fps = screenshot_fps
@@ -652,12 +680,48 @@ def frame_loop():
                     action_vec = last_ai_action_vec
                     source_flag = 1
             if action_vec is not None and pyautogui is not None:
-                nx, ny, click_flag = float(action_vec[0]), float(action_vec[1]), float(action_vec[2])
-                x, y = denormalize_action_to_mouse(nx, ny, rect)
+                nx1, ny1, nx2, ny2, nxm, nym, press_val, hold_val, t = [float(v) for v in action_vec]
+                sx, sy = denormalize_action_to_mouse(nx1, ny1, rect)
+                ex, ey = denormalize_action_to_mouse(nx2, ny2, rect)
+                mx, my = denormalize_action_to_mouse(nxm, nym, rect)
+                act_type = max(0, min(3, int(round(t))))
+                hold_time = 0.05 + hold_val * 1.5
+                press_delay = 0.02 + press_val * 0.2
                 try:
-                    pyautogui.moveTo(x, y)
-                    if click_flag >= 0.5:
-                        pyautogui.click()
+                    if act_type == 0:
+                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
+                    elif act_type == 1:
+                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
+                        pyautogui.mouseDown()
+                        time.sleep(press_delay)
+                        time.sleep(hold_time * 0.3)
+                        pyautogui.mouseUp()
+                    elif act_type == 2:
+                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
+                        pyautogui.mouseDown()
+                        time.sleep(press_delay + hold_time)
+                        pyautogui.mouseUp()
+                    else:
+                        pyautogui.moveTo(sx, sy, duration=hold_time * 0.2)
+                        pyautogui.mouseDown()
+                        path_pts = [(sx, sy), (mx, my), (ex, ey)]
+                        filtered = []
+                        for p in path_pts:
+                            if not filtered or filtered[-1] != p:
+                                filtered.append(p)
+                        total_steps = max(5, int(8 + press_val * 20))
+                        for i in range(len(filtered) - 1):
+                            p0 = filtered[i]
+                            p1 = filtered[i + 1]
+                            steps = max(2, total_steps // max(1, len(filtered) - 1))
+                            for s in range(1, steps + 1):
+                                ratio = s / steps
+                                curve = 0.5 - 0.5 * np.cos(np.pi * ratio)
+                                px = int(p0[0] + (p1[0] - p0[0]) * curve)
+                                py = int(p0[1] + (p1[1] - p0[1]) * curve)
+                                pyautogui.moveTo(px, py)
+                                time.sleep(max(0.0, hold_time / total_steps))
+                        pyautogui.mouseUp()
                 except:
                     pass
         elif mode == MODE_LEARN:
@@ -668,8 +732,35 @@ def frame_loop():
                     pt = None
                 if pt is not None and rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]:
                     nx, ny = normalize_action_from_mouse(pt[0], pt[1], rect)
-                    click_flag = 1.0 if is_left_button_pressed() else 0.0
-                    action_vec = np.array([nx, ny, click_flag], dtype=np.float32)
+                    pressed = is_left_button_pressed()
+                    if pressed:
+                        if not user_pressing:
+                            user_pressing = True
+                            user_press_start = (nx, ny)
+                            user_press_path = [(nx, ny)]
+                            user_press_time = time.monotonic()
+                        else:
+                            if len(user_press_path) < 12:
+                                user_press_path.append((nx, ny))
+                        action_vec = np.array([nx, ny, nx, ny, nx, ny, 1.0, 0.0, 1.0], dtype=np.float32)
+                    else:
+                        if user_pressing:
+                            duration = time.monotonic() - user_press_time
+                            path = user_press_path if user_press_path else [(nx, ny)]
+                            start_pt = user_press_start if user_press_start else path[0]
+                            end_pt = path[-1]
+                            mid_pt = path[len(path) // 2] if path else start_pt
+                            dist = np.linalg.norm(np.array(start_pt) - np.array(end_pt))
+                            act_type = 1
+                            if dist > 0.05:
+                                act_type = 3
+                            elif duration >= 0.6:
+                                act_type = 2
+                            hold_norm = max(0.0, min(1.0, duration / 2.0))
+                            action_vec = np.array([start_pt[0], start_pt[1], end_pt[0], end_pt[1], mid_pt[0], mid_pt[1], 1.0, hold_norm, float(act_type)], dtype=np.float32)
+                            user_pressing = False
+                        else:
+                            action_vec = np.array([nx, ny, nx, ny, nx, ny, 0.0, 0.0, 0.0], dtype=np.float32)
                     if action_vec is not None:
                         last_user_action_vec = action_vec
                         action_vec = last_user_action_vec
@@ -804,6 +895,7 @@ def optimize_model_thread():
     mse = nn.MSELoss()
     bce_control = nn.BCEWithLogitsLoss()
     ce_rule = nn.CrossEntropyLoss()
+    ce_type = nn.CrossEntropyLoss()
     scaler = None
     if device == "cuda":
         try:
@@ -821,25 +913,33 @@ def optimize_model_thread():
             obs, act, src = batch
             obs = obs.to(device)
             act = act.to(device)
-            target_pos = act[:, :2]
-            target_click = act[:, 2]
+            target_start = act[:, :2]
+            target_end = act[:, 2:4]
+            target_mid = act[:, 4:6]
+            target_press = act[:, 6]
+            target_hold = act[:, 7]
+            target_type = act[:, 8].long().clamp(0, 3)
             optimizer.zero_grad()
             ctx = torch.amp.autocast("cuda") if device == "cuda" and scaler else contextlib.nullcontext()
             with ctx:
-                pos, click_logit, control_logits, _ = model(obs)
-                loss_pos = mse((pos + 1.0) / 2.0, target_pos)
-                loss_click = bce(click_logit, target_click)
+                pos_start, pos_end, pos_mid, press_logit, hold_logit, control_logits, _, type_logits = model(obs)
+                loss_start = mse((pos_start + 1.0) / 2.0, target_start)
+                loss_end = mse((pos_end + 1.0) / 2.0, target_end)
+                loss_mid = mse((pos_mid + 1.0) / 2.0, target_mid)
+                loss_press = bce(press_logit, target_press)
+                loss_hold = bce(hold_logit, target_hold)
                 gh = model.grid_h
                 gw = model.grid_w
                 control_target = torch.zeros((obs.size(0), 1, gh, gw), device=device)
-                click_mask = target_click >= 0.5
+                click_mask = target_press >= 0.5
                 if click_mask.any():
                     idx = torch.nonzero(click_mask, as_tuple=False).squeeze(1)
-                    cx = (target_pos[idx, 0] * (gw - 1)).long().clamp(0, gw - 1)
-                    cy = (target_pos[idx, 1] * (gh - 1)).long().clamp(0, gh - 1)
+                    cx = (target_start[idx, 0] * (gw - 1)).long().clamp(0, gw - 1)
+                    cy = (target_start[idx, 1] * (gh - 1)).long().clamp(0, gh - 1)
                     control_target[idx, 0, cy, cx] = 1.0
                 loss_control = bce_control(control_logits, control_target)
-                loss = loss_pos + loss_click + 0.1 * loss_control
+                loss_type = ce_type(type_logits, target_type)
+                loss = loss_start + loss_end + loss_mid + loss_press + 0.5 * loss_hold + 0.1 * loss_control + 0.25 * loss_type
                 if obs.size(0) > 0:
                     aug_list = []
                     label_list = []
