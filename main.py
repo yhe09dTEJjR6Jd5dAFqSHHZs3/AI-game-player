@@ -25,6 +25,7 @@ ImageEnhance = None
 ImageFilter = None
 ImageDraw = None
 ImageFont = None
+ImageGrab = None
 
 with contextlib.suppress(Exception):
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -48,11 +49,11 @@ def ensure_module(module_name, package_name=None):
     return mod
 
 def ensure_pillow_available():
-    global pil_module, Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageFont
-    pil_targets = ["Image", "ImageTk", "ImageOps", "ImageEnhance", "ImageFilter", "ImageDraw", "ImageFont"]
+    global pil_module, Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageFont, ImageGrab
+    pil_targets = ["Image", "ImageTk", "ImageOps", "ImageEnhance", "ImageFilter", "ImageDraw", "ImageFont", "ImageGrab"]
     pil_module_local = ensure_module("PIL", "Pillow")
     pil_module = pil_module_local
-    Image = ImageTk = ImageOps = ImageEnhance = ImageFilter = ImageDraw = ImageFont = None
+    Image = ImageTk = ImageOps = ImageEnhance = ImageFilter = ImageDraw = ImageFont = ImageGrab = None
     if pil_module_local is not None:
         for name in pil_targets:
             val = getattr(pil_module_local, name, None)
@@ -70,6 +71,8 @@ def ensure_pillow_available():
                 ImageDraw = val
             elif name == "ImageFont":
                 ImageFont = val
+            elif name == "ImageGrab":
+                ImageGrab = val
     return Image is not None
 
 def ensure_dependencies():
@@ -870,6 +873,8 @@ def is_left_button_pressed():
 
 def capture_window_image(hwnd):
     global window_a_rect
+    best_img = None
+    best_stat = -1.0
     image_win32 = None
     captured_with_win32 = False
     win32_stat = 0.0
@@ -896,11 +901,10 @@ def capture_window_image(hwnd):
                 mfcDC.DeleteDC()
                 win32gui.ReleaseDC(hwnd, hwndDC)
                 if image_win32:
-                    win32_stat = np.array(image_win32).std()
-                    if win32_stat > 5.0:
-                        captured_with_win32 = True
-                    else:
-                        image_win32 = None
+                    win32_stat = float(np.array(image_win32).std())
+                    captured_with_win32 = win32_stat > 5.0
+                    best_img = image_win32 if win32_stat > best_stat else best_img
+                    best_stat = max(best_stat, win32_stat)
         except:
             image_win32 = None
     if not captured_with_win32 and pyautogui is not None and window_a_rect is not None:
@@ -916,13 +920,22 @@ def capture_window_image(hwnd):
                 img = pyautogui.screenshot(region=(left, top, w, h))
                 img_rgb = img.convert("RGB")
                 py_stat = float(np.array(img_rgb).std())
-                if image_win32 is None or py_stat > win32_stat + 1.0:
-                    return img_rgb
-                return image_win32
+                if py_stat > best_stat + 1.0:
+                    best_img = img_rgb
+                    best_stat = py_stat
+                if py_stat < 2.0 and ImageGrab is not None:
+                    try:
+                        grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
+                        grab_stat = float(np.array(grab_img).std())
+                        if grab_stat > best_stat + 1.0:
+                            best_img = grab_img
+                            best_stat = grab_stat
+                    except:
+                        pass
+                if best_img is not None:
+                    return best_img
         except:
             pass
-    if image_win32 is not None:
-        return image_win32
     if pyautogui is not None and window_a_rect is not None:
         try:
             if win32gui:
@@ -934,10 +947,40 @@ def capture_window_image(hwnd):
             h = bottom - top
             if w > 0 and h > 0:
                 img = pyautogui.screenshot(region=(left, top, w, h))
-                return img.convert("RGB")
+                img_rgb = img.convert("RGB")
+                py_stat = float(np.array(img_rgb).std())
+                if py_stat > best_stat + 1.0:
+                    best_img = img_rgb
+                    best_stat = py_stat
+                if py_stat < 2.0 and ImageGrab is not None:
+                    try:
+                        grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
+                        grab_stat = float(np.array(grab_img).std())
+                        if grab_stat > best_stat + 1.0:
+                            best_img = grab_img
+                            best_stat = grab_stat
+                    except:
+                        pass
+                if best_img is not None:
+                    return best_img
         except:
             pass
-    return None
+    if ImageGrab is not None and window_a_rect is not None:
+        try:
+            if win32gui:
+                rect = win32gui.GetWindowRect(hwnd)
+            else:
+                rect = window_a_rect
+            left, top, right, bottom = rect
+            if right > left and bottom > top:
+                grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
+                grab_stat = float(np.array(grab_img).std())
+                if grab_stat > best_stat + 1.0:
+                    best_img = grab_img
+                    best_stat = grab_stat
+        except:
+            pass
+    return best_img
 
 def resize_for_model(img):
     if Image is None:
