@@ -936,35 +936,6 @@ def capture_window_image(hwnd):
                     return best_img
         except:
             pass
-    if pyautogui is not None and window_a_rect is not None:
-        try:
-            if win32gui:
-                rect = win32gui.GetWindowRect(hwnd)
-            else:
-                rect = window_a_rect
-            left, top, right, bottom = rect
-            w = right - left
-            h = bottom - top
-            if w > 0 and h > 0:
-                img = pyautogui.screenshot(region=(left, top, w, h))
-                img_rgb = img.convert("RGB")
-                py_stat = float(np.array(img_rgb).std())
-                if py_stat > best_stat + 1.0:
-                    best_img = img_rgb
-                    best_stat = py_stat
-                if py_stat < 2.0 and ImageGrab is not None:
-                    try:
-                        grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
-                        grab_stat = float(np.array(grab_img).std())
-                        if grab_stat > best_stat + 1.0:
-                            best_img = grab_img
-                            best_stat = grab_stat
-                    except:
-                        pass
-                if best_img is not None:
-                    return best_img
-        except:
-            pass
     if ImageGrab is not None and window_a_rect is not None:
         try:
             if win32gui:
@@ -980,11 +951,8 @@ def capture_window_image(hwnd):
                     best_stat = grab_stat
         except:
             pass
-    return best_img
-                if image_win32 is None or grab_stat > win32_stat + 1.0:
-                    return grab_img
-        except:
-            pass
+    if best_img is not None:
+        return best_img
     return image_win32
 
 def resize_for_model(img):
