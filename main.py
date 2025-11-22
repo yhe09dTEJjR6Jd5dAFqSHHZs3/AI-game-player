@@ -25,6 +25,7 @@ ImageEnhance = None
 ImageFilter = None
 ImageDraw = None
 ImageFont = None
+ImageGrab = None
 
 with contextlib.suppress(Exception):
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -48,11 +49,11 @@ def ensure_module(module_name, package_name=None):
     return mod
 
 def ensure_pillow_available():
-    global pil_module, Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageFont
-    pil_targets = ["Image", "ImageTk", "ImageOps", "ImageEnhance", "ImageFilter", "ImageDraw", "ImageFont"]
+    global pil_module, Image, ImageTk, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageFont, ImageGrab
+    pil_targets = ["Image", "ImageTk", "ImageOps", "ImageEnhance", "ImageFilter", "ImageDraw", "ImageFont", "ImageGrab"]
     pil_module_local = ensure_module("PIL", "Pillow")
     pil_module = pil_module_local
-    Image = ImageTk = ImageOps = ImageEnhance = ImageFilter = ImageDraw = ImageFont = None
+    Image = ImageTk = ImageOps = ImageEnhance = ImageFilter = ImageDraw = ImageFont = ImageGrab = None
     if pil_module_local is not None:
         for name in pil_targets:
             val = getattr(pil_module_local, name, None)
@@ -70,6 +71,8 @@ def ensure_pillow_available():
                 ImageDraw = val
             elif name == "ImageFont":
                 ImageFont = val
+            elif name == "ImageGrab":
+                ImageGrab = val
     return Image is not None
 
 def ensure_dependencies():
@@ -937,7 +940,21 @@ def capture_window_image(hwnd):
                 return img.convert("RGB")
         except:
             pass
-    return None
+    if ImageGrab is not None and window_a_rect is not None:
+        try:
+            if win32gui:
+                rect = win32gui.GetWindowRect(hwnd)
+            else:
+                rect = window_a_rect
+            left, top, right, bottom = rect
+            if right > left and bottom > top:
+                grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
+                grab_stat = float(np.array(grab_img).std())
+                if image_win32 is None or grab_stat > win32_stat + 1.0:
+                    return grab_img
+        except:
+            pass
+    return image_win32
 
 def resize_for_model(img):
     if Image is None:
