@@ -873,6 +873,8 @@ def is_left_button_pressed():
 
 def capture_window_image(hwnd):
     global window_a_rect
+    best_img = None
+    best_stat = -1.0
     image_win32 = None
     captured_with_win32 = False
     win32_stat = 0.0
@@ -899,11 +901,10 @@ def capture_window_image(hwnd):
                 mfcDC.DeleteDC()
                 win32gui.ReleaseDC(hwnd, hwndDC)
                 if image_win32:
-                    win32_stat = np.array(image_win32).std()
-                    if win32_stat > 5.0:
-                        captured_with_win32 = True
-                    else:
-                        image_win32 = None
+                    win32_stat = float(np.array(image_win32).std())
+                    captured_with_win32 = win32_stat > 5.0
+                    best_img = image_win32 if win32_stat > best_stat else best_img
+                    best_stat = max(best_stat, win32_stat)
         except:
             image_win32 = None
     if not captured_with_win32 and pyautogui is not None and window_a_rect is not None:
@@ -919,13 +920,22 @@ def capture_window_image(hwnd):
                 img = pyautogui.screenshot(region=(left, top, w, h))
                 img_rgb = img.convert("RGB")
                 py_stat = float(np.array(img_rgb).std())
-                if image_win32 is None or py_stat > win32_stat + 1.0:
-                    return img_rgb
-                return image_win32
+                if py_stat > best_stat + 1.0:
+                    best_img = img_rgb
+                    best_stat = py_stat
+                if py_stat < 2.0 and ImageGrab is not None:
+                    try:
+                        grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
+                        grab_stat = float(np.array(grab_img).std())
+                        if grab_stat > best_stat + 1.0:
+                            best_img = grab_img
+                            best_stat = grab_stat
+                    except:
+                        pass
+                if best_img is not None:
+                    return best_img
         except:
             pass
-    if image_win32 is not None:
-        return image_win32
     if pyautogui is not None and window_a_rect is not None:
         try:
             if win32gui:
@@ -937,7 +947,22 @@ def capture_window_image(hwnd):
             h = bottom - top
             if w > 0 and h > 0:
                 img = pyautogui.screenshot(region=(left, top, w, h))
-                return img.convert("RGB")
+                img_rgb = img.convert("RGB")
+                py_stat = float(np.array(img_rgb).std())
+                if py_stat > best_stat + 1.0:
+                    best_img = img_rgb
+                    best_stat = py_stat
+                if py_stat < 2.0 and ImageGrab is not None:
+                    try:
+                        grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
+                        grab_stat = float(np.array(grab_img).std())
+                        if grab_stat > best_stat + 1.0:
+                            best_img = grab_img
+                            best_stat = grab_stat
+                    except:
+                        pass
+                if best_img is not None:
+                    return best_img
         except:
             pass
     if ImageGrab is not None and window_a_rect is not None:
@@ -950,6 +975,12 @@ def capture_window_image(hwnd):
             if right > left and bottom > top:
                 grab_img = ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
                 grab_stat = float(np.array(grab_img).std())
+                if grab_stat > best_stat + 1.0:
+                    best_img = grab_img
+                    best_stat = grab_stat
+        except:
+            pass
+    return best_img
                 if image_win32 is None or grab_stat > win32_stat + 1.0:
                     return grab_img
         except:
