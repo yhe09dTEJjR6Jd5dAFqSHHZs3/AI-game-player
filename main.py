@@ -135,8 +135,7 @@ visibility_confidence = 0.0
 dpi_scale_state = (1.0, 1.0)
 
 seq_len = 4
-text_vocab = "abcdefghijklmnopqrstuvwxyz0123456789:+-_/ .,?" \
-    "!@#$%^&*()[]{}<>""\"""'"
+text_vocab = "abcdefghijklmnopqrstuvwxyz0123456789:+-_/ .,?!@#$%^&*()[]{}<>\"'"
 text_token_map = {c: i + 1 for i, c in enumerate(text_vocab)}
 text_max_len = 96
 text_pad_id = 0
@@ -568,8 +567,8 @@ def set_mode(new_mode):
     global current_mode, last_user_input_time
     with mode_lock:
         current_mode = new_mode
-        if new_mode == MODE_LEARN:
-            last_user_input_time = time.monotonic()
+    if new_mode == MODE_LEARN:
+        last_user_input_time = time.monotonic()
 
 def get_mode():
     with mode_lock:
@@ -706,7 +705,8 @@ def hardware_audio_vector():
     feats = [hardware_stats.get("cpu", 0.0) / 100.0, hardware_stats.get("mem", 0.0) / 100.0, hardware_stats.get("gpu", 0.0) / 100.0, hardware_stats.get("vram", 0.0) / 100.0]
     feats.append(1.0 if hardware_stats.get("gpu_known", False) else 0.0)
     feats.append(1.0 if hardware_stats.get("vram_known", False) else 0.0)
-    feats.append(len(recognized_values) / float(max_numbers))
+    with recognized_lock:
+        feats.append(len(recognized_values) / float(max_numbers))
     while len(feats) < audio_feature_dim:
         feats.append(math.sin(len(feats)) * 0.1)
     return np.array(feats[:audio_feature_dim], dtype=np.float32)
@@ -870,11 +870,9 @@ def is_left_button_pressed():
 
 def capture_window_image(hwnd):
     global window_a_rect
-
     image_win32 = None
     captured_with_win32 = False
     win32_stat = 0.0
-
     if win32gui is not None and win32ui is not None and Image is not None:
         try:
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
@@ -887,36 +885,26 @@ def capture_window_image(hwnd):
                 saveBitMap = win32ui.CreateBitmap()
                 saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
                 saveDC.SelectObject(saveBitMap)
-
-
                 result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
                 if result != 1:
-
                     saveDC.BitBlt((0, 0), (w, h), mfcDC, (0, 0), win32con.SRCCOPY)
-
                 bmpinfo = saveBitMap.GetInfo()
                 bmpstr = saveBitMap.GetBitmapBits(True)
                 image_win32 = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]), bmpstr, "raw", "BGRX", 0, 1)
-
                 win32gui.DeleteObject(saveBitMap.GetHandle())
                 saveDC.DeleteDC()
                 mfcDC.DeleteDC()
                 win32gui.ReleaseDC(hwnd, hwndDC)
-
-
                 if image_win32:
-                    win32_stat =  np.array(image_win32).std()
+                    win32_stat = np.array(image_win32).std()
                     if win32_stat > 5.0:
                         captured_with_win32 = True
                     else:
                         image_win32 = None
         except:
             image_win32 = None
-
-
     if not captured_with_win32 and pyautogui is not None and window_a_rect is not None:
         try:
-
             if win32gui:
                 rect = win32gui.GetWindowRect(hwnd)
             else:
@@ -925,7 +913,6 @@ def capture_window_image(hwnd):
             w = right - left
             h = bottom - top
             if w > 0 and h > 0:
-
                 img = pyautogui.screenshot(region=(left, top, w, h))
                 img_rgb = img.convert("RGB")
                 py_stat = float(np.array(img_rgb).std())
@@ -934,7 +921,6 @@ def capture_window_image(hwnd):
                 return image_win32
         except:
             pass
-
     if image_win32 is not None:
         return image_win32
     if pyautogui is not None and window_a_rect is not None:
@@ -1143,8 +1129,8 @@ def gather_dxdiag_metrics():
                             used = float(parts[0]) * 1024 * 1024
             if used is not None and total not in (None, 0):
                 metrics.append({"util": None, "used": used, "total": total})
-        with contextlib.suppress(Exception):
-            os.remove(tmp_path)
+            with contextlib.suppress(Exception):
+                os.remove(tmp_path)
     except:
         return []
     return metrics
@@ -1315,11 +1301,6 @@ def window_visibility_check(hwnd):
                         continue
         except:
             pass
-        fg = False
-        try:
-            fg = win32gui.GetForegroundWindow() == hwnd
-        except:
-            fg = False
         fullscreen = False
         monitor_rect = screen_rect
         if win32api is not None:
@@ -1346,12 +1327,10 @@ def window_visibility_check(hwnd):
         hidden_area = missing_area + occlusion_area
         occlusion_ratio = min(1.0, hidden_area / total_area)
         confidence = max(0.0, min(1.0, 1.0 - occlusion_ratio))
-        if not fg:
-            confidence *= 0.8
         if cloaked:
             confidence *= 0.5
         visible_full = clipped_area >= total_area * 0.9 and occlusion_ratio <= 0.15 and confidence >= 0.5 and not cloaked
-        basis_parts = [f"前台:{'是' if fg else '否'}", f"遮挡:{int(occlusion_ratio * 100)}%", f"DPI:{dpi_x:.2f}/{dpi_y:.2f}", f"全屏:{'是' if fullscreen else '否'}"]
+        basis_parts = [f"遮挡:{int(occlusion_ratio * 100)}%", f"DPI:{dpi_x:.2f}/{dpi_y:.2f}", f"全屏:{'是' if fullscreen else '否'}"]
         set_visibility_basis(" | ".join(basis_parts), confidence)
         if cloaked:
             push_error_message("窗口被系统隐藏或加速，暂停操作")
@@ -1369,25 +1348,25 @@ def ai_compute_action(frame_seq, num_vec, text_tokens, audio_vec):
         with model_lock:
             model = policy_model
             model.eval()
-            x = torch.from_numpy(frame_seq).unsqueeze(0)
-            n = torch.from_numpy(num_vec).unsqueeze(0)
-            t = torch.from_numpy(text_tokens).unsqueeze(0)
-            a = torch.from_numpy(audio_vec).unsqueeze(0)
-            with torch.no_grad():
-                pos_start, pos_end, pos_mid, press_logit, hold_logit, _, _, type_logits, _, _ = model(x, n, t, a)
-                pos_start = pos_start[0].cpu().numpy()
-                pos_end = pos_end[0].cpu().numpy()
-                pos_mid = pos_mid[0].cpu().numpy()
-                press_prob = torch.sigmoid(press_logit)[0].item()
-                hold_prob = torch.sigmoid(hold_logit)[0].item()
-                type_idx = int(torch.argmax(type_logits, dim=1)[0].item())
-                nx1 = max(0.0, min(1.0, (pos_start[0] + 1.0) / 2.0))
-                ny1 = max(0.0, min(1.0, (pos_start[1] + 1.0) / 2.0))
-                nx2 = max(0.0, min(1.0, (pos_end[0] + 1.0) / 2.0))
-                ny2 = max(0.0, min(1.0, (pos_end[1] + 1.0) / 2.0))
-                nxm = max(0.0, min(1.0, (pos_mid[0] + 1.0) / 2.0))
-                nym = max(0.0, min(1.0, (pos_mid[1] + 1.0) / 2.0))
-                return np.array([nx1, ny1, nx2, ny2, nxm, nym, press_prob, hold_prob, float(type_idx)], dtype=np.float32)
+        x = torch.from_numpy(frame_seq).unsqueeze(0)
+        n = torch.from_numpy(num_vec).unsqueeze(0)
+        t = torch.from_numpy(text_tokens).unsqueeze(0)
+        a = torch.from_numpy(audio_vec).unsqueeze(0)
+        with torch.no_grad():
+            pos_start, pos_end, pos_mid, press_logit, hold_logit, _, _, type_logits, _, _ = model(x, n, t, a)
+        pos_start = pos_start[0].cpu().numpy()
+        pos_end = pos_end[0].cpu().numpy()
+        pos_mid = pos_mid[0].cpu().numpy()
+        press_prob = torch.sigmoid(press_logit)[0].item()
+        hold_prob = torch.sigmoid(hold_logit)[0].item()
+        type_idx = int(torch.argmax(type_logits, dim=1)[0].item())
+        nx1 = max(0.0, min(1.0, (pos_start[0] + 1.0) / 2.0))
+        ny1 = max(0.0, min(1.0, (pos_start[1] + 1.0) / 2.0))
+        nx2 = max(0.0, min(1.0, (pos_end[0] + 1.0) / 2.0))
+        ny2 = max(0.0, min(1.0, (pos_end[1] + 1.0) / 2.0))
+        nxm = max(0.0, min(1.0, (pos_mid[0] + 1.0) / 2.0))
+        nym = max(0.0, min(1.0, (pos_mid[1] + 1.0) / 2.0))
+        return np.array([nx1, ny1, nx2, ny2, nxm, nym, press_prob, hold_prob, float(type_idx)], dtype=np.float32)
     except:
         return None
 
@@ -1421,11 +1400,14 @@ def frame_loop():
         else:
             window_a_title_local = ""
         window_a_title = window_a_title_local
-        if get_mode() == MODE_RECOG:
+        mode = get_mode()
+        if mode == MODE_RECOG:
             time.sleep(0.1)
             continue
-
         img = capture_window_image(hwnd)
+        if img is not None:
+            with last_frame_lock:
+                last_frame_np = np.array(img)
         if img is None:
             continue
         frame_arr_model = resize_for_model(img)
@@ -1434,9 +1416,6 @@ def frame_loop():
         text_tokens = build_live_text_tokens(num_vec)
         audio_vec = capture_audio_snapshot()
         last_audio_feature = audio_vec
-        with last_frame_lock:
-            last_frame_np = np.array(img)
-        mode = get_mode()
         if mode != MODE_TRAIN:
             ai_interrupt_event.clear()
         recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and occlusion_ratio <= 0.15 and not optimization_running and not recognition_running
@@ -1563,7 +1542,7 @@ def frame_loop():
             record_experience(frame_seq_model, action_vec, source_flag, num_vec, text_tokens, audio_vec)
 
 class LASTINPUTINFO(ctypes.Structure):
-    fields = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
 def get_system_idle_seconds():
     try:
@@ -1826,7 +1805,7 @@ def optimize_model_thread():
                     loss = loss_start + loss_end + loss_mid + loss_press + 0.5 * loss_hold + 0.1 * loss_control + 0.25 * loss_type + 0.2 * loss_pref + 0.3 * loss_value
                     val_loss += float(loss.item())
                     val_batches += 1
-                val_metric = val_loss / max(1, val_batches)
+            val_metric = val_loss / max(1, val_batches)
             model.train()
         optimization_status_text = f"Train {avg_train:.4f} | Val {val_metric:.4f}"
         if val_loader is not None:
@@ -1836,9 +1815,9 @@ def optimize_model_thread():
                 stale_epochs = 0
             else:
                 stale_epochs += 1
-                if stale_epochs > patience:
-                    optimization_cancel_requested = True
-                    break
+            if stale_epochs > patience:
+                optimization_cancel_requested = True
+                break
     if best_state is not None:
         model.load_state_dict(best_state, strict=False)
     model_cpu = model.to("cpu")
@@ -2029,18 +2008,16 @@ def update_number_list_ui():
     number_row_widgets = []
     with recognized_lock:
         data = list(recognized_values)
-        attempted = recognition_attempted
-        msg = recognition_result_msg
-    
+    attempted = recognition_attempted
+    msg = recognition_result_msg
     if not data:
-        text = "尚未识别到数值，请在学习模式下点击“识别”按钮。"
+        text = "尚未识别到数值，请在学习模式下点击识别按钮。"
         if attempted:
             text = "识别完成，但未检测到非负整数。\n\n" + msg
         label = ttk.Label(numbers_inner, text=text, style="Status.TLabel", wraplength=800)
         label.grid(row=0, column=0, sticky="w", padx=4, pady=2)
         number_row_widgets.append(label)
         return
-    
     for idx, item in enumerate(data):
         row = ttk.Frame(numbers_inner, style="App.TFrame")
         row.grid(row=idx, column=0, sticky="we", padx=4, pady=2)
@@ -2087,9 +2064,7 @@ def on_recognize_clicked():
     if not ensure_pillow_available():
         messagebox.showerror("错误", "需要安装 Pillow 才能识别数值。")
         return
-    
     set_mode(MODE_RECOG)
-    
     def worker():
         global recognition_running, recognition_attempted, recognition_progress, recognition_finished_flag, recognition_result_msg
         recognition_running = True
@@ -2100,17 +2075,10 @@ def on_recognize_clicked():
             img = None
             if hwnd is not None:
                 recognition_progress = 5.0
-                           
                 time.sleep(0.5)
-                           
                 img = capture_window_image(hwnd)
-                
-                                                
-                                                     
-            
             values = []
             if img is not None:
-
                 stat = np.array(img).std()
                 if stat < 5.0:
                     recognition_result_msg = "警告：截取到的画面几乎为纯色（黑/白）。\n可能是硬件加速导致，请尝试将窗口移至屏幕中央并保持前台可见。"
@@ -2122,7 +2090,6 @@ def on_recognize_clicked():
                         recognition_result_msg = "已使用内置数字识别引擎完成处理。"
             else:
                 recognition_result_msg = "无法获取窗口图像，请确保窗口未最小化。"
-
             recognition_progress = 95.0
             new_list = []
             for item in values:
@@ -2210,37 +2177,40 @@ def update_ui_loop():
         with last_frame_lock:
             frame = last_frame_np
         if frame is not None and ImageTk is not None and Image is not None:
-            img = Image.fromarray(frame)
-            overlays = []
-            with recognized_lock:
-                for item in recognized_values:
-                    bbox = item.get("bbox")
-                    val = item.get("value")
-                    color = item.get("color", get_value_color(val))
-                    if bbox:
-                        overlays.append((bbox, color))
-            if overlays and ImageDraw is not None:
-                img = img.convert("RGBA")
-                dr = ImageDraw.Draw(img, "RGBA")
-                for bbox, color in overlays:
-                    x1, y1, x2, y2 = bbox
-                    fill = (color[0], color[1], color[2], 80)
-                    outline = (color[0], color[1], color[2], 200)
-                    dr.rectangle([x1, y1, x2, y2], outline=outline, width=2)
-                    dr.rectangle([x1, y1, x2, y2], fill=fill)
-                img = img.convert("RGB")
-            cw = canvas.winfo_width()
-            ch = canvas.winfo_height()
-            if cw > 10 and ch > 10:
-                fw, fh = img.size
-                if fw > 0 and fh > 0:
-                    scale = min(cw / fw, ch / fh)
-                    nw = max(1, int(fw * scale))
-                    nh = max(1, int(fh * scale))
-                    img = img.resize((nw, nh), Image.Resampling.BILINEAR)
-                    img_tk = ImageTk.PhotoImage(img)
-                    canvas.configure(image=img_tk)
-                    canvas_image_ref = img_tk
+            try:
+                img = Image.fromarray(frame)
+                overlays = []
+                with recognized_lock:
+                    for item in recognized_values:
+                        bbox = item.get("bbox")
+                        val = item.get("value")
+                        color = item.get("color", get_value_color(val))
+                        if bbox:
+                            overlays.append((bbox, color))
+                if overlays and ImageDraw is not None:
+                    img = img.convert("RGBA")
+                    dr = ImageDraw.Draw(img, "RGBA")
+                    for bbox, color in overlays:
+                        x1, y1, x2, y2 = bbox
+                        fill = (color[0], color[1], color[2], 80)
+                        outline = (color[0], color[1], color[2], 200)
+                        dr.rectangle([x1, y1, x2, y2], outline=outline, width=2)
+                        dr.rectangle([x1, y1, x2, y2], fill=fill)
+                    img = img.convert("RGB")
+                cw = canvas.winfo_width()
+                ch = canvas.winfo_height()
+                if cw > 10 and ch > 10:
+                    fw, fh = img.size
+                    if fw > 0 and fh > 0:
+                        scale = min(cw / fw, ch / fh)
+                        nw = max(1, int(fw * scale))
+                        nh = max(1, int(fh * scale))
+                        img = img.resize((nw, nh), Image.Resampling.BILINEAR)
+                img_tk = ImageTk.PhotoImage(img)
+                canvas.configure(image=img_tk)
+                canvas_image_ref = img_tk
+            except Exception as e:
+                print(f"Preview update error: {e}")
         if mode_now == MODE_LEARN and window_a_handle is not None and not optimization_running and not recognition_running:
             sleep_btn.state(["!disabled"])
         else:
@@ -2277,7 +2247,8 @@ def update_ui_loop():
                 progress_label_var.set("")
                 set_mode(MODE_LEARN)
         root.after(100, update_ui_loop)
-    except:
+    except Exception as e:
+        print(f"UI update error: {e}")
         try:
             root.after(200, update_ui_loop)
         except:
