@@ -1324,7 +1324,7 @@ def window_visibility_check(hwnd):
         occlusion_area = union_area(occluders)
         hidden_area = missing_area + occlusion_area
         occlusion_ratio = min(1.0, hidden_area / total_area)
-        visible_full = clipped_area >= total_area * 0.999 and occlusion_ratio <= 0.001 and not cloaked
+        visible_full = clipped_area >= total_area * 0.98 and occlusion_ratio <= 0.02 and not cloaked
         confidence = max(0.0, min(1.0, 1.0 - occlusion_ratio))
         if not fg:
             confidence *= 0.8
@@ -1332,7 +1332,7 @@ def window_visibility_check(hwnd):
             confidence *= 0.5
         basis_parts = [f"前台:{'是' if fg else '否'}", f"遮挡:{int(occlusion_ratio * 100)}%", f"DPI:{dpi_x:.2f}/{dpi_y:.2f}", f"全屏:{'是' if fullscreen else '否'}"]
         set_visibility_basis(" | ".join(basis_parts), confidence)
-        if occlusion_ratio > 0.2 or not fg:
+        if occlusion_ratio > 0.2:
             push_error_message("窗口可见性下降，已暂停")
         if cloaked:
             push_error_message("窗口被系统隐藏或加速，暂停操作")
