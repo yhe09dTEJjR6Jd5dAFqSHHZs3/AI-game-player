@@ -1332,8 +1332,6 @@ def window_visibility_check(hwnd):
         visible_full = clipped_area >= total_area * 0.9 and occlusion_ratio <= 0.15 and confidence >= 0.5 and not cloaked
         basis_parts = [f"前台:{'是' if fg else '否'}", f"遮挡:{int(occlusion_ratio * 100)}%", f"DPI:{dpi_x:.2f}/{dpi_y:.2f}", f"全屏:{'是' if fullscreen else '否'}"]
         set_visibility_basis(" | ".join(basis_parts), confidence)
-        if occlusion_ratio > 0.35 or confidence < 0.4:
-            push_error_message("窗口可见性下降，已暂停")
         if cloaked:
             push_error_message("窗口被系统隐藏或加速，暂停操作")
         window_a_rect = rect
@@ -1402,10 +1400,6 @@ def frame_loop():
         else:
             window_a_title_local = ""
         window_a_title = window_a_title_local
-        if not vis:
-            continue
-        
-                                                 
         if get_mode() == MODE_RECOG:
             time.sleep(0.1)
             continue
