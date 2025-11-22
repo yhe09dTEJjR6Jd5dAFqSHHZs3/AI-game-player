@@ -870,10 +870,11 @@ def is_left_button_pressed():
 
 def capture_window_image(hwnd):
     global window_a_rect
-                      
+
     image_win32 = None
     captured_with_win32 = False
-    
+    win32_stat = 0.0
+
     if win32gui is not None and win32ui is not None and Image is not None:
         try:
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
@@ -886,36 +887,36 @@ def capture_window_image(hwnd):
                 saveBitMap = win32ui.CreateBitmap()
                 saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
                 saveDC.SelectObject(saveBitMap)
-                
-                                                     
+
+
                 result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
                 if result != 1:
-                                    
+
                     saveDC.BitBlt((0, 0), (w, h), mfcDC, (0, 0), win32con.SRCCOPY)
-                
+
                 bmpinfo = saveBitMap.GetInfo()
                 bmpstr = saveBitMap.GetBitmapBits(True)
                 image_win32 = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]), bmpstr, "raw", "BGRX", 0, 1)
-                
+
                 win32gui.DeleteObject(saveBitMap.GetHandle())
                 saveDC.DeleteDC()
                 mfcDC.DeleteDC()
                 win32gui.ReleaseDC(hwnd, hwndDC)
-                
-                                              
+
+
                 if image_win32:
-                    stat =  np.array(image_win32).std()
-                    if stat > 5.0:                      
+                    win32_stat =  np.array(image_win32).std()
+                    if win32_stat > 5.0:
                         captured_with_win32 = True
                     else:
-                        image_win32 = None                        
+                        image_win32 = None
         except:
             image_win32 = None
 
-                                      
+
     if not captured_with_win32 and pyautogui is not None and window_a_rect is not None:
         try:
-                              
+
             if win32gui:
                 rect = win32gui.GetWindowRect(hwnd)
             else:
@@ -924,13 +925,33 @@ def capture_window_image(hwnd):
             w = right - left
             h = bottom - top
             if w > 0 and h > 0:
-                                                  
+
+                img = pyautogui.screenshot(region=(left, top, w, h))
+                img_rgb = img.convert("RGB")
+                py_stat = float(np.array(img_rgb).std())
+                if image_win32 is None or py_stat > win32_stat + 1.0:
+                    return img_rgb
+                return image_win32
+        except:
+            pass
+
+    if image_win32 is not None:
+        return image_win32
+    if pyautogui is not None and window_a_rect is not None:
+        try:
+            if win32gui:
+                rect = win32gui.GetWindowRect(hwnd)
+            else:
+                rect = window_a_rect
+            left, top, right, bottom = rect
+            w = right - left
+            h = bottom - top
+            if w > 0 and h > 0:
                 img = pyautogui.screenshot(region=(left, top, w, h))
                 return img.convert("RGB")
         except:
             pass
-    
-    return image_win32
+    return None
 
 def resize_for_model(img):
     if Image is None:
