@@ -1324,15 +1324,15 @@ def window_visibility_check(hwnd):
         occlusion_area = union_area(occluders)
         hidden_area = missing_area + occlusion_area
         occlusion_ratio = min(1.0, hidden_area / total_area)
-        visible_full = clipped_area >= total_area * 0.98 and occlusion_ratio <= 0.02 and not cloaked
         confidence = max(0.0, min(1.0, 1.0 - occlusion_ratio))
         if not fg:
             confidence *= 0.8
         if cloaked:
             confidence *= 0.5
+        visible_full = clipped_area >= total_area * 0.9 and occlusion_ratio <= 0.15 and confidence >= 0.5 and not cloaked
         basis_parts = [f"前台:{'是' if fg else '否'}", f"遮挡:{int(occlusion_ratio * 100)}%", f"DPI:{dpi_x:.2f}/{dpi_y:.2f}", f"全屏:{'是' if fullscreen else '否'}"]
         set_visibility_basis(" | ".join(basis_parts), confidence)
-        if occlusion_ratio > 0.2:
+        if occlusion_ratio > 0.35 or confidence < 0.4:
             push_error_message("窗口可见性下降，已暂停")
         if cloaked:
             push_error_message("窗口被系统隐藏或加速，暂停操作")
@@ -1424,7 +1424,7 @@ def frame_loop():
         mode = get_mode()
         if mode != MODE_TRAIN:
             ai_interrupt_event.clear()
-        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and occlusion_ratio <= 0.001 and not optimization_running and not recognition_running
+        recording = mode in (MODE_LEARN, MODE_TRAIN) and vis and occlusion_ratio <= 0.15 and not optimization_running and not recognition_running
         action_vec = None
         source_flag = 0
         if mode == MODE_TRAIN:
