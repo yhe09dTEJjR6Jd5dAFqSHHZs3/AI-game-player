@@ -981,6 +981,11 @@ def capture_window_image(hwnd):
         except:
             pass
     return best_img
+                if image_win32 is None or grab_stat > win32_stat + 1.0:
+                    return grab_img
+        except:
+            pass
+    return image_win32
 
 def resize_for_model(img):
     if Image is None:
