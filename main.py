@@ -1162,7 +1162,9 @@ body {
   background: radial-gradient(circle at 12% 10%, rgba(56,189,248,0.12), transparent 26%), radial-gradient(circle at 88% 8%, rgba(168,85,247,0.12), transparent 24%), radial-gradient(circle at 40% 60%, rgba(34,197,94,0.12), transparent 30%), #020617;
   font-family: Consolas, "JetBrains Mono", monospace;
   color: #e5e5e5;
-  overflow: hidden;
+  min-height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 #grid {
   position: fixed;
@@ -1218,10 +1220,13 @@ body {
   position: relative;
   z-index: 2;
   padding: 18px 22px;
+  max-width: 1280px;
+  margin: 0 auto;
 }
 .row {
   display: flex;
   gap: 18px;
+  flex-wrap: wrap;
 }
 .col {
   background: rgba(8,15,30,0.92);
@@ -1484,6 +1489,19 @@ select:focus {
   background: radial-gradient(circle at 20% 30%, rgba(56,189,248,0.12), transparent 40%), rgba(2,6,23,0.85);
   box-shadow: inset 0 0 0 1px rgba(148,163,184,0.12), inset 0 0 12px rgba(34,211,238,0.18);
 }
+@media (max-width: 1180px) {
+  .row {
+    flex-direction: column;
+  }
+  .col-left,
+  .col-right {
+    width: 100%;
+    flex: 1 1 auto;
+  }
+  .chip-row {
+    flex-wrap: wrap;
+  }
+}
 .footer {
   margin-top: 6px;
   font-size: 11px;
@@ -1496,26 +1514,6 @@ select:focus {
   font-size: 11px;
   color: #94a3b8;
   line-height: 1.8;
-}
-.mode-line {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 6px 0;
-  border-bottom: 1px solid rgba(148,163,184,0.16);
-  color: #e2e8f0;
-  font-size: 12px;
-}
-.mode-line:last-child {
-  border-bottom: none;
-}
-.mode-label {
-  color: #94a3b8;
-  letter-spacing: 0.5px;
-}
-.mode-desc {
-  color: #38fbd4;
-  font-weight: 700;
 }
 .badge.neon {
   background: linear-gradient(90deg, rgba(56,189,248,0.3), rgba(94,234,212,0.35));
@@ -1577,7 +1575,6 @@ select:focus {
   <div class="header">
     <div>
       <div class="title">NEURO DESKTOP · SYNAPTIC WINDOW AI</div>
-      <div class="badge neon">量子窗格控制塔 · 霓虹脉冲态</div>
     </div>
     <div class="chip-row">
       <div class="chip" id="captureTag">捕获诊断 · 未绑定</div>
@@ -1699,12 +1696,6 @@ select:focus {
             <canvas class="wave-canvas" id="vramWave" width="320" height="70"></canvas>
           </div>
         </div>
-      </div>
-      <div class="section-title">模式说明</div>
-      <div class="card holo">
-        <div class="mode-line"><span class="mode-label">学习模式</span><span class="mode-desc">记录窗口A画面 + 人类鼠标轨迹（人类经验）</span></div>
-        <div class="mode-line"><span class="mode-label">训练模式</span><span class="mode-desc">模型观察窗口A画面并自行驱动鼠标（AI经验）</span></div>
-        <div class="mode-line"><span class="mode-label">离线优化</span><span class="mode-desc">融合人类/AI经验 · 自适应 Epoch · VRAM 自愈</span></div>
       </div>
     </div>
   </div>
