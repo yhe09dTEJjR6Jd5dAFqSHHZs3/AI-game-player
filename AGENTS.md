@@ -26,9 +26,9 @@ NVIDIA GeForce RTX 3050 Ti Laptop GPU；
 运行过程中生成的所有文件（AI模型、经验池），均位于Desktop\AAA及其子文件夹。
 
 通过电脑上的默认浏览器，实现一个科幻感满满的操作窗口，实时显示各种信息，包括但不限于：
-①窗口A是否满足截图条件：若否，给出原因；
-②显示器分辨率、DPI、磁盘可用空间；
-③CPU、内存、GPU、显存占用率曲线；
+CPU、内存、GPU、显存占用率（像心电图那样的曲线）；
+窗口A是否满足截图条件：若否，给出原因；
+显示器分辨率、DPI、磁盘可用空间；
 
 FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
 
