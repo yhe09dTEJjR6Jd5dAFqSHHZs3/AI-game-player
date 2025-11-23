@@ -965,7 +965,7 @@ HTML_PAGE = '''<!DOCTYPE html>
 body {
   margin: 0;
   padding: 0;
-  background: radial-gradient(circle at top, #0f172a 0, #020617 40%, #000 100%);
+  background: radial-gradient(circle at 12% 10%, rgba(56,189,248,0.12), transparent 26%), radial-gradient(circle at 88% 8%, rgba(168,85,247,0.12), transparent 24%), radial-gradient(circle at 40% 60%, rgba(34,197,94,0.12), transparent 30%), #020617;
   font-family: Consolas, "JetBrains Mono", monospace;
   color: #e5e5e5;
   overflow: hidden;
@@ -974,19 +974,50 @@ body {
   position: fixed;
   inset: 0;
   background-image:
-    linear-gradient(rgba(15,23,42,0.72) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(15,23,42,0.72) 1px, transparent 1px);
-  background-size: 32px 32px, 32px 32px;
-  opacity: 0.7;
+    linear-gradient(rgba(59,130,246,0.22) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(45,212,191,0.18) 1px, transparent 1px);
+  background-size: 28px 28px, 28px 28px;
+  opacity: 0.6;
   pointer-events: none;
+  animation: drift 12s linear infinite;
 }
 #glow {
   position: fixed;
   inset: -40%;
   background:
-    radial-gradient(circle at 10% 10%, rgba(56,189,248,0.16), transparent 60%),
-    radial-gradient(circle at 90% 70%, rgba(34,197,94,0.12), transparent 55%);
+    radial-gradient(circle at 14% 18%, rgba(56,189,248,0.2), transparent 58%),
+    radial-gradient(circle at 82% 74%, rgba(34,197,94,0.16), transparent 55%),
+    radial-gradient(circle at 50% 60%, rgba(168,85,247,0.12), transparent 60%);
   mix-blend-mode: screen;
+  pointer-events: none;
+}
+#scanlines {
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient( to bottom, rgba(255,255,255,0.04) 0, rgba(255,255,255,0.04) 1px, transparent 1px, transparent 3px);
+  opacity: 0.45;
+  mix-blend-mode: soft-light;
+  pointer-events: none;
+  animation: scan 8s linear infinite;
+}
+#stars {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 1;
+}
+#holo {
+  position: fixed;
+  width: 360px;
+  height: 360px;
+  border-radius: 50%;
+  top: -120px;
+  right: -60px;
+  background: conic-gradient(from 45deg, rgba(56,189,248,0.12), rgba(45,212,191,0.26), rgba(168,85,247,0.18), rgba(56,189,248,0.12));
+  filter: blur(44px);
+  opacity: 0.8;
+  animation: rotate 16s linear infinite;
   pointer-events: none;
 }
 #app {
@@ -999,11 +1030,37 @@ body {
   gap: 18px;
 }
 .col {
-  background: rgba(15,23,42,0.96);
+  background: rgba(8,15,30,0.92);
   border-radius: 14px;
-  border: 1px solid rgba(148,163,184,0.42);
-  box-shadow: 0 0 24px rgba(15,23,42,0.9), 0 0 38px rgba(16,185,129,0.18);
+  border: 1px solid rgba(148,163,184,0.38);
+  box-shadow: 0 0 24px rgba(15,23,42,0.9), 0 0 42px rgba(56,189,248,0.22);
   padding: 14px 16px;
+  position: relative;
+  overflow: hidden;
+}
+.col::before {
+  content: "";
+  position: absolute;
+  inset: -60% -40% auto auto;
+  width: 240px;
+  height: 240px;
+  background: radial-gradient(circle at center, rgba(56,189,248,0.16), transparent 58%);
+  opacity: 0.6;
+  mix-blend-mode: screen;
+  animation: floaty 8s ease-in-out infinite;
+  pointer-events: none;
+}
+.col::after {
+  content: "";
+  position: absolute;
+  inset: auto auto -55% -35%;
+  width: 220px;
+  height: 220px;
+  background: radial-gradient(circle at center, rgba(168,85,247,0.16), transparent 58%);
+  opacity: 0.5;
+  mix-blend-mode: screen;
+  animation: floaty 9s ease-in-out infinite reverse;
+  pointer-events: none;
 }
 .col-left {
   flex: 1.4;
@@ -1021,6 +1078,10 @@ body {
   font-size: 17px;
   letter-spacing: 0.16em;
   color: #a5b4fc;
+  background: linear-gradient(120deg, #38bdf8, #22c55e, #a855f7);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 0 0 18px rgba(56,189,248,0.45);
 }
 .badge {
   font-size: 12px;
@@ -1227,11 +1288,29 @@ select:focus {
   font-size: 11px;
   color: #94a3b8;
 }
+.star {
+  position: absolute;
+  width: 2px;
+  height: 2px;
+  background: rgba(148,163,184,0.9);
+  border-radius: 50%;
+  box-shadow: 0 0 8px rgba(56,189,248,0.8);
+  opacity: 0.75;
+  animation: twinkle 3s ease-in-out infinite;
+}
+@keyframes drift { from { background-position: 0 0, 0 0; } to { background-position: 28px 28px, 28px 28px; } }
+@keyframes scan { from { transform: translateY(0); } to { transform: translateY(-100%); } }
+@keyframes rotate { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+@keyframes floaty { 0% { transform: translateY(0); } 50% { transform: translateY(-8px); } 100% { transform: translateY(0); } }
+@keyframes twinkle { 0%, 100% { opacity: 0.35; transform: scale(1); } 50% { opacity: 1; transform: scale(1.8); } }
 </style>
 </head>
 <body>
 <div id="grid"></div>
 <div id="glow"></div>
+<div id="scanlines"></div>
+<div id="stars"></div>
+<div id="holo"></div>
 <div id="app">
   <div class="header">
     <div>
@@ -1330,6 +1409,22 @@ let lastState = null;
 let typingModeTimer = null;
 let typingStatusTimer = null;
 let pulsePhase = 0;
+function seedStars() {
+  const container = document.getElementById("stars");
+  if (!container) return;
+  container.innerHTML = "";
+  const total = 86;
+  for (let i = 0; i < total; i++) {
+    const dot = document.createElement("div");
+    dot.className = "star";
+    dot.style.left = Math.random() * 100 + "%";
+    dot.style.top = Math.random() * 100 + "%";
+    dot.style.opacity = 0.35 + Math.random() * 0.6;
+    dot.style.animationDuration = 2.2 + Math.random() * 2.5 + "s";
+    dot.style.animationDelay = Math.random() * 3 + "s";
+    container.appendChild(dot);
+  }
+}
 function typeWriter(element, fullText, prefix) {
   if (!element) return;
   if (typingModeTimer && element.id === "modeText") clearInterval(typingModeTimer);
@@ -1508,6 +1603,7 @@ function animatePulse() {
 window.addEventListener("load", () => {
   document.getElementById("btnRefresh").addEventListener("click", refreshWindows);
   document.getElementById("btnStart").addEventListener("click", bindAndStart);
+  seedStars();
   refreshWindows();
   buildNeuroGrid();
   animateNeuroGrid();
