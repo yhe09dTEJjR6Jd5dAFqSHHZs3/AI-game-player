@@ -23,10 +23,63 @@ from torch.utils.data import Dataset, DataLoader
 
 home_dir = os.path.expanduser("~")
 base_dir = os.path.join(home_dir, "Desktop", "AAA")
-exp_dir = os.path.join(base_dir, "experience")
-model_dir = os.path.join(base_dir, "models")
-os.makedirs(exp_dir, exist_ok=True)
-os.makedirs(model_dir, exist_ok=True)
+exp_root = os.path.join(base_dir, "experience")
+model_root = os.path.join(base_dir, "models")
+state_file = os.path.join(base_dir, "runtime_state.json")
+active_profile = "default"
+remembered_window_title = ""
+os.makedirs(exp_root, exist_ok=True)
+os.makedirs(model_root, exist_ok=True)
+
+def sanitize_profile(name):
+    txt = "" if name is None else str(name)
+    cleaned = []
+    for ch in txt:
+        if ch.isalnum() or ch in (" ", "-", "_"):
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+    clean = "".join(cleaned).strip()
+    clean = "_".join([p for p in clean.split(" ") if p])
+    if not clean:
+        clean = "profile"
+    return clean[:80]
+
+def ensure_profile_dirs():
+    os.makedirs(os.path.join(exp_root, active_profile), exist_ok=True)
+    os.makedirs(os.path.join(model_root, active_profile), exist_ok=True)
+
+def get_exp_dir():
+    ensure_profile_dirs()
+    return os.path.join(exp_root, active_profile)
+
+def get_model_dir():
+    ensure_profile_dirs()
+    return os.path.join(model_root, active_profile)
+
+def persist_runtime_state():
+    try:
+        data = {"window_title": remembered_window_title, "profile": active_profile}
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def load_runtime_state():
+    global active_profile, remembered_window_title
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            remembered_window_title = data.get("window_title", "") or ""
+            prof = data.get("profile", "") or ""
+            if prof:
+                active_profile = prof
+        except Exception:
+            remembered_window_title = ""
+    ensure_profile_dirs()
+
+load_runtime_state()
 
 state = {"exit": False, "optimize": False, "switch_to_training": False}
 kbd_listener = None
@@ -63,8 +116,21 @@ ui_state = {
     "mem": 0.0,
     "gpu": 0.0,
     "vram": 0.0,
-    "capture": "未绑定窗口A"
+    "capture": "未绑定窗口A",
+    "profile": active_profile,
+    "remembered": remembered_window_title
 }
+
+def activate_profile(title):
+    global active_profile, remembered_window_title
+    remembered_window_title = title or ""
+    active_profile = sanitize_profile(title) if title else "default"
+    ui_state["profile"] = active_profile
+    ui_state["remembered"] = remembered_window_title
+    ensure_profile_dirs()
+    persist_runtime_state()
+
+activate_profile(remembered_window_title)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == "cuda":
@@ -540,7 +606,7 @@ def save_sequence_experience(hwnd, frames, path_points, source):
             return
         ts = int(time.time() * 1000)
         prefix = "H_" if source == "human" else "A_"
-        path_file = os.path.join(exp_dir, prefix + str(ts) + ".npz")
+        path_file = os.path.join(get_exp_dir(), prefix + str(ts) + ".npz")
         src_val = np.array([0 if source == "human" else 1], dtype=np.int8)
         np.savez_compressed(path_file, imgs=imgs_arr, path=path.astype(np.float32), src=src_val)
     except Exception:
@@ -571,7 +637,7 @@ def preprocess_sequence_for_model(frames):
         return None
 
 def load_model():
-    model_path = os.path.join(model_dir, "model_latest.pt")
+    model_path = os.path.join(get_model_dir(), "model_latest.pt")
     model = Net().to(device)
     if os.path.exists(model_path):
         try:
@@ -582,7 +648,7 @@ def load_model():
     return model
 
 def scan_experience_files():
-    files = sorted(glob.glob(os.path.join(exp_dir, "*.npz")))
+    files = sorted(glob.glob(os.path.join(get_exp_dir(), "*.npz")))
     human_files = []
     ai_files = []
     for f in files:
@@ -794,7 +860,7 @@ def offline_train():
             model.load_state_dict(best_state)
         except Exception:
             pass
-    model_path = os.path.join(model_dir, "model_latest.pt")
+    model_path = os.path.join(get_model_dir(), "model_latest.pt")
     torch.save(model.state_dict(), model_path)
     if device.type == "cuda":
         try:
@@ -979,7 +1045,7 @@ def execute_mouse_path(hwnd, mctl, path_points):
 def training_mode(hwnd):
     ui_state["mode"] = "训练模式"
     ui_state["status"] = "AI 正在根据窗口A画面输出鼠标轨迹"
-    model_path = os.path.join(model_dir, "model_latest.pt")
+    model_path = os.path.join(get_model_dir(), "model_latest.pt")
     if not os.path.exists(model_path):
         ui_state["status"] = "未找到模型文件，无法进入训练模式"
         return
@@ -1065,6 +1131,8 @@ def bind_window_by_index(idx):
     current_hwnd = hwnd
     ui_state["hwnd_title"] = title
     ui_state["status"] = "窗口A 已绑定: " + title
+    activate_profile(title)
+    scan_experience_files()
     try:
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
@@ -1248,6 +1316,8 @@ body {
   background: radial-gradient(circle at top left, rgba(34,197,94,0.09), rgba(15,23,42,0.96));
   padding: 10px 12px 12px;
   margin-bottom: 10px;
+  position: relative;
+  overflow: hidden;
 }
 .label {
   font-size: 12px;
@@ -1373,31 +1443,46 @@ select:focus {
 .progress-shell.discharge::after {
   opacity: 1;
 }
-.metric {
-  margin-top: 8px;
+.wave-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 6px;
 }
-.metric-header {
+.wave-box {
+  padding: 8px;
+  border-radius: 12px;
+  background: linear-gradient(120deg, rgba(15,23,42,0.9), rgba(30,41,59,0.8));
+  box-shadow: inset 0 0 0 1px rgba(94,234,212,0.35), 0 10px 30px rgba(15,23,42,0.4);
+  position: relative;
+  overflow: hidden;
+}
+.wave-box::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 10% 10%, rgba(94,234,212,0.16), transparent 35%), radial-gradient(circle at 80% 0%, rgba(59,130,246,0.18), transparent 40%);
+  opacity: 0.65;
+  pointer-events: none;
+}
+.wave-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   font-size: 12px;
   color: #cbd5f5;
+  letter-spacing: 0.5px;
 }
-.metric-bar {
-  margin-top: 4px;
-  height: 8px;
-  border-radius: 999px;
-  background: rgba(15,23,42,0.96);
-  overflow: hidden;
-  box-shadow: 0 0 0 1px rgba(94,234,212,0.5);
+.wave-header span:last-child {
+  color: #38fbd4;
 }
-.metric-inner {
-  height: 100%;
-  width: 0%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #34d399, #22d3ee);
-  box-shadow: 0 0 16px rgba(45,212,191,0.8);
-  transition: width 0.2s ease-out;
+.wave-canvas {
+  margin-top: 6px;
+  border-radius: 10px;
+  width: 100%;
+  height: 70px;
+  background: radial-gradient(circle at 20% 30%, rgba(56,189,248,0.12), transparent 40%), rgba(2,6,23,0.85);
+  box-shadow: inset 0 0 0 1px rgba(148,163,184,0.12), inset 0 0 12px rgba(34,211,238,0.18);
 }
 .footer {
   margin-top: 6px;
@@ -1410,6 +1495,60 @@ select:focus {
 .code {
   font-size: 11px;
   color: #94a3b8;
+  line-height: 1.8;
+}
+.mode-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(148,163,184,0.16);
+  color: #e2e8f0;
+  font-size: 12px;
+}
+.mode-line:last-child {
+  border-bottom: none;
+}
+.mode-label {
+  color: #94a3b8;
+  letter-spacing: 0.5px;
+}
+.mode-desc {
+  color: #38fbd4;
+  font-weight: 700;
+}
+.badge.neon {
+  background: linear-gradient(90deg, rgba(56,189,248,0.3), rgba(94,234,212,0.35));
+  color: #e0f2fe;
+  box-shadow: 0 0 20px rgba(59,130,246,0.35);
+}
+.card.holo {
+  background: radial-gradient(circle at 20% 10%, rgba(56,189,248,0.12), transparent 30%), radial-gradient(circle at 80% 0%, rgba(34,197,94,0.16), transparent 26%), rgba(15,23,42,0.82);
+  border: 1px solid rgba(59,130,246,0.25);
+  box-shadow: inset 0 0 0 1px rgba(94,234,212,0.2), 0 10px 30px rgba(2,6,23,0.65);
+}
+.card.holo::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(120deg, rgba(56,189,248,0.12), rgba(34,211,238,0.05));
+  opacity: 0;
+  transition: opacity 0.3s ease-out;
+  pointer-events: none;
+}
+.card.holo:hover::after {
+  opacity: 1;
+}
+.ionic-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+.hyper {
+  letter-spacing: 0.8px;
+  color: #67e8f9;
+  text-shadow: 0 0 14px rgba(103,232,249,0.7);
 }
 .star {
   position: absolute;
@@ -1438,19 +1577,20 @@ select:focus {
   <div class="header">
     <div>
       <div class="title">NEURO DESKTOP · SYNAPTIC WINDOW AI</div>
-      <div class="badge">自进化窗口脑核 · Epoch 自适应 · VRAM 自救</div>
+      <div class="badge neon">量子窗格控制塔 · 霓虹脉冲态</div>
     </div>
     <div class="chip-row">
       <div class="chip" id="captureTag">捕获诊断 · 未绑定</div>
       <div class="chip" id="screenTag">屏幕 -</div>
       <div class="chip" id="diskTag">磁盘 -</div>
+      <div class="chip" id="profileTag">窗口记忆 · -</div>
     </div>
   </div>
   <div class="row">
     <div class="col col-left">
       <div class="section-title">窗口A 绑定与控制</div>
-      <div class="card">
-        <div class="label">选择作为窗口A的应用窗口</div>
+      <div class="card holo">
+        <div class="label hyper">选择作为窗口A的应用窗口</div>
         <select id="windowSelect">
           <option value="">正在扫描可见窗口...</option>
         </select>
@@ -1458,13 +1598,23 @@ select:focus {
           <button class="btn btn-ghost" id="btnRefresh">刷新窗口列表</button>
           <button class="btn btn-primary" id="btnStart">绑定窗口A并启动学习模式</button>
         </div>
+        <div class="ionic-grid" style="margin-top:8px;">
+          <div>
+            <div class="info-label">记忆窗口</div>
+            <div class="info-value" id="rememberedText">-</div>
+          </div>
+          <div>
+            <div class="info-label">模型分组</div>
+            <div class="info-value info-highlight" id="profileText">default</div>
+          </div>
+        </div>
         <div class="status-line">
           <span class="status-mode" id="modeText">模式: 待机</span><br>
           <span class="status-text" id="statusText">状态: 等待启动</span>
         </div>
       </div>
       <div class="section-title">训练进程 · Loss 感应 · 放电闪动</div>
-      <div class="card">
+      <div class="card holo">
         <div class="info-grid">
           <div>
             <div class="info-label">窗口A</div>
@@ -1519,7 +1669,7 @@ select:focus {
     </div>
     <div class="col col-right">
       <div class="section-title">系统画像</div>
-      <div class="card">
+      <div class="card holo">
         <div class="info-label">设备</div>
         <div class="info-value" id="deviceText"></div>
         <div class="info-label" style="margin-top:6px;">视觉理解</div>
@@ -1531,30 +1681,30 @@ select:focus {
         <div class="info-label" style="margin-top:6px;">经验池管理</div>
         <div class="info-value code" id="recycleText"></div>
         <div class="info-label" style="margin-top:10px;">实时资源</div>
-        <div class="metric">
-          <div class="metric-header"><span>CPU</span><span id="cpuText">0%</span></div>
-          <div class="metric-bar"><div class="metric-inner" id="cpuBar"></div></div>
-        </div>
-        <div class="metric">
-          <div class="metric-header"><span>内存</span><span id="memText">0%</span></div>
-          <div class="metric-bar"><div class="metric-inner" id="memBar"></div></div>
-        </div>
-        <div class="metric">
-          <div class="metric-header"><span>GPU</span><span id="gpuText">0%</span></div>
-          <div class="metric-bar"><div class="metric-inner" id="gpuBar"></div></div>
-        </div>
-        <div class="metric">
-          <div class="metric-header"><span>显存</span><span id="vramText">0%</span></div>
-          <div class="metric-bar"><div class="metric-inner" id="vramBar"></div></div>
+        <div class="wave-grid">
+          <div class="wave-box">
+            <div class="wave-header"><span>CPU</span><span id="cpuText">0%</span></div>
+            <canvas class="wave-canvas" id="cpuWave" width="320" height="70"></canvas>
+          </div>
+          <div class="wave-box">
+            <div class="wave-header"><span>内存</span><span id="memText">0%</span></div>
+            <canvas class="wave-canvas" id="memWave" width="320" height="70"></canvas>
+          </div>
+          <div class="wave-box">
+            <div class="wave-header"><span>GPU</span><span id="gpuText">0%</span></div>
+            <canvas class="wave-canvas" id="gpuWave" width="320" height="70"></canvas>
+          </div>
+          <div class="wave-box">
+            <div class="wave-header"><span>显存</span><span id="vramText">0%</span></div>
+            <canvas class="wave-canvas" id="vramWave" width="320" height="70"></canvas>
+          </div>
         </div>
       </div>
       <div class="section-title">模式说明</div>
-      <div class="card">
-        <div class="code">
-          学习模式：记录窗口A画面 + 人类鼠标轨迹（人类经验）<br>
-          训练模式：模型观察窗口A画面并自行驱动鼠标（AI经验）<br>
-          离线优化：融合人类与AI经验，自适应 Epoch + VRAM 自救
-        </div>
+      <div class="card holo">
+        <div class="mode-line"><span class="mode-label">学习模式</span><span class="mode-desc">记录窗口A画面 + 人类鼠标轨迹（人类经验）</span></div>
+        <div class="mode-line"><span class="mode-label">训练模式</span><span class="mode-desc">模型观察窗口A画面并自行驱动鼠标（AI经验）</span></div>
+        <div class="mode-line"><span class="mode-label">离线优化</span><span class="mode-desc">融合人类/AI经验 · 自适应 Epoch · VRAM 自愈</span></div>
       </div>
     </div>
   </div>
@@ -1605,6 +1755,60 @@ function lossToColor(loss) {
   let h = 120 * (1 - n);
   return "linear-gradient(90deg, hsl(" + h + ",90%,52%), hsl(" + (h+30) + ",90%,58%))";
 }
+const metricHistory = {cpu: [], mem: [], gpu: [], vram: []};
+const waveColors = {cpu: "#60a5fa", mem: "#a855f7", gpu: "#22d3ee", vram: "#f59e0b"};
+function pushWave(name, value) {
+  if (!metricHistory[name]) metricHistory[name] = [];
+  let v = isFinite(value) ? value : 0;
+  if (v < 0) v = 0;
+  if (v > 100) v = 100;
+  metricHistory[name].push(v);
+  if (metricHistory[name].length > 140) metricHistory[name].shift();
+  drawWave(name);
+}
+function drawWave(name) {
+  let canvas = document.getElementById(name + "Wave");
+  if (!canvas) return;
+  let ctx = canvas.getContext("2d");
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "rgba(2,6,23,0.82)";
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = "rgba(148,163,184,0.25)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 5; i++) {
+    let y = (h / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+  const arr = metricHistory[name] || [];
+  if (arr.length < 2) return;
+  ctx.strokeStyle = waveColors[name] || "#22d3ee";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < arr.length; i++) {
+    let x = (i / (arr.length - 1)) * w;
+    let y = h - (arr[i] / 100) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < arr.length; i++) {
+    let x = (i / (arr.length - 1)) * w;
+    let y = h - (arr[i] / 100) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  let sparkX = Math.random() * w;
+  let sparkY = Math.random() * h;
+  ctx.fillStyle = "rgba(56,189,248,0.35)";
+  ctx.fillRect(sparkX - 1, sparkY - 1, 2, 2);
+}
 function updateUI(state) {
   let modeEl = document.getElementById("modeText");
   let statusEl = document.getElementById("statusText");
@@ -1630,10 +1834,9 @@ function updateUI(state) {
   let memText = document.getElementById("memText");
   let gpuText = document.getElementById("gpuText");
   let vramText = document.getElementById("vramText");
-  let cpuBar = document.getElementById("cpuBar");
-  let memBar = document.getElementById("memBar");
-  let gpuBar = document.getElementById("gpuBar");
-  let vramBar = document.getElementById("vramBar");
+  let profileEl = document.getElementById("profileText");
+  let rememberedEl = document.getElementById("rememberedText");
+  let profileTag = document.getElementById("profileTag");
   let shell = document.getElementById("progressShell");
   let fill = document.getElementById("progressFill");
   if (!state) return;
@@ -1679,18 +1882,20 @@ function updateUI(state) {
   if (dpiEl) dpiEl.textContent = state.dpi || "-";
   if (diskEl) diskEl.textContent = state.disk || "-";
   if (diskTag) diskTag.textContent = "磁盘 " + (state.disk || "-");
-  function setBar(val, barEl, textEl) {
-    if (!barEl || !textEl) return;
+  if (profileEl) profileEl.textContent = state.profile || "default";
+  if (rememberedEl) rememberedEl.textContent = state.remembered || "-";
+  if (profileTag) profileTag.textContent = "窗口记忆 · " + (state.remembered || "-");
+  function setWave(val, key, textEl) {
     let pct = isFinite(val) ? val : 0;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    barEl.style.width = pct + "%";
-    textEl.textContent = pct.toFixed(1) + "%";
+    if (textEl) textEl.textContent = pct.toFixed(1) + "%";
+    pushWave(key, pct);
   }
-  setBar(state.cpu, cpuBar, cpuText);
-  setBar(state.mem, memBar, memText);
-  setBar(state.gpu, gpuBar, gpuText);
-  setBar(state.vram, vramBar, vramText);
+  setWave(state.cpu, "cpu", cpuText);
+  setWave(state.mem, "mem", memText);
+  setWave(state.gpu, "gpu", gpuText);
+  setWave(state.vram, "vram", vramText);
   let total = state.total_steps || 0;
   let steps = state.steps || 0;
   let pct = 0;
@@ -1727,10 +1932,22 @@ function refreshWindows() {
       sel.appendChild(opt);
       return;
     }
+    let remembered = data.remembered || "";
+    let profileTag = document.getElementById("profileTag");
+    let rememberedText = document.getElementById("rememberedText");
+    let profileText = document.getElementById("profileText");
+    if (rememberedText) rememberedText.textContent = remembered || "-";
+    if (profileTag) profileTag.textContent = "窗口记忆 · " + (remembered || "-");
+    if (profileText && data.profile) profileText.textContent = data.profile;
+    let matched = false;
     data.windows.forEach((w, idx) => {
       let opt = document.createElement("option");
       opt.value = idx;
       opt.textContent = idx + ": " + w.title;
+      if (!matched && remembered && w.title === remembered) {
+        opt.selected = true;
+        matched = true;
+      }
       sel.appendChild(opt);
     });
   }).catch(()=>{});
@@ -1750,6 +1967,12 @@ function tickState() {
     updateUI(state);
   }).catch(()=>{});
 }
+function randomDischargePulse() {
+  let shell = document.getElementById("progressShell");
+  if (!shell) return;
+  shell.classList.add("discharge");
+  setTimeout(() => shell.classList.remove("discharge"), 180 + Math.random() * 180);
+}
 window.addEventListener("load", () => {
   document.getElementById("btnRefresh").addEventListener("click", refreshWindows);
   document.getElementById("btnStart").addEventListener("click", bindAndStart);
@@ -1757,6 +1980,7 @@ window.addEventListener("load", () => {
   refreshWindows();
   tickState();
   setInterval(tickState, 200);
+  setInterval(() => { if (Math.random() > 0.6) randomDischargePulse(); }, 2200);
 });
 </script>
 </body>
@@ -1793,7 +2017,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/windows":
             refresh_window_list()
             ws = [{"title": t, "hwnd": int(hwnd)} for hwnd, t in windows_list]
-            self._send_json({"windows": ws})
+            self._send_json({"windows": ws, "remembered": remembered_window_title, "profile": active_profile})
         else:
             self._send_json({"error": "not_found"}, code=404)
     def do_POST(self):
