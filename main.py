@@ -10,6 +10,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 import urllib.parse
 import win32gui
+import ctypes
+import shutil
+import psutil
 from PIL import ImageGrab
 from pynput import mouse, keyboard
 import numpy as np
@@ -52,7 +55,15 @@ ui_state = {
     "path_len": 0,
     "embed_dim": 0,
     "heads": 0,
-    "layers": 0
+    "layers": 0,
+    "screen": "",
+    "dpi": "",
+    "disk": "",
+    "cpu": 0.0,
+    "mem": 0.0,
+    "gpu": 0.0,
+    "vram": 0.0,
+    "capture": "未绑定窗口A"
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -184,6 +195,121 @@ def choose_hyperparams(num_samples, human_ratio):
         batch_size = max(1, batch_size // 2)
     patience = 4 if num_samples < 800 else 3
     return batch_size, min_epochs, max_epochs, base_lr, wd, grad_clip, patience
+
+def get_display_metrics():
+    try:
+        user32 = ctypes.windll.user32
+        width = int(user32.GetSystemMetrics(0))
+        height = int(user32.GetSystemMetrics(1))
+    except Exception:
+        width = 0
+        height = 0
+    dpi = 0.0
+    try:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    try:
+        dpi = float(ctypes.windll.shcore.GetDpiForSystem())
+    except Exception:
+        try:
+            hwnd = ctypes.windll.user32.GetDesktopWindow()
+            dpi = float(ctypes.windll.user32.GetDpiForWindow(hwnd))
+        except Exception:
+            dpi = 0.0
+    return width, height, dpi
+
+def get_disk_metrics():
+    try:
+        usage = shutil.disk_usage(base_dir)
+        free_gb = usage.free / float(1024 ** 3)
+        total_gb = usage.total / float(1024 ** 3)
+        return free_gb, total_gb
+    except Exception:
+        return 0.0, 0.0
+
+def get_resource_metrics():
+    try:
+        cpu = psutil.cpu_percent(interval=0.05)
+    except Exception:
+        cpu = 0.0
+    try:
+        mem = psutil.virtual_memory().percent
+    except Exception:
+        mem = 0.0
+    gpu = 0.0
+    vram = 0.0
+    if device.type == "cuda":
+        try:
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            used_mem = total_mem - free_mem
+            if total_mem > 0:
+                vram = (used_mem / float(total_mem)) * 100.0
+        except Exception:
+            try:
+                total_mem = torch.cuda.get_device_properties(0).total_memory
+                used_mem = torch.cuda.memory_allocated(0)
+                if total_mem > 0:
+                    vram = (used_mem / float(total_mem)) * 100.0
+            except Exception:
+                vram = 0.0
+        try:
+            gpu = float(torch.cuda.utilization(0))
+        except Exception:
+            gpu = vram
+    return cpu, mem, gpu, vram
+
+def capture_diagnostics():
+    if current_hwnd is None:
+        return "未绑定窗口A"
+    try:
+        if not win32gui.IsWindow(current_hwnd):
+            return "窗口句柄失效"
+        if win32gui.IsIconic(current_hwnd):
+            return "窗口被最小化"
+        if not win32gui.IsWindowVisible(current_hwnd):
+            return "窗口不可见"
+        rect = win32gui.GetWindowRect(current_hwnd)
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
+        if width <= 40 or height <= 40:
+            return "窗口尺寸异常"
+        sw, sh, _ = get_display_metrics()
+        if sw > 0 and sh > 0:
+            if left < 0 or top < 0 or right > sw or bottom > sh:
+                return "窗口未完全显示在屏幕内"
+        fg = win32gui.GetForegroundWindow()
+        if fg != current_hwnd:
+            return "窗口未激活，可能被遮挡"
+    except Exception:
+        return "窗口状态未知"
+    return "捕获就绪"
+
+def update_realtime_metrics():
+    width, height, dpi = get_display_metrics()
+    if width > 0 and height > 0:
+        ui_state["screen"] = str(width) + " × " + str(height)
+    else:
+        ui_state["screen"] = "未知"
+    if dpi > 0:
+        ui_state["dpi"] = ("%.0f" % dpi) + " DPI"
+    else:
+        ui_state["dpi"] = "DPI 未知"
+    free_gb, total_gb = get_disk_metrics()
+    if total_gb > 0:
+        ui_state["disk"] = ("%.1f" % free_gb) + " GB 可用 / " + ("%.1f" % total_gb) + " GB"
+    else:
+        ui_state["disk"] = "磁盘信息未知"
+    cpu, mem, gpu, vram = get_resource_metrics()
+    ui_state["cpu"] = float(cpu)
+    ui_state["mem"] = float(mem)
+    ui_state["gpu"] = float(gpu)
+    ui_state["vram"] = float(vram)
+    ui_state["capture"] = capture_diagnostics()
 
 def augment_sequence(imgs):
     imgs = imgs.astype(np.float32)
@@ -1084,21 +1210,37 @@ body {
   text-shadow: 0 0 18px rgba(56,189,248,0.45);
 }
 .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: linear-gradient(120deg, rgba(56,189,248,0.22), rgba(34,197,94,0.14));
+  border: 1px solid rgba(56,189,248,0.5);
+  color: #c7f9cc;
+  padding: 6px 12px;
   font-size: 12px;
-  color: #22c55e;
+  border-radius: 14px;
+  box-shadow: 0 8px 30px rgba(59,130,246,0.35);
 }
-.pulse {
+.chip-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.chip {
+  background: rgba(30,41,59,0.8);
+  border: 1px solid rgba(94,234,212,0.5);
+  color: #e2f3ff;
+  padding: 6px 10px;
+  border-radius: 999px;
   font-size: 11px;
-  color: #38bdf8;
-}
-.pulse span {
-  display: inline-block;
-  min-width: 120px;
+  box-shadow: 0 8px 24px rgba(8,47,73,0.6);
+  white-space: nowrap;
 }
 .section-title {
   font-size: 13px;
-  color: #a5b4fc;
+  color: #a5f3fc;
   margin-bottom: 8px;
+  letter-spacing: 1px;
 }
 .card {
   border-radius: 12px;
@@ -1190,6 +1332,9 @@ select:focus {
 .info-highlight {
   color: #22c55e;
 }
+.info-alert {
+  color: #fbbf24;
+}
 .progress-shell {
   margin-top: 10px;
   position: relative;
@@ -1228,52 +1373,30 @@ select:focus {
 .progress-shell.discharge::after {
   opacity: 1;
 }
-.neuro-grid {
-  margin-top: 10px;
-  display: grid;
-  grid-template-columns: repeat(26, 1fr);
-  grid-auto-rows: 8px;
-  gap: 3px;
-}
-.neuro-cell {
-  border-radius: 3px;
-  background: #020617;
-  box-shadow: 0 0 0 rgba(15,23,42,0.0);
-  transition: background 0.18s linear, box-shadow 0.18s linear, transform 0.18s linear;
-}
-.neuro-cell.active1 {
-  background: #22c55e;
-  box-shadow: 0 0 12px rgba(34,197,94,0.9);
-  transform: translateY(-1px);
-}
-.neuro-cell.active2 {
-  background: #2dd4bf;
-  box-shadow: 0 0 12px rgba(45,212,191,0.95);
-  transform: translateY(-1px);
-}
-.neuro-cell.active3 {
-  background: #38bdf8;
-  box-shadow: 0 0 14px rgba(56,189,248,0.96);
-  transform: translateY(-1px);
-}
-.brain-meter {
+.metric {
   margin-top: 8px;
-  font-size: 11px;
 }
-.brain-bar {
+.metric-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: #cbd5f5;
+}
+.metric-bar {
   margin-top: 4px;
-  height: 6px;
+  height: 8px;
   border-radius: 999px;
   background: rgba(15,23,42,0.96);
   overflow: hidden;
-  box-shadow: 0 0 0 1px rgba(148,163,184,0.6);
+  box-shadow: 0 0 0 1px rgba(94,234,212,0.5);
 }
-.brain-bar-inner {
+.metric-inner {
   height: 100%;
   width: 0%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #38bdf8, #22c55e, #a855f7);
-  box-shadow: 0 0 16px rgba(14,165,233,0.8);
+  background: linear-gradient(90deg, #34d399, #22d3ee);
+  box-shadow: 0 0 16px rgba(45,212,191,0.8);
   transition: width 0.2s ease-out;
 }
 .footer {
@@ -1317,7 +1440,11 @@ select:focus {
       <div class="title">NEURO DESKTOP · SYNAPTIC WINDOW AI</div>
       <div class="badge">自进化窗口脑核 · Epoch 自适应 · VRAM 自救</div>
     </div>
-    <div class="pulse">神经场: <span id="pulseText">▁▂▃▄▅▆▇█</span></div>
+    <div class="chip-row">
+      <div class="chip" id="captureTag">捕获诊断 · 未绑定</div>
+      <div class="chip" id="screenTag">屏幕 -</div>
+      <div class="chip" id="diskTag">磁盘 -</div>
+    </div>
   </div>
   <div class="row">
     <div class="col col-left">
@@ -1367,13 +1494,24 @@ select:focus {
         <div class="progress-shell" id="progressShell">
           <div class="progress-fill" id="progressFill"></div>
         </div>
-        <div class="brain-meter">
-          <div>脑龄 Level <span id="brainLevel">0</span></div>
-          <div class="brain-bar">
-            <div class="brain-bar-inner" id="brainInner"></div>
+        <div class="info-grid" style="margin-top:10px;">
+          <div>
+            <div class="info-label">捕获状态</div>
+            <div class="info-value" id="captureStatus">未绑定窗口A</div>
+          </div>
+          <div>
+            <div class="info-label">显示器</div>
+            <div class="info-value" id="screenInfo">-</div>
+          </div>
+          <div>
+            <div class="info-label">DPI</div>
+            <div class="info-value" id="dpiInfo">-</div>
+          </div>
+          <div>
+            <div class="info-label">磁盘空间</div>
+            <div class="info-value" id="diskInfo">-</div>
           </div>
         </div>
-        <div class="neuro-grid" id="neuroGrid"></div>
         <div class="footer">
           键盘控制：<span>Enter</span> = 停止记录并离线优化 · <span>Space</span> = 训练模式 · <span>Esc</span> = 结束运行
         </div>
@@ -1392,6 +1530,23 @@ select:focus {
         <div class="info-value" id="netText"></div>
         <div class="info-label" style="margin-top:6px;">经验池管理</div>
         <div class="info-value code" id="recycleText"></div>
+        <div class="info-label" style="margin-top:10px;">实时资源</div>
+        <div class="metric">
+          <div class="metric-header"><span>CPU</span><span id="cpuText">0%</span></div>
+          <div class="metric-bar"><div class="metric-inner" id="cpuBar"></div></div>
+        </div>
+        <div class="metric">
+          <div class="metric-header"><span>内存</span><span id="memText">0%</span></div>
+          <div class="metric-bar"><div class="metric-inner" id="memBar"></div></div>
+        </div>
+        <div class="metric">
+          <div class="metric-header"><span>GPU</span><span id="gpuText">0%</span></div>
+          <div class="metric-bar"><div class="metric-inner" id="gpuBar"></div></div>
+        </div>
+        <div class="metric">
+          <div class="metric-header"><span>显存</span><span id="vramText">0%</span></div>
+          <div class="metric-bar"><div class="metric-inner" id="vramBar"></div></div>
+        </div>
       </div>
       <div class="section-title">模式说明</div>
       <div class="card">
@@ -1408,7 +1563,6 @@ select:focus {
 let lastState = null;
 let typingModeTimer = null;
 let typingStatusTimer = null;
-let pulsePhase = 0;
 function seedStars() {
   const container = document.getElementById("stars");
   if (!container) return;
@@ -1465,8 +1619,21 @@ function updateUI(state) {
   let seqEl = document.getElementById("seqText");
   let netEl = document.getElementById("netText");
   let recycleEl = document.getElementById("recycleText");
-  let brainLevelEl = document.getElementById("brainLevel");
-  let brainInnerEl = document.getElementById("brainInner");
+  let captureEl = document.getElementById("captureStatus");
+  let screenEl = document.getElementById("screenInfo");
+  let dpiEl = document.getElementById("dpiInfo");
+  let diskEl = document.getElementById("diskInfo");
+  let captureTag = document.getElementById("captureTag");
+  let screenTag = document.getElementById("screenTag");
+  let diskTag = document.getElementById("diskTag");
+  let cpuText = document.getElementById("cpuText");
+  let memText = document.getElementById("memText");
+  let gpuText = document.getElementById("gpuText");
+  let vramText = document.getElementById("vramText");
+  let cpuBar = document.getElementById("cpuBar");
+  let memBar = document.getElementById("memBar");
+  let gpuBar = document.getElementById("gpuBar");
+  let vramBar = document.getElementById("vramBar");
   let shell = document.getElementById("progressShell");
   let fill = document.getElementById("progressFill");
   if (!state) return;
@@ -1501,11 +1668,29 @@ function updateUI(state) {
   let recycleLine = "经验池文件 " + (state.exp_files || 0) + " 条";
   if (state.recycled > 0) recycleLine += " · 最近回收 " + state.recycled + " 条";
   recycleEl.textContent = recycleLine;
-  let brain = state.brain_level || 0;
-  if (brain < 0) brain = 0;
-  if (brain > 100) brain = 100;
-  brainLevelEl.textContent = brain.toFixed(1);
-  brainInnerEl.style.width = brain + "%";
+  let captureInfo = state.capture || "未知";
+  if (captureEl) {
+    captureEl.textContent = captureInfo;
+    if (captureInfo.indexOf("就绪") >= 0) captureEl.className = "info-value info-highlight"; else captureEl.className = "info-value info-alert";
+  }
+  if (captureTag) captureTag.textContent = "捕获诊断 · " + captureInfo;
+  if (screenEl) screenEl.textContent = state.screen || "-";
+  if (screenTag) screenTag.textContent = "屏幕 " + (state.screen || "-");
+  if (dpiEl) dpiEl.textContent = state.dpi || "-";
+  if (diskEl) diskEl.textContent = state.disk || "-";
+  if (diskTag) diskTag.textContent = "磁盘 " + (state.disk || "-");
+  function setBar(val, barEl, textEl) {
+    if (!barEl || !textEl) return;
+    let pct = isFinite(val) ? val : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    barEl.style.width = pct + "%";
+    textEl.textContent = pct.toFixed(1) + "%";
+  }
+  setBar(state.cpu, cpuBar, cpuText);
+  setBar(state.mem, memBar, memText);
+  setBar(state.gpu, gpuBar, gpuText);
+  setBar(state.vram, vramBar, vramText);
   let total = state.total_steps || 0;
   let steps = state.steps || 0;
   let pct = 0;
@@ -1565,49 +1750,11 @@ function tickState() {
     updateUI(state);
   }).catch(()=>{});
 }
-function buildNeuroGrid() {
-  let grid = document.getElementById("neuroGrid");
-  for (let i = 0; i < 26 * 10; i++) {
-    let d = document.createElement("div");
-    d.className = "neuro-cell";
-    grid.appendChild(d);
-  }
-}
-function animateNeuroGrid() {
-  let grid = document.getElementById("neuroGrid");
-  let cells = Array.from(grid.children);
-  setInterval(() => {
-    cells.forEach(c => {
-      if (Math.random() < 0.2) {
-        c.className = "neuro-cell";
-      }
-    });
-    let active = Math.floor(Math.random() * 40) + 20;
-    for (let i = 0; i < active; i++) {
-      let idx = Math.floor(Math.random() * cells.length);
-      let c = cells[idx];
-      let r = Math.random();
-      if (r < 0.33) c.className = "neuro-cell active1";
-      else if (r < 0.66) c.className = "neuro-cell active2";
-      else c.className = "neuro-cell active3";
-    }
-  }, 130);
-}
-function animatePulse() {
-  const patterns = ["▁▂▃▄▅▆▇█","█▇▆▅▄▃▂▁","▂▃▄▅▆▇█▇","▃▄▅▆▇█▇▆","▄▅▆▇█▇▆▅","▅▆▇█▇▆▅▄"];
-  setInterval(() => {
-    pulsePhase = (pulsePhase + 1) % patterns.length;
-    document.getElementById("pulseText").textContent = patterns[pulsePhase];
-  }, 180);
-}
 window.addEventListener("load", () => {
   document.getElementById("btnRefresh").addEventListener("click", refreshWindows);
   document.getElementById("btnStart").addEventListener("click", bindAndStart);
   seedStars();
   refreshWindows();
-  buildNeuroGrid();
-  animateNeuroGrid();
-  animatePulse();
   tickState();
   setInterval(tickState, 200);
 });
@@ -1637,6 +1784,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif parsed.path == "/state":
             files, human_files, ai_files = scan_experience_files()
+            update_realtime_metrics()
             payload = dict(ui_state)
             payload["exp_files"] = len(files)
             payload["human_exp"] = len(human_files)
