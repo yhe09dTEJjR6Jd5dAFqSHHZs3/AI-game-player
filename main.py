@@ -1156,15 +1156,33 @@ HTML_PAGE = '''<!DOCTYPE html>
 <title>NEURO DESKTOP · SYNAPTIC WINDOW AI</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-body {
+* {
+  box-sizing: border-box;
+}
+html, body {
   margin: 0;
   padding: 0;
+  width: 100%;
+}
+body {
+  margin: 0;
+  padding: clamp(10px, 2vw, 18px);
   background: radial-gradient(circle at 12% 10%, rgba(56,189,248,0.12), transparent 26%), radial-gradient(circle at 88% 8%, rgba(168,85,247,0.12), transparent 24%), radial-gradient(circle at 40% 60%, rgba(34,197,94,0.12), transparent 30%), #020617;
   font-family: Consolas, "JetBrains Mono", monospace;
   color: #e5e5e5;
   min-height: 100vh;
   overflow-x: hidden;
   overflow-y: auto;
+}
+#aurora {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(circle at 20% 30%, rgba(56,189,248,0.16), transparent 32%), radial-gradient(circle at 80% 24%, rgba(14,165,233,0.12), transparent 28%), radial-gradient(circle at 18% 78%, rgba(34,197,94,0.18), transparent 32%), radial-gradient(circle at 82% 82%, rgba(168,85,247,0.18), transparent 30%);
+  filter: blur(20px) saturate(130%);
+  opacity: 0.8;
+  mix-blend-mode: screen;
+  pointer-events: none;
+  animation: pulse 14s ease-in-out infinite alternate;
 }
 #grid {
   position: fixed;
@@ -1176,6 +1194,25 @@ body {
   opacity: 0.6;
   pointer-events: none;
   animation: drift 12s linear infinite;
+}
+#frame {
+  position: fixed;
+  inset: clamp(8px, 1.6vw, 18px);
+  border: 1px solid rgba(56,189,248,0.3);
+  box-shadow: 0 0 24px rgba(56,189,248,0.22), inset 0 0 18px rgba(94,234,212,0.18);
+  border-radius: 18px;
+  pointer-events: none;
+  mix-blend-mode: screen;
+  backdrop-filter: blur(2px);
+}
+#beam {
+  position: fixed;
+  inset: 0;
+  background: conic-gradient(from 120deg at 20% 20%, rgba(56,189,248,0.12), rgba(94,234,212,0.08), rgba(168,85,247,0.12), rgba(56,189,248,0.12));
+  opacity: 0.26;
+  pointer-events: none;
+  animation: rotate 22s linear infinite;
+  filter: blur(28px);
 }
 #glow {
   position: fixed;
@@ -1219,13 +1256,13 @@ body {
 #app {
   position: relative;
   z-index: 2;
-  padding: 18px 22px;
-  max-width: 1280px;
+  padding: clamp(16px, 2vw, 26px);
+  width: min(1320px, calc(100vw - 18px));
   margin: 0 auto;
 }
 .row {
   display: flex;
-  gap: 18px;
+  gap: clamp(12px, 2vw, 18px);
   flex-wrap: wrap;
 }
 .col {
@@ -1261,8 +1298,12 @@ body {
   animation: floaty 9s ease-in-out infinite reverse;
   pointer-events: none;
 }
+.col::after {
+  transform: rotate(12deg);
+}
 .col-left {
   flex: 1.4;
+  min-width: 320px;
 }
 .col-right {
   width: 290px;
@@ -1274,7 +1315,7 @@ body {
   margin-bottom: 10px;
 }
 .title {
-  font-size: 17px;
+  font-size: clamp(15px, 2vw, 18px);
   letter-spacing: 0.16em;
   color: #a5b4fc;
   background: linear-gradient(120deg, #38bdf8, #22c55e, #a855f7);
@@ -1294,10 +1335,16 @@ body {
   border-radius: 14px;
   box-shadow: 0 8px 30px rgba(59,130,246,0.35);
 }
+.badge.pulse {
+  background: linear-gradient(120deg, rgba(56,189,248,0.32), rgba(94,234,212,0.18));
+  box-shadow: 0 0 24px rgba(34,211,238,0.25);
+  animation: breathe 3.6s ease-in-out infinite;
+}
 .chip-row {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
 }
 .chip {
   background: rgba(30,41,59,0.8);
@@ -1329,26 +1376,28 @@ body {
   color: #94a3b8;
   margin-bottom: 4px;
 }
-select, button {
+select, button, .btn {
   font-family: inherit;
   font-size: 12px;
+  width: 100%;
 }
 select {
-  width: 100%;
   padding: 6px 8px;
   border-radius: 8px;
   border: 1px solid rgba(148,163,184,0.8);
-  background: rgba(15,23,42,0.9);
+  background: linear-gradient(120deg, rgba(15,23,42,0.9), rgba(15,23,42,0.86));
   color: #e5e5e5;
 }
 select:focus {
   outline: none;
   box-shadow: 0 0 0 1px #22c55e;
 }
-.btn-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  align-items: center;
+  margin-top: 6px;
 }
 .btn {
   flex: 1;
@@ -1450,7 +1499,7 @@ select:focus {
 }
 .wave-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 10px;
   margin-top: 6px;
 }
@@ -1500,6 +1549,20 @@ select:focus {
   }
   .chip-row {
     flex-wrap: wrap;
+  }
+}
+@media (max-width: 760px) {
+  #app {
+    width: 100%;
+  }
+  .wave-grid {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
+  .badge, .chip, .info-value, .info-label {
+    font-size: 12px;
+  }
+  .title {
+    font-size: 15px;
   }
 }
 .footer {
@@ -1560,13 +1623,18 @@ select:focus {
 }
 @keyframes drift { from { background-position: 0 0, 0 0; } to { background-position: 28px 28px, 28px 28px; } }
 @keyframes scan { from { transform: translateY(0); } to { transform: translateY(-100%); } }
+@keyframes pulse { 0% { opacity: 0.7; transform: scale(1); } 100% { opacity: 1; transform: scale(1.04); } }
 @keyframes rotate { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 @keyframes floaty { 0% { transform: translateY(0); } 50% { transform: translateY(-8px); } 100% { transform: translateY(0); } }
+@keyframes breathe { 0% { transform: translateZ(0); box-shadow: 0 0 14px rgba(56,189,248,0.25); } 50% { box-shadow: 0 0 28px rgba(94,234,212,0.32); } 100% { transform: translateZ(0); box-shadow: 0 0 14px rgba(56,189,248,0.25); } }
 @keyframes twinkle { 0%, 100% { opacity: 0.35; transform: scale(1); } 50% { opacity: 1; transform: scale(1.8); } }
 </style>
 </head>
 <body>
+<div id="aurora"></div>
 <div id="grid"></div>
+<div id="frame"></div>
+<div id="beam"></div>
 <div id="glow"></div>
 <div id="scanlines"></div>
 <div id="stars"></div>
@@ -1580,7 +1648,7 @@ select:focus {
       <div class="chip" id="captureTag">捕获诊断 · 未绑定</div>
       <div class="chip" id="screenTag">屏幕 -</div>
       <div class="chip" id="diskTag">磁盘 -</div>
-      <div class="chip" id="profileTag">窗口记忆 · -</div>
+      <div class="chip pulse" id="profileTag">窗口记忆 · -</div>
     </div>
   </div>
   <div class="row">
@@ -1588,10 +1656,10 @@ select:focus {
       <div class="section-title">窗口A 绑定与控制</div>
       <div class="card holo">
         <div class="label hyper">选择作为窗口A的应用窗口</div>
-        <select id="windowSelect">
-          <option value="">正在扫描可见窗口...</option>
-        </select>
-        <div class="btn-row">
+        <div class="control-grid">
+          <select id="windowSelect">
+            <option value="">正在扫描可见窗口...</option>
+          </select>
           <button class="btn btn-ghost" id="btnRefresh">刷新窗口列表</button>
           <button class="btn btn-primary" id="btnStart">绑定窗口A并启动学习模式</button>
         </div>
@@ -1748,6 +1816,18 @@ function lossToColor(loss) {
 }
 const metricHistory = {cpu: [], mem: [], gpu: [], vram: []};
 const waveColors = {cpu: "#60a5fa", mem: "#a855f7", gpu: "#22d3ee", vram: "#f59e0b"};
+function resizeWaves() {
+  const ratio = window.devicePixelRatio || 1;
+  ["cpu", "mem", "gpu", "vram"].forEach(name => {
+    let canvas = document.getElementById(name + "Wave");
+    if (!canvas) return;
+    let width = canvas.clientWidth || 320;
+    let height = 70;
+    canvas.width = Math.max(140, width * ratio);
+    canvas.height = height * ratio;
+    canvas.style.height = height + "px";
+  });
+}
 function pushWave(name, value) {
   if (!metricHistory[name]) metricHistory[name] = [];
   let v = isFinite(value) ? value : 0;
@@ -1967,11 +2047,16 @@ function randomDischargePulse() {
 window.addEventListener("load", () => {
   document.getElementById("btnRefresh").addEventListener("click", refreshWindows);
   document.getElementById("btnStart").addEventListener("click", bindAndStart);
+  resizeWaves();
   seedStars();
   refreshWindows();
   tickState();
   setInterval(tickState, 200);
   setInterval(() => { if (Math.random() > 0.6) randomDischargePulse(); }, 2200);
+});
+window.addEventListener("resize", () => {
+  resizeWaves();
+  ["cpu", "mem", "gpu", "vram"].forEach(drawWave);
 });
 </script>
 </body>
