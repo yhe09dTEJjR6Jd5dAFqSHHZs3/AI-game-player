@@ -464,6 +464,30 @@ class ResidualBlock(nn.Module):
         out = self.relu(out)
         return out
 
+class TensorLogic(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        self.logic_gate = nn.Linear(dim, dim)
+        self.out = nn.Linear(dim, dim)
+    def forward(self, tokens, seq):
+        b, s, d = tokens.shape
+        h = self.heads
+        d_h = d // h
+        q = self.query(tokens).view(b, s, h, d_h)
+        k = self.key(seq).view(b, s, h, d_h)
+        v = self.value(seq).view(b, s, h, d_h)
+        attn = torch.einsum("bshd,bshd->bsh", q, k) * self.scale
+        attn = torch.softmax(attn, dim=1).unsqueeze(-1)
+        logic = (attn * v).sum(dim=1)
+        gate = torch.sigmoid(self.logic_gate(tokens).mean(dim=1))
+        fused = torch.tanh(self.out(logic.view(b, d) * gate))
+        return fused
+
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
@@ -472,6 +496,7 @@ class Net(nn.Module):
         self.seq_len = SEQ_LEN
         self.embed_dim = MODEL_EMBED_DIM
         hidden_dim = max(512, self.embed_dim)
+        logic_heads = max(1, MODEL_HEADS // 2)
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, base, 3, 2, 1),
             nn.BatchNorm2d(base),
@@ -500,8 +525,9 @@ class Net(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=self.embed_dim, nhead=MODEL_HEADS, dim_feedforward=MODEL_FF, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=MODEL_LAYERS)
         self.temporal_rnn = nn.GRU(input_size=self.embed_dim, hidden_size=self.embed_dim, batch_first=True)
+        self.logic = TensorLogic(self.embed_dim, logic_heads)
         self.path_query = nn.Parameter(torch.randn(PATH_LEN, self.embed_dim))
-        self.ctx_proj = nn.Linear(self.embed_dim * 2, hidden_dim)
+        self.ctx_proj = nn.Linear(self.embed_dim * 3, hidden_dim)
         self.traj_gru = nn.GRU(input_size=self.embed_dim, hidden_size=hidden_dim, batch_first=True)
         self.traj_out = nn.Linear(hidden_dim, 2)
     def forward(self, x):
@@ -542,7 +568,8 @@ class Net(nn.Module):
         context_tokens = x.mean(dim=1)
         temporal_out, temporal_hidden = self.temporal_rnn(frame_feats)
         context_seq = temporal_hidden[-1]
-        context = torch.cat([context_tokens, context_seq], dim=1)
+        logic_ctx = self.logic(frame_feats, temporal_out)
+        context = torch.cat([context_tokens, context_seq, logic_ctx], dim=1)
         h0 = self.ctx_proj(context).unsqueeze(0)
         queries = self.path_query.unsqueeze(0).expand(b, -1, -1)
         traj, _ = self.traj_gru(queries, h0)
