@@ -17,12 +17,13 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from pynput import mouse, keyboard
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QPushButton, QProgressBar, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QPushButton, QProgressBar,
                              QFrame, QMessageBox, QGraphicsDropShadowEffect, QDialog, QGridLayout)
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QThread, QPoint, QRect, QSize
 from PyQt5.QtGui import QColor, QPainter, QPen, QFont, QBrush, QImage, QPixmap
 import pyqtgraph as pg
+from collections import deque
 
 try:
     import pytesseract
@@ -51,7 +52,7 @@ for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
 
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, 'w', encoding='utf-8') as f:
-        f.write("timestamp,img_path,mx,my,click,source\n")
+        f.write("timestamp,img_path,mx,my,click,source,ocr\n")
 
 if not os.path.exists(REGION_FILE):
     with open(REGION_FILE, 'w', encoding='utf-8') as f:
@@ -59,6 +60,19 @@ if not os.path.exists(REGION_FILE):
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_W, INPUT_H = 320, 180
+SEQ_LEN = 4
+MAX_OCR = 16
+
+def letterbox(img, new_w, new_h):
+    h, w = img.shape[:2]
+    scale = min(new_w / w, new_h / h)
+    nw, nh = int(w * scale), int(h * scale)
+    resized = cv2.resize(img, (nw, nh))
+    canvas = np.zeros((new_h, new_w, 3), dtype=np.uint8)
+    top = (new_h - nh) // 2
+    left = (new_w - nw) // 2
+    canvas[top:top+nh, left:left+nw] = resized
+    return canvas
 
 def get_screen_size():
     with mss.mss() as sct:
@@ -66,6 +80,20 @@ def get_screen_size():
         return monitor['width'], monitor['height'], monitor['left'], monitor['top']
 
 SCREEN_W, SCREEN_H, SCREEN_LEFT, SCREEN_TOP = get_screen_size()
+
+def pack_ocr(vals):
+    buf = [0]*MAX_OCR
+    for i, v in enumerate(vals[:MAX_OCR]):
+        buf[i] = float(v)
+    return buf
+
+def preprocess_frame(img):
+    img = letterbox(img, INPUT_W, INPUT_H)
+    detail = cv2.Laplacian(img, cv2.CV_8U)
+    stacked = np.concatenate([img, detail[..., :1]], axis=2)
+    stacked = stacked.astype(np.float32) / 255.0
+    stacked = np.transpose(stacked, (2,0,1))
+    return stacked
 
 class SEBlock(nn.Module):
     def __init__(self, channel, reduction=16):
@@ -111,7 +139,7 @@ class Brain(nn.Module):
     def __init__(self):
         super(Brain, self).__init__()
         self.initial = nn.Sequential(
-            nn.Conv2d(3, 32, 5, 2, 2, bias=False),
+            nn.Conv2d(4, 32, 5, 2, 2, bias=False),
             nn.BatchNorm2d(32),
             nn.SiLU(),
             nn.MaxPool2d(3, 2, 1)
@@ -120,6 +148,9 @@ class Brain(nn.Module):
         self.layer2 = self._make_layer(64, 128, 2, stride=2)
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
         self.avg = nn.AdaptiveAvgPool2d((1, 1))
+        self.ocr_enc = nn.Sequential(nn.Linear(MAX_OCR, 64), nn.SiLU())
+        self.gru = nn.GRU(256 + 64, 256, batch_first=True)
+        self.dir_head = nn.Linear(256, 9)
         self.fc = nn.Sequential(
             nn.Linear(256, 128),
             nn.SiLU(),
@@ -133,14 +164,21 @@ class Brain(nn.Module):
             layers.append(ResBlock(out_c, out_c))
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, ocr):
+        b, t, c, h, w = x.shape
+        x = x.view(b * t, c, h, w)
         x = self.initial(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.avg(x)
-        x = torch.flatten(x, 1)
-        return self.fc(x)
+        x = torch.flatten(x, 1).view(b, t, -1)
+        ocr_feat = self.ocr_enc(ocr)
+        seq = torch.cat([x, ocr_feat], dim=2)
+        out, _ = self.gru(seq)
+        feat = out[:, -1, :]
+        dirs = self.dir_head(feat)
+        return self.fc(feat), dirs
 
 class ExperiencePool(Dataset):
     def __init__(self):
@@ -152,27 +190,46 @@ class ExperiencePool(Dataset):
                     try:
                         parts = line.strip().split(',')
                         if len(parts) >= 6:
-                            self.data.append(parts)
-                    except: pass
-    
+                            ts = int(parts[0])
+                            img_path = parts[1]
+                            mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
+                            ocr = []
+                            if len(parts) >= 7:
+                                ocr = [float(x) for x in parts[6].split('|') if x != '']
+                            self.data.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': pack_ocr(ocr)})
+                    except:
+                        pass
+        self.data.sort(key=lambda x: x['ts'])
+
     def __len__(self):
         return len(self.data)
-    
+
     def __getitem__(self, idx):
-        item = self.data[idx]
-        img_path = item[1]
-        mx, my = float(item[2]), float(item[3])
-        click = float(item[4])
-        
-        img = cv2.imread(img_path)
-        if img is None:
-            img = np.zeros((INPUT_H, INPUT_W, 3), dtype=np.uint8)
+        seq_imgs = []
+        seq_ocr = []
+        start = max(0, idx - SEQ_LEN + 1)
+        pad = SEQ_LEN - (idx - start + 1)
+        for _ in range(pad):
+            seq_imgs.append(np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32))
+            seq_ocr.append(pack_ocr([]))
+        for j in range(start, idx + 1):
+            item = self.data[j]
+            img = cv2.imread(item['img'])
+            if img is None:
+                img = np.zeros((INPUT_H, INPUT_W, 3), dtype=np.uint8)
+            img = preprocess_frame(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            seq_imgs.append(img)
+            seq_ocr.append(item['ocr'])
+        mx, my, click = self.data[idx]['mx'], self.data[idx]['my'], self.data[idx]['click']
+        prev = self.data[idx-1] if idx > 0 else self.data[idx]
+        dx, dy = mx - prev['mx'], my - prev['my']
+        mag = (dx**2 + dy**2) ** 0.5
+        if mag < 1e-3:
+            direction = 8
         else:
-            img = cv2.resize(img, (INPUT_W, INPUT_H))
-            
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        return torch.tensor(img), torch.tensor([mx, my, click], dtype=torch.float32)
+            angle = (np.arctan2(dy, dx) + np.pi) / (2 * np.pi)
+            direction = int(angle * 8) % 8
+        return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long)
 
 class OptimizerThread(QThread):
     finished_sig = pyqtSignal()
@@ -184,32 +241,39 @@ class OptimizerThread(QThread):
             self.finished_sig.emit()
             return
             
-        dl = DataLoader(ds, batch_size=32, shuffle=True, num_workers=0)
+        dl = DataLoader(ds, batch_size=16, shuffle=True, num_workers=0)
         model = Brain().to(DEVICE)
-        
+
         opt = optim.AdamW(model.parameters(), lr=1e-3)
-        crit = nn.MSELoss()
-        
+        reg_loss = nn.SmoothL1Loss()
+        bce = nn.BCELoss()
+
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
         
         epochs = 5
         model.train()
         
         for ep in range(epochs):
-            for i, (imgs, targs) in enumerate(dl):
-                imgs, targs = imgs.to(DEVICE), targs.to(DEVICE)
+            for i, (imgs, ocrs, targs, dirs) in enumerate(dl):
+                imgs, ocrs, targs, dirs = imgs.to(DEVICE), ocrs.to(DEVICE), targs.to(DEVICE), dirs.to(DEVICE)
                 opt.zero_grad(set_to_none=True)
-                
+
                 if scaler:
                     with torch.amp.autocast('cuda'):
-                        out = model(imgs)
-                        loss = crit(out, targs)
+                        out, logits = model(imgs, ocrs)
+                        l_pos = reg_loss(out[:, :2], targs[:, :2])
+                        l_click = bce(out[:, 2], targs[:, 2])
+                        l_dir = F.cross_entropy(logits, dirs)
+                        loss = l_pos + l_click + 0.5 * l_dir
                     scaler.scale(loss).backward()
                     scaler.step(opt)
                     scaler.update()
                 else:
-                    out = model(imgs)
-                    loss = crit(out, targs)
+                    out, logits = model(imgs, ocrs)
+                    l_pos = reg_loss(out[:, :2], targs[:, :2])
+                    l_click = bce(out[:, 2], targs[:, 2])
+                    l_dir = F.cross_entropy(logits, dirs)
+                    loss = l_pos + l_click + 0.5 * l_dir
                     loss.backward()
                     opt.step()
             
@@ -263,7 +327,8 @@ class DataWorker(QThread):
                     path = os.path.join(IMG_DIR, name)
                     cv2.imwrite(path, small_img)
                     with open(LOG_FILE, 'a', encoding='utf-8') as f:
-                        f.write(f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source}\n")
+                        ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
+                        f.write(f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt}\n")
                 
                 self.queue.task_done()
             except queue.Empty:
@@ -434,16 +499,20 @@ class MainWin(QMainWindow):
         self.queue = queue.Queue()
         self.worker = DataWorker(self.queue)
         self.worker.start()
-        
+
         self.overlay = Overlay()
         self.overlay.show()
         self.worker.ocr_result.connect(self.overlay.update_vals)
-        
+        self.worker.ocr_result.connect(self.update_ocr)
+
         self.mode = "LEARNING"
         self.smooth_x, self.smooth_y = 0.5, 0.5
         self.dragging = False
         self.last_record = 0
         self.mouse_pressed = False
+        self.latest_ocr = pack_ocr([])
+        self.seq_frames = deque(maxlen=SEQ_LEN)
+        self.seq_ocr = deque(maxlen=SEQ_LEN)
         
         self.init_ui()
         self.setup_listeners()
@@ -605,6 +674,10 @@ class MainWin(QMainWindow):
         self.mode_lbl.setText(f"模式: {txt}")
         self.mode_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {c};")
 
+    def update_ocr(self, vals):
+        self.latest_ocr = pack_ocr(vals)
+        self.seq_ocr.append(self.latest_ocr)
+
     def update_stats(self):
         cpu = psutil.cpu_percent()
         mem = psutil.virtual_memory().percent
@@ -647,30 +720,39 @@ class MainWin(QMainWindow):
         try:
             img = np.array(self.sct.grab(self.monitor))
             frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            proc = preprocess_frame(rgb)
+            self.seq_frames.append(proc)
+            self.seq_ocr.append(self.latest_ocr)
+
             mx, my = self.mouse.position
             nx, ny = mx/SCREEN_W, my/SCREEN_H
             nx, ny = max(0, min(1, nx)), max(0, min(1, ny))
             click = 1.0 if self.mouse_pressed else 0.0
             source = "USER"
-            
+
             if self.mode == "TRAINING":
-                inp = cv2.resize(frame, (INPUT_W, INPUT_H))
-                inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
-                inp = torch.from_numpy(inp).permute(2,0,1).unsqueeze(0).float()/255.0
-                inp = inp.to(DEVICE)
-                
+                seq_imgs = list(self.seq_frames)
+                seq_ocr = list(self.seq_ocr)
+                while len(seq_imgs) < SEQ_LEN:
+                    seq_imgs.insert(0, np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32))
+                    seq_ocr.insert(0, pack_ocr([]))
+                seq_imgs = torch.tensor(np.stack(seq_imgs)[None, ...], dtype=torch.float32, device=DEVICE)
+                seq_ocr = torch.tensor(np.stack(seq_ocr)[None, ...], dtype=torch.float32, device=DEVICE)
+
                 with torch.no_grad():
                     if torch.cuda.is_available():
                         with torch.amp.autocast('cuda'):
-                            out = self.brain(inp)
+                            out, logits = self.brain(seq_imgs, seq_ocr)
                     else:
-                        out = self.brain(inp)
-                
+                        out, logits = self.brain(seq_imgs, seq_ocr)
+
                 px, py, pc = out[0].cpu().numpy()
-                self.smooth_x = 0.5 * self.smooth_x + 0.5 * px
-                self.smooth_y = 0.5 * self.smooth_y + 0.5 * py
-                
+                conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
+                blend = 0.3 + 0.7 * conf
+                self.smooth_x = (1 - blend) * self.smooth_x + blend * px
+                self.smooth_y = (1 - blend) * self.smooth_y + blend * py
+
                 self.mouse.position = (int(self.smooth_x * SCREEN_W), int(self.smooth_y * SCREEN_H))
                 if pc > 0.5 and not self.dragging:
                     self.mouse.press(mouse.Button.left)
@@ -689,13 +771,13 @@ class MainWin(QMainWindow):
 
             save = False
             if (self.mode == "LEARNING" and source == "USER") or (self.mode == "TRAINING" and source == "AI"):
-                if time.time() - self.last_record > 0.1: 
+                if time.time() - self.last_record > 0.1:
                     save = True
                     self.last_record = time.time()
-            
-            small = cv2.resize(frame, (INPUT_W, INPUT_H))
+
+            small = letterbox(frame, INPUT_W, INPUT_H)
             self.queue.put((frame, small, nx, ny, click, source, save))
-            
+
         except Exception: pass
 
     def close_app(self):
