@@ -290,6 +290,9 @@ class DataWorker(QThread):
         self.queue = queue
         self.running = True
         self.regions = []
+        self.prev_rois = []
+        self.prev_vals = []
+        self.prev_change = []
         self.reload_regions()
 
     def reload_regions(self):
@@ -298,6 +301,9 @@ class DataWorker(QThread):
                 self.regions = json.load(f)
         except:
             self.regions = []
+        self.prev_rois = [None] * len(self.regions)
+        self.prev_vals = [0.0] * len(self.regions)
+        self.prev_change = [0.0] * len(self.regions)
 
     def run(self):
         while self.running:
@@ -308,13 +314,33 @@ class DataWorker(QThread):
                 ocr_vals = []
                 if pytesseract and self.regions:
                     gray = cv2.cvtColor(full_img, cv2.COLOR_BGR2GRAY)
-                    for r in self.regions:
+                    for idx, r in enumerate(self.regions):
                         try:
                             roi = gray[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
+                            if idx >= len(self.prev_rois):
+                                self.prev_rois.append(None)
+                                self.prev_vals.append(0.0)
+                                self.prev_change.append(0.0)
+                            diff = 0.0
+                            if self.prev_rois[idx] is not None:
+                                d = cv2.absdiff(roi, self.prev_rois[idx])
+                                diff = float(np.mean(d)) / 255.0
+                            diff = 0.5 * self.prev_change[idx] + 0.5 * diff
+                            self.prev_change[idx] = diff
+                            self.prev_rois[idx] = roi
                             txt = pytesseract.image_to_string(roi, config='--psm 6 digits')
                             digits = ''.join(filter(str.isdigit, txt))
                             val = int(digits) if digits else 0
-                            ocr_vals.append(val)
+                            prev_v = self.prev_vals[idx]
+                            if diff < 0.02 and val == 0 and prev_v > 0:
+                                smooth = prev_v
+                            else:
+                                smooth = 0.7 * prev_v + 0.3 * val
+                            self.prev_vals[idx] = smooth
+                            weight = {'yellow': 1.6, 'red': 1.0, 'blue': 1.0, 'green': 0.6}.get(r.get('type'), 1.0)
+                            boost = {'yellow': 60.0, 'red': 40.0, 'blue': 40.0, 'green': 20.0}.get(r.get('type'), 30.0)
+                            final_v = smooth * (1 + weight * diff) + boost * diff
+                            ocr_vals.append(final_v)
                         except:
                             ocr_vals.append(0)
                     self.ocr_result.emit(ocr_vals)
@@ -327,7 +353,7 @@ class DataWorker(QThread):
                     path = os.path.join(IMG_DIR, name)
                     cv2.imwrite(path, small_img)
                     with open(LOG_FILE, 'a', encoding='utf-8') as f:
-                        ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
+                        ocr_txt = "|".join([f"{v:.2f}" for v in ocr_vals]) if ocr_vals else ""
                         f.write(f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt}\n")
                 
                 self.queue.task_done()
@@ -438,8 +464,11 @@ class RegionEditor(QDialog):
         p.setPen(QColor(0, 240, 255))
         p.setFont(QFont("SimHei", 14, QFont.Bold))
         cur_c, cur_txt = colors[self.current_type]
-        info = f"当前模式: {cur_txt} | 按键[1-4]切换类型 | 鼠标拖拽创建 | 右键删除 | 回车保存"
+        info = f"当前模式: {cur_txt} | [1-4]切换类型 | 鼠标拖拽创建 | 右键删除 | 回车保存 | ESC退出"
+        detail = ("红框=数值越小越好 | 蓝框=数值越大越好 | 黄框=波动剧烈重点关注 | "
+                  "绿框=保持稳定区域 | 请精确框选需要识别的数字或监测区域")
         p.drawText(20, 40, info)
+        p.drawText(20, 70, detail)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
