@@ -328,21 +328,30 @@ class DataWorker(QThread):
                             diff = 0.5 * self.prev_change[idx] + 0.5 * diff
                             self.prev_change[idx] = diff
                             self.prev_rois[idx] = roi
-                            txt = pytesseract.image_to_string(roi, config='--psm 6 digits')
-                            digits = ''.join(filter(str.isdigit, txt))
-                            val = int(digits) if digits else 0
                             prev_v = self.prev_vals[idx]
+                            if diff < 0.005:
+                                val = prev_v
+                            else:
+                                resized = cv2.resize(roi, (0, 0), fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
+                                normed = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
+                                blurred = cv2.GaussianBlur(normed, (3, 3), 0)
+                                _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                                if np.mean(binary) > 150:
+                                    binary = cv2.bitwise_not(binary)
+                                txt = pytesseract.image_to_string(binary, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
+                                digits = ''.join(filter(str.isdigit, txt))
+                                val = int(digits) if digits else prev_v
                             if diff < 0.02 and val == 0 and prev_v > 0:
                                 smooth = prev_v
                             else:
-                                smooth = 0.7 * prev_v + 0.3 * val
+                                smooth = 0.6 * prev_v + 0.4 * val
                             self.prev_vals[idx] = smooth
                             weight = {'yellow': 1.6, 'red': 1.0, 'blue': 1.0, 'green': 0.6}.get(r.get('type'), 1.0)
                             boost = {'yellow': 60.0, 'red': 40.0, 'blue': 40.0, 'green': 20.0}.get(r.get('type'), 30.0)
                             final_v = smooth * (1 + weight * diff) + boost * diff
                             ocr_vals.append(final_v)
                         except:
-                            ocr_vals.append(0)
+                            ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
                     self.ocr_result.emit(ocr_vals)
                 else:
                     self.ocr_result.emit([0]*len(self.regions))
