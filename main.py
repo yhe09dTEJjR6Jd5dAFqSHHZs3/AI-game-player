@@ -312,49 +312,55 @@ class DataWorker(QThread):
                 full_img, small_img, mx, my, click, source, save = data
                 
                 ocr_vals = []
-                if pytesseract and self.regions:
-                    gray = cv2.cvtColor(full_img, cv2.COLOR_BGR2GRAY)
-                    for idx, r in enumerate(self.regions):
-                        try:
-                            roi = gray[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
-                            if idx >= len(self.prev_rois):
-                                self.prev_rois.append(None)
-                                self.prev_vals.append(0.0)
-                                self.prev_change.append(0.0)
-                            diff = 0.0
-                            if self.prev_rois[idx] is not None:
-                                d = cv2.absdiff(roi, self.prev_rois[idx])
-                                diff = float(np.mean(d)) / 255.0
-                            diff = 0.5 * self.prev_change[idx] + 0.5 * diff
-                            self.prev_change[idx] = diff
-                            self.prev_rois[idx] = roi
-                            prev_v = self.prev_vals[idx]
-                            if diff < 0.005:
-                                val = prev_v
-                            else:
-                                resized = cv2.resize(roi, (0, 0), fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
-                                normed = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
-                                blurred = cv2.GaussianBlur(normed, (3, 3), 0)
-                                _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                                if np.mean(binary) > 150:
-                                    binary = cv2.bitwise_not(binary)
-                                txt = pytesseract.image_to_string(binary, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
-                                digits = ''.join(filter(str.isdigit, txt))
-                                val = int(digits) if digits else prev_v
-                            if diff < 0.02 and val == 0 and prev_v > 0:
-                                smooth = prev_v
-                            else:
-                                smooth = 0.6 * prev_v + 0.4 * val
-                            self.prev_vals[idx] = smooth
-                            weight = {'yellow': 1.6, 'red': 1.0, 'blue': 1.0, 'green': 0.6}.get(r.get('type'), 1.0)
-                            boost = {'yellow': 60.0, 'red': 40.0, 'blue': 40.0, 'green': 20.0}.get(r.get('type'), 30.0)
-                            final_v = smooth * (1 + weight * diff) + boost * diff
-                            ocr_vals.append(final_v)
-                        except:
-                            ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
+                if self.regions:
+                    if pytesseract:
+                        gray = cv2.cvtColor(full_img, cv2.COLOR_BGR2GRAY)
+                        for idx, r in enumerate(self.regions):
+                            try:
+                                roi = gray[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
+                                if idx >= len(self.prev_rois):
+                                    self.prev_rois.append(None)
+                                    self.prev_vals.append(0.0)
+                                    self.prev_change.append(0.0)
+                                diff = 0.0
+                                if self.prev_rois[idx] is not None:
+                                    d = cv2.absdiff(roi, self.prev_rois[idx])
+                                    diff = float(np.mean(d)) / 255.0
+                                diff = 0.5 * self.prev_change[idx] + 0.5 * diff
+                                self.prev_change[idx] = diff
+                                self.prev_rois[idx] = roi
+                                prev_v = self.prev_vals[idx]
+                                if diff < 0.005:
+                                    val = prev_v
+                                else:
+                                    resized = cv2.resize(roi, (0, 0), fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
+                                    normed = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
+                                    blurred = cv2.GaussianBlur(normed, (3, 3), 0)
+                                    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                                    if np.mean(binary) > 150:
+                                        binary = cv2.bitwise_not(binary)
+                                    txt = pytesseract.image_to_string(binary, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
+                                    digits = ''.join(filter(str.isdigit, txt))
+                                    val = int(digits) if digits else prev_v
+                                if diff < 0.02 and val == 0 and prev_v > 0:
+                                    smooth = prev_v
+                                else:
+                                    smooth = 0.6 * prev_v + 0.4 * val
+                                self.prev_vals[idx] = smooth
+                                weight = {'yellow': 1.6, 'red': 1.0, 'blue': 1.0, 'green': 0.6}.get(r.get('type'), 1.0)
+                                boost = {'yellow': 60.0, 'red': 40.0, 'blue': 40.0, 'green': 20.0}.get(r.get('type'), 30.0)
+                                final_v = smooth * (1 + weight * diff) + boost * diff
+                                ocr_vals.append(final_v)
+                            except:
+                                ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
+                    else:
+                        needed = len(self.regions)
+                        if len(self.prev_vals) < needed:
+                            self.prev_vals.extend([0.0] * (needed - len(self.prev_vals)))
+                        ocr_vals = list(self.prev_vals[:needed])
                     self.ocr_result.emit(ocr_vals)
                 else:
-                    self.ocr_result.emit([0]*len(self.regions))
+                    self.ocr_result.emit([])
 
                 if save:
                     ts = str(int(time.time() * 1000))
@@ -523,7 +529,7 @@ class RegionEditor(QDialog):
 class MainWin(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NEURAL INTERFACE SYSTEM")
+        self.setWindowTitle("神经接口系统")
         self.resize(1000, 600)
         self.setStyleSheet("QMainWindow {background-color: #050a0f; color: #00f0ff; font-family: 'SimHei';}")
         
@@ -593,12 +599,12 @@ class MainWin(QMainWindow):
         fl.addLayout(header)
         
         grid = QGridLayout()
-        self.lbl_cpu = QLabel("CPU: 0%")
-        self.lbl_mem = QLabel("MEM: 0%")
-        self.lbl_gpu = QLabel("GPU: 0%")
-        self.lbl_vram = QLabel("VRAM: 0GB")
-        self.lbl_disk = QLabel("DISK: 0TB")
-        self.lbl_res = QLabel("RES: 0x0")
+        self.lbl_cpu = QLabel("处理器: 0%")
+        self.lbl_mem = QLabel("内存: 0%")
+        self.lbl_gpu = QLabel("显卡: 0%")
+        self.lbl_vram = QLabel("显存: 0GB")
+        self.lbl_disk = QLabel("磁盘: 0TB")
+        self.lbl_res = QLabel("分辨率: 0x0")
         
         for i, l in enumerate([self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_disk, self.lbl_res]):
             l.setStyleSheet("color: #00f0ff; font-size: 14px; padding: 5px;")
@@ -606,9 +612,9 @@ class MainWin(QMainWindow):
         fl.addLayout(grid)
         
         gl = QGridLayout()
-        self.p_cpu = SciFiPlot("CPU", '#00ff00')
+        self.p_cpu = SciFiPlot("处理器", '#00ff00')
         self.p_mem = SciFiPlot("内存", '#00ffff')
-        self.p_gpu = SciFiPlot("GPU", '#ff0055')
+        self.p_gpu = SciFiPlot("显卡", '#ff0055')
         self.p_vram = SciFiPlot("显存", '#ffaa00')
         
         self.d_cpu, self.d_mem, self.d_gpu, self.d_vram = [], [], [], []
@@ -736,12 +742,12 @@ class MainWin(QMainWindow):
                 scale = ctypes.windll.shcore.GetScaleFactorForDevice(0)
             except: pass
             
-        self.lbl_cpu.setText(f"CPU: {cpu}%")
-        self.lbl_mem.setText(f"MEM: {mem}%")
-        self.lbl_gpu.setText(f"GPU: {gpu_u}%")
-        self.lbl_vram.setText(f"VRAM: {vram_u/1024:.1f}/{vram_t/1024:.1f}GB")
-        self.lbl_disk.setText(f"DISK: {disk.free/(1024**4):.2f}TB")
-        self.lbl_res.setText(f"RES: {SCREEN_W}x{SCREEN_H} ({scale}%)")
+        self.lbl_cpu.setText(f"处理器: {cpu}%")
+        self.lbl_mem.setText(f"内存: {mem}%")
+        self.lbl_gpu.setText(f"显卡: {gpu_u}%")
+        self.lbl_vram.setText(f"显存: {vram_u/1024:.1f}/{vram_t/1024:.1f}GB")
+        self.lbl_disk.setText(f"磁盘可用: {disk.free/(1024**4):.2f}TB")
+        self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
         
         for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100]):
             l.pop(0)
