@@ -36,8 +36,10 @@ if os.name == 'nt':
         pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
 try:
-    torch.set_float32_matmul_precision('medium')
-except:
+    if torch.cuda.is_available():
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
+except Exception:
     pass
 
 BASE_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "AAA")
@@ -302,7 +304,7 @@ class DataWorker(QThread):
         except:
             self.regions = []
         self.prev_rois = [None] * len(self.regions)
-        self.prev_vals = [0.0] * len(self.regions)
+        self.prev_vals = [0] * len(self.regions)
         self.prev_change = [0.0] * len(self.regions)
 
     def run(self):
@@ -320,7 +322,7 @@ class DataWorker(QThread):
                                 roi = gray[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
                                 if idx >= len(self.prev_rois):
                                     self.prev_rois.append(None)
-                                    self.prev_vals.append(0.0)
+                                    self.prev_vals.append(0)
                                     self.prev_change.append(0.0)
                                 diff = 0.0
                                 if self.prev_rois[idx] is not None:
@@ -329,7 +331,7 @@ class DataWorker(QThread):
                                 diff = 0.5 * self.prev_change[idx] + 0.5 * diff
                                 self.prev_change[idx] = diff
                                 self.prev_rois[idx] = roi
-                                prev_v = self.prev_vals[idx]
+                                prev_v = int(self.prev_vals[idx])
                                 if diff < 0.005:
                                     val = prev_v
                                 else:
@@ -343,20 +345,16 @@ class DataWorker(QThread):
                                     digits = ''.join(filter(str.isdigit, txt))
                                     val = int(digits) if digits else prev_v
                                 if diff < 0.02 and val == 0 and prev_v > 0:
-                                    smooth = prev_v
-                                else:
-                                    smooth = 0.6 * prev_v + 0.4 * val
-                                self.prev_vals[idx] = smooth
-                                weight = {'yellow': 1.6, 'red': 1.0, 'blue': 1.0, 'green': 0.6}.get(r.get('type'), 1.0)
-                                boost = {'yellow': 60.0, 'red': 40.0, 'blue': 40.0, 'green': 20.0}.get(r.get('type'), 30.0)
-                                final_v = smooth * (1 + weight * diff) + boost * diff
+                                    val = prev_v
+                                final_v = max(0, int(round(val)))
+                                self.prev_vals[idx] = final_v
                                 ocr_vals.append(final_v)
                             except:
                                 ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
                     else:
                         needed = len(self.regions)
                         if len(self.prev_vals) < needed:
-                            self.prev_vals.extend([0.0] * (needed - len(self.prev_vals)))
+                            self.prev_vals.extend([0] * (needed - len(self.prev_vals)))
                         ocr_vals = list(self.prev_vals[:needed])
                     self.ocr_result.emit(ocr_vals)
                 else:
@@ -368,7 +366,7 @@ class DataWorker(QThread):
                     path = os.path.join(IMG_DIR, name)
                     cv2.imwrite(path, small_img)
                     with open(LOG_FILE, 'a', encoding='utf-8') as f:
-                        ocr_txt = "|".join([f"{v:.2f}" for v in ocr_vals]) if ocr_vals else ""
+                        ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
                         f.write(f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt}\n")
                 
                 self.queue.task_done()
