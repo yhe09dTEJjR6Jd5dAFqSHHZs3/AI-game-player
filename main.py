@@ -297,6 +297,7 @@ class DataWorker(QThread):
         self.prev_change = []
         self.histories = []
         self.last_read_tick = []
+        self.stable_counts = []
         self.tick = 0
         self.reload_regions()
 
@@ -311,6 +312,7 @@ class DataWorker(QThread):
         self.prev_change = [0.0] * len(self.regions)
         self.histories = [deque(maxlen=5) for _ in self.regions]
         self.last_read_tick = [0] * len(self.regions)
+        self.stable_counts = [0] * len(self.regions)
 
     def run(self):
         while self.running:
@@ -332,6 +334,7 @@ class DataWorker(QThread):
                                     self.prev_change.append(0.0)
                                     self.histories.append(deque(maxlen=5))
                                     self.last_read_tick.append(0)
+                                    self.stable_counts.append(0)
                                 diff = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
                                 diff = 0.5 * self.prev_change[idx] + 0.5 * diff
                                 self.prev_change[idx] = diff
@@ -347,6 +350,11 @@ class DataWorker(QThread):
                                         binary = cv2.bitwise_not(binary)
                                     txt = pytesseract.image_to_string(binary, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
                                     digits = ''.join(filter(str.isdigit, txt))
+                                    if not digits:
+                                        flipped = cv2.bitwise_not(binary)
+                                        alt = cv2.adaptiveThreshold(flipped, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+                                        txt = pytesseract.image_to_string(alt, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
+                                        digits = ''.join(filter(str.isdigit, txt))
                                     self.last_read_tick[idx] = self.tick
                                     candidate = int(digits) if digits else prev_v
                                 else:
@@ -355,10 +363,15 @@ class DataWorker(QThread):
                                     candidate = 0
                                 self.histories[idx].append(candidate)
                                 smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else candidate
-                                if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01:
+                                stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
+                                if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
                                     smoothed = prev_v
                                 final_v = max(0, smoothed)
                                 self.prev_vals[idx] = final_v
+                                if final_v == prev_v:
+                                    self.stable_counts[idx] = stable + 1
+                                else:
+                                    self.stable_counts[idx] = 0
                                 ocr_vals.append(final_v)
                             except:
                                 ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
