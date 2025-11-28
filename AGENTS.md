@@ -24,7 +24,7 @@ AI对变化幅度大的区域更加敏感。
 cuDNN版本：8.9.7
 Python版本：3.10.11
 操作系统：Windows 11
-PaddleOCR版本：v3.3.2
+PaddleOCR版本：v2.6.1
 CUDA Toolkit版本：11.8
 
 要求：
