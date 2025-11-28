@@ -68,12 +68,37 @@ def letterbox(img, new_w, new_h):
     canvas[top:top+nh, left:left+nw] = resized
     return canvas
 
+def compute_letterbox_params(src_w, src_h, dst_w, dst_h):
+    scale = min(dst_w / src_w, dst_h / src_h)
+    resized_w, resized_h = int(src_w * scale), int(src_h * scale)
+    left = (dst_w - resized_w) // 2
+    top = (dst_h - resized_h) // 2
+    return scale, left, top, resized_w, resized_h
+
 def get_screen_size():
     with mss.mss() as sct:
         monitor = sct.monitors[1]
         return monitor['width'], monitor['height'], monitor['left'], monitor['top']
 
 SCREEN_W, SCREEN_H, SCREEN_LEFT, SCREEN_TOP = get_screen_size()
+LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H = compute_letterbox_params(SCREEN_W, SCREEN_H, INPUT_W, INPUT_H)
+
+def clamp01(v):
+    return max(0.0, min(1.0, v))
+
+def screen_to_letter_norm(x, y):
+    lx = (x - SCREEN_LEFT) * LB_SCALE + LB_LEFT
+    ly = (y - SCREEN_TOP) * LB_SCALE + LB_TOP
+    return clamp01(lx / INPUT_W), clamp01(ly / INPUT_H)
+
+def letter_norm_to_screen(nx, ny):
+    lx = clamp01(nx) * INPUT_W
+    ly = clamp01(ny) * INPUT_H
+    sx = (lx - LB_LEFT) / LB_SCALE + SCREEN_LEFT
+    sy = (ly - LB_TOP) / LB_SCALE + SCREEN_TOP
+    sx = max(SCREEN_LEFT, min(SCREEN_LEFT + SCREEN_W - 1, sx))
+    sy = max(SCREEN_TOP, min(SCREEN_TOP + SCREEN_H - 1, sy))
+    return sx, sy
 
 def pack_ocr(vals, deltas=None):
     buf = [0]*MAX_OCR
@@ -156,7 +181,7 @@ class Brain(nn.Module):
             nn.Linear(128, 3),
             nn.Sigmoid()
         )
-        self.delta_head = nn.Sequential(nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 4), nn.Tanh())
+        self.delta_head = nn.Sequential(nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 6), nn.Tanh())
 
     def _make_layer(self, in_c, out_c, blocks, stride):
         layers = [ResBlock(in_c, out_c, stride)]
@@ -281,9 +306,11 @@ class ExperiencePool(Dataset):
             direction = int(angle * 8) % 8
         next1 = self.data[min(len(self.data)-1, idx+1)]
         next2 = self.data[min(len(self.data)-1, idx+2)]
+        next3 = self.data[min(len(self.data)-1, idx+3)]
         d1 = torch.tensor([next1['mx']-mx, next1['my']-my], dtype=torch.float32)
-        d2 = torch.tensor([next2['mx']-next1['mx'], next2['my']-next1['my']], dtype=torch.float32)
-        delta_target = torch.cat([d1, d2])
+        d2 = torch.tensor([next2['mx']-mx, next2['my']-my], dtype=torch.float32)
+        d3 = torch.tensor([next3['mx']-mx, next3['my']-my], dtype=torch.float32)
+        delta_target = torch.cat([d1, d2, d3])
         w = torch.tensor(self.data[idx]['weight'], dtype=torch.float32)
         return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w
 
@@ -348,13 +375,50 @@ class OptimizerThread(QThread):
         torch.save(model.state_dict(), weight_path)
         self.finished_sig.emit()
 
+class SaveWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.q = queue.Queue()
+        self.running = True
+
+    def enqueue(self, path, img, log_line):
+        self.q.put((path, img, log_line))
+
+    def run(self):
+        while self.running or not self.q.empty():
+            try:
+                path, img, log_line = self.q.get(timeout=0.1)
+                try:
+                    cv2.imwrite(path, img)
+                except Exception:
+                    pass
+                try:
+                    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+                        f.write(log_line)
+                except Exception:
+                    pass
+                self.q.task_done()
+            except queue.Empty:
+                continue
+
+    def stop(self):
+        self.running = False
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+                self.q.task_done()
+            except queue.Empty:
+                break
+
 class DataWorker(QThread):
     ocr_result = pyqtSignal(list)
-    
+
     def __init__(self, queue):
         super().__init__()
         self.queue = queue
         self.running = True
+        self.save_worker = SaveWorker()
+        self.save_worker.start()
         self.regions = []
         self.prev_rois = []
         self.prev_vals = []
@@ -440,11 +504,10 @@ class DataWorker(QThread):
                     ts = str(int(time.time() * 1000))
                     name = f"{ts}.jpg"
                     path = os.path.join(IMG_DIR, name)
-                    cv2.imwrite(path, small_img)
-                    with open(LOG_FILE, 'a', encoding='utf-8') as f:
-                        ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
-                        f.write(f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt}\n")
-                
+                    ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
+                    log_line = f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt}\n"
+                    self.save_worker.enqueue(path, small_img, log_line)
+
                 self.queue.task_done()
             except queue.Empty:
                 pass
@@ -453,6 +516,8 @@ class DataWorker(QThread):
 
     def stop(self):
         self.running = False
+        self.save_worker.stop()
+        self.save_worker.join()
         self.wait()
 
 class SciFiPlot(pg.PlotWidget):
@@ -629,7 +694,7 @@ class MainWin(QMainWindow):
         self.release_thresh = 0.3
         self.min_press = 0.12
         self.last_press_time = 0.0
-        self.plan_queue = deque(maxlen=4)
+        self.plan_queue = deque(maxlen=6)
         
         self.init_ui()
         self.setup_listeners()
@@ -791,6 +856,23 @@ class MainWin(QMainWindow):
         self.mode_lbl.setText(f"模式: {txt}")
         self.mode_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {c};")
 
+    def build_path(self, base_target, delta_pred):
+        start = np.array([self.smooth_x, self.smooth_y], dtype=np.float32)
+        cp1 = start + delta_pred[:2]
+        cp2 = start + delta_pred[2:4]
+        end = start + delta_pred[4:6]
+        base = np.array(base_target, dtype=np.float32)
+        end = 0.5 * end + 0.5 * base
+
+        def bezier(t):
+            return ((1-t)**3) * start + 3 * ((1-t)**2) * t * cp1 + 3 * (1-t) * (t**2) * cp2 + (t**3) * end
+
+        pts = []
+        for t in np.linspace(0.25, 1.0, 4):
+            p = bezier(t)
+            pts.append((float(clamp01(p[0])), float(clamp01(p[1]))))
+        return pts
+
     def update_ocr(self, vals):
         full_vals = [0]*MAX_OCR
         deltas = [0]*MAX_OCR
@@ -850,8 +932,7 @@ class MainWin(QMainWindow):
             self.seq_ocr.append(self.latest_ocr)
 
             mx, my = self.mouse.position
-            nx, ny = mx/SCREEN_W, my/SCREEN_H
-            nx, ny = max(0, min(1, nx)), max(0, min(1, ny))
+            nx, ny = screen_to_letter_norm(mx, my)
             click = 1.0 if self.mouse_pressed else 0.0
             source = "USER"
 
@@ -874,21 +955,20 @@ class MainWin(QMainWindow):
                 px, py, pc = out[0].cpu().numpy()
                 delta_pred = delta_out[0].cpu().numpy()
                 self.plan_queue.clear()
-                self.plan_queue.append((delta_pred[0], delta_pred[1]))
-                self.plan_queue.append((delta_pred[2], delta_pred[3]))
+                for pt in self.build_path((px, py), delta_pred):
+                    self.plan_queue.append(pt)
                 conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
                 blend = 0.3 + 0.7 * conf
                 target_x, target_y = px, py
                 if self.plan_queue:
-                    dx, dy = self.plan_queue.popleft()
-                    target_x += dx
-                    target_y += dy
-                target_x = max(0, min(1, target_x))
-                target_y = max(0, min(1, target_y))
+                    target_x, target_y = self.plan_queue.popleft()
+                target_x = clamp01(target_x)
+                target_y = clamp01(target_y)
                 self.smooth_x = (1 - blend) * self.smooth_x + blend * target_x
                 self.smooth_y = (1 - blend) * self.smooth_y + blend * target_y
 
-                self.mouse.position = (int(self.smooth_x * SCREEN_W), int(self.smooth_y * SCREEN_H))
+                sx, sy = letter_norm_to_screen(self.smooth_x, self.smooth_y)
+                self.mouse.position = (int(sx), int(sy))
                 now = time.time()
                 if not self.dragging and pc >= self.press_thresh:
                     self.mouse.press(mouse.Button.left)
