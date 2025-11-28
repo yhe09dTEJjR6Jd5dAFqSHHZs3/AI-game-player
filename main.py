@@ -75,11 +75,15 @@ def get_screen_size():
 
 SCREEN_W, SCREEN_H, SCREEN_LEFT, SCREEN_TOP = get_screen_size()
 
-def pack_ocr(vals):
+def pack_ocr(vals, deltas=None):
     buf = [0]*MAX_OCR
     for i, v in enumerate(vals[:MAX_OCR]):
         buf[i] = float(v)
-    return buf
+    delta_buf = [0]*MAX_OCR
+    if deltas is not None:
+        for i, v in enumerate(deltas[:MAX_OCR]):
+            delta_buf[i] = float(v)
+    return buf + delta_buf
 
 def preprocess_frame(img):
     img = letterbox(img, INPUT_W, INPUT_H)
@@ -142,7 +146,8 @@ class Brain(nn.Module):
         self.layer2 = self._make_layer(64, 128, 2, stride=2)
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
         self.avg = nn.AdaptiveAvgPool2d((1, 1))
-        self.ocr_enc = nn.Sequential(nn.Linear(MAX_OCR, 64), nn.SiLU())
+        self.ocr_enc = nn.Sequential(nn.Linear(MAX_OCR*2, 128), nn.SiLU(), nn.Linear(128, 64), nn.SiLU())
+        self.ocr_attn = nn.MultiheadAttention(64, 4, batch_first=True)
         self.gru = nn.GRU(256 + 64, 256, batch_first=True)
         self.dir_head = nn.Linear(256, 9)
         self.fc = nn.Sequential(
@@ -151,6 +156,7 @@ class Brain(nn.Module):
             nn.Linear(128, 3),
             nn.Sigmoid()
         )
+        self.delta_head = nn.Sequential(nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 4), nn.Tanh())
 
     def _make_layer(self, in_c, out_c, blocks, stride):
         layers = [ResBlock(in_c, out_c, stride)]
@@ -168,18 +174,30 @@ class Brain(nn.Module):
         x = self.avg(x)
         x = torch.flatten(x, 1).view(b, t, -1)
         ocr_feat = self.ocr_enc(ocr)
+        attn, _ = self.ocr_attn(ocr_feat, ocr_feat, ocr_feat)
+        ocr_feat = 0.5 * (ocr_feat + attn)
         seq = torch.cat([x, ocr_feat], dim=2)
         out, _ = self.gru(seq)
         feat = out[:, -1, :]
         dirs = self.dir_head(feat)
-        return self.fc(feat), dirs
+        return self.fc(feat), dirs, self.delta_head(feat)
 
 class ExperiencePool(Dataset):
     def __init__(self):
         self.data = []
+        self.cache = {}
+        self.cache_order = deque()
+        self.cache_limit = 2000
+        try:
+            with open(REGION_FILE, 'r', encoding='utf-8') as f:
+                regions = json.load(f)
+                self.region_types = [r.get('type', 'red') for r in regions]
+        except:
+            self.region_types = []
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, 'r', encoding='utf-8') as f:
                 lines = f.readlines()[1:]
+                prev_vals = [0]*len(self.region_types)
                 for line in lines:
                     try:
                         parts = line.strip().split(',')
@@ -190,10 +208,51 @@ class ExperiencePool(Dataset):
                             ocr = []
                             if len(parts) >= 7:
                                 ocr = [float(x) for x in parts[6].split('|') if x != '']
-                            self.data.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': pack_ocr(ocr)})
+                            deltas = []
+                            if self.region_types:
+                                cur_vals = ocr[:len(self.region_types)] + [0]*max(0, len(self.region_types)-len(ocr))
+                                deltas = [cur_vals[i] - prev_vals[i] for i in range(len(self.region_types))]
+                                prev_vals = cur_vals
+                            feat = pack_ocr(ocr, deltas)
+                            weight = self.calc_weight(ocr, deltas)
+                            self.data.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight})
                     except:
                         pass
         self.data.sort(key=lambda x: x['ts'])
+
+    def calc_weight(self, ocr, deltas):
+        if not self.region_types or not ocr:
+            return 1.0
+        score = 0.0
+        total = 0.0
+        for idx, t in enumerate(self.region_types):
+            if idx < len(deltas):
+                d = deltas[idx]
+                total += abs(d)
+                if t == 'blue':
+                    score += d
+                else:
+                    score -= d
+        norm = total + 1e-3
+        base = 1.0 + score/(norm*2)
+        if score < 0:
+            base *= 0.5
+        return max(0.05, base)
+
+    def cache_image(self, path):
+        if path in self.cache:
+            return self.cache[path]
+        img = cv2.imread(path)
+        if img is None:
+            img = np.zeros((INPUT_H, INPUT_W, 3), dtype=np.uint8)
+        img = preprocess_frame(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        self.cache[path] = img
+        self.cache_order.append(path)
+        if len(self.cache_order) > self.cache_limit:
+            old = self.cache_order.popleft()
+            if old in self.cache:
+                del self.cache[old]
+        return img
 
     def __len__(self):
         return len(self.data)
@@ -208,10 +267,7 @@ class ExperiencePool(Dataset):
             seq_ocr.append(pack_ocr([]))
         for j in range(start, idx + 1):
             item = self.data[j]
-            img = cv2.imread(item['img'])
-            if img is None:
-                img = np.zeros((INPUT_H, INPUT_W, 3), dtype=np.uint8)
-            img = preprocess_frame(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            img = self.cache_image(item['img'])
             seq_imgs.append(img)
             seq_ocr.append(item['ocr'])
         mx, my, click = self.data[idx]['mx'], self.data[idx]['my'], self.data[idx]['click']
@@ -223,7 +279,13 @@ class ExperiencePool(Dataset):
         else:
             angle = (np.arctan2(dy, dx) + np.pi) / (2 * np.pi)
             direction = int(angle * 8) % 8
-        return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long)
+        next1 = self.data[min(len(self.data)-1, idx+1)]
+        next2 = self.data[min(len(self.data)-1, idx+2)]
+        d1 = torch.tensor([next1['mx']-mx, next1['my']-my], dtype=torch.float32)
+        d2 = torch.tensor([next2['mx']-next1['mx'], next2['my']-next1['my']], dtype=torch.float32)
+        delta_target = torch.cat([d1, d2])
+        w = torch.tensor(self.data[idx]['weight'], dtype=torch.float32)
+        return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w
 
 class OptimizerThread(QThread):
     finished_sig = pyqtSignal()
@@ -237,43 +299,53 @@ class OptimizerThread(QThread):
             
         dl = DataLoader(ds, batch_size=16, shuffle=True, num_workers=0)
         model = Brain().to(DEVICE)
+        weight_path = os.path.join(MODEL_DIR, "brain.pth")
+        if os.path.exists(weight_path):
+            try:
+                model.load_state_dict(torch.load(weight_path, map_location=DEVICE))
+            except:
+                pass
 
-        opt = optim.AdamW(model.parameters(), lr=1e-3)
-        reg_loss = nn.SmoothL1Loss()
-        bce = nn.BCELoss()
+        opt = optim.AdamW(model.parameters(), lr=8e-4)
+        reg_loss = nn.SmoothL1Loss(reduction='none')
+        bce = nn.BCELoss(reduction='none')
 
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
-        
-        epochs = 5
+
+        epochs = 3 if os.path.exists(weight_path) else 5
         model.train()
-        
+
         for ep in range(epochs):
-            for i, (imgs, ocrs, targs, dirs) in enumerate(dl):
-                imgs, ocrs, targs, dirs = imgs.to(DEVICE), ocrs.to(DEVICE), targs.to(DEVICE), dirs.to(DEVICE)
+            for i, (imgs, ocrs, targs, dirs, delta_t, ws) in enumerate(dl):
+                imgs, ocrs, targs, dirs, delta_t, ws = imgs.to(DEVICE), ocrs.to(DEVICE), targs.to(DEVICE), dirs.to(DEVICE), delta_t.to(DEVICE), ws.to(DEVICE)
                 opt.zero_grad(set_to_none=True)
 
                 if scaler:
                     with torch.amp.autocast('cuda'):
-                        out, logits = model(imgs, ocrs)
-                        l_pos = reg_loss(out[:, :2], targs[:, :2])
+                        out, logits, delta_out = model(imgs, ocrs)
+                        l_pos = reg_loss(out[:, :2], targs[:, :2]).mean(dim=1)
                         l_click = bce(out[:, 2], targs[:, 2])
-                        l_dir = F.cross_entropy(logits, dirs)
-                        loss = l_pos + l_click + 0.5 * l_dir
+                        l_dir = F.cross_entropy(logits, dirs, reduction='none')
+                        l_delta = reg_loss(delta_out, delta_t).mean(dim=1)
+                        comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta
+                        loss = (comb * ws).sum() / (ws.sum() + 1e-6)
                     scaler.scale(loss).backward()
                     scaler.step(opt)
                     scaler.update()
                 else:
-                    out, logits = model(imgs, ocrs)
-                    l_pos = reg_loss(out[:, :2], targs[:, :2])
+                    out, logits, delta_out = model(imgs, ocrs)
+                    l_pos = reg_loss(out[:, :2], targs[:, :2]).mean(dim=1)
                     l_click = bce(out[:, 2], targs[:, 2])
-                    l_dir = F.cross_entropy(logits, dirs)
-                    loss = l_pos + l_click + 0.5 * l_dir
+                    l_dir = F.cross_entropy(logits, dirs, reduction='none')
+                    l_delta = reg_loss(delta_out, delta_t).mean(dim=1)
+                    comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta
+                    loss = (comb * ws).sum() / (ws.sum() + 1e-6)
                     loss.backward()
                     opt.step()
-            
+
             self.progress_sig.emit(int((ep + 1) / epochs * 100))
-            
-        torch.save(model.state_dict(), os.path.join(MODEL_DIR, "brain.pth"))
+
+        torch.save(model.state_dict(), weight_path)
         self.finished_sig.emit()
 
 class DataWorker(QThread):
@@ -328,12 +400,12 @@ class DataWorker(QThread):
                                 self.histories.append(deque(maxlen=5))
                                 self.last_read_tick.append(0)
                                 self.stable_counts.append(0)
-                            diff = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
-                            diff = 0.5 * self.prev_change[idx] + 0.5 * diff
+                            raw = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
+                            diff = 0.3 * self.prev_change[idx] + 0.7 * raw
                             self.prev_change[idx] = diff
                             self.prev_rois[idx] = roi
                             prev_v = self.prev_vals[idx]
-                            need_read = diff >= 0.003 or prev_v is None or self.tick - self.last_read_tick[idx] >= 5
+                            need_read = diff >= 0.002 or prev_v is None or self.tick - self.last_read_tick[idx] >= 3
                             if need_read:
                                 result = self.ocr.ocr(roi, cls=False)
                                 digits = ''
@@ -403,9 +475,7 @@ class Overlay(QWidget):
         self.values = []
         self.colors = {
             'red': QColor(255, 50, 50),
-            'blue': QColor(50, 50, 255),
-            'yellow': QColor(255, 255, 50),
-            'green': QColor(50, 255, 50)
+            'blue': QColor(50, 50, 255)
         }
         self.reload()
 
@@ -461,9 +531,7 @@ class RegionEditor(QDialog):
         
         colors = {
             'red': (QColor(255, 50, 50), "红框(越小越好)"),
-            'blue': (QColor(50, 50, 255), "蓝框(越大越好)"),
-            'yellow': (QColor(255, 255, 50), "黄框(波动大)"),
-            'green': (QColor(50, 255, 50), "绿框(波动小)")
+            'blue': (QColor(50, 50, 255), "蓝框(越大越好)")
         }
         
         for r in self.regions:
@@ -481,9 +549,8 @@ class RegionEditor(QDialog):
         p.setPen(QColor(0, 240, 255))
         p.setFont(QFont("SimHei", 14, QFont.Bold))
         cur_c, cur_txt = colors[self.current_type]
-        info = f"当前模式: {cur_txt} | [1-4]切换类型 | 鼠标拖拽创建 | 右键删除 | 回车保存 | ESC退出"
-        detail = ("红框=数值越小越好 | 蓝框=数值越大越好 | 黄框=波动剧烈重点关注 | "
-                  "绿框=保持稳定区域 | 请精确框选需要识别的数字或监测区域")
+        info = f"当前模式: {cur_txt} | [1-2]切换类型 | 鼠标拖拽创建 | 右键删除 | 回车保存 | ESC退出"
+        detail = "红框=数值越小越好 | 蓝框=数值越大越好 | 请精确框选需要识别的数字或监测区域"
         p.drawText(20, 40, info)
         p.drawText(20, 70, detail)
 
@@ -518,8 +585,6 @@ class RegionEditor(QDialog):
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_1: self.current_type = 'red'
         elif e.key() == Qt.Key_2: self.current_type = 'blue'
-        elif e.key() == Qt.Key_3: self.current_type = 'yellow'
-        elif e.key() == Qt.Key_4: self.current_type = 'green'
         elif e.key() in [Qt.Key_Return, Qt.Key_Enter]:
             with open(REGION_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.regions, f)
@@ -557,8 +622,14 @@ class MainWin(QMainWindow):
         self.last_record = 0
         self.mouse_pressed = False
         self.latest_ocr = pack_ocr([])
+        self.prev_ocr_vals = [0]*MAX_OCR
         self.seq_frames = deque(maxlen=SEQ_LEN)
         self.seq_ocr = deque(maxlen=SEQ_LEN)
+        self.press_thresh = 0.7
+        self.release_thresh = 0.3
+        self.min_press = 0.12
+        self.last_press_time = 0.0
+        self.plan_queue = deque(maxlen=4)
         
         self.init_ui()
         self.setup_listeners()
@@ -721,7 +792,14 @@ class MainWin(QMainWindow):
         self.mode_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {c};")
 
     def update_ocr(self, vals):
-        self.latest_ocr = pack_ocr(vals)
+        full_vals = [0]*MAX_OCR
+        deltas = [0]*MAX_OCR
+        for i in range(MAX_OCR):
+            v = vals[i] if i < len(vals) else 0
+            full_vals[i] = v
+            deltas[i] = v - self.prev_ocr_vals[i]
+            self.prev_ocr_vals[i] = v
+        self.latest_ocr = pack_ocr(full_vals, deltas)
         self.seq_ocr.append(self.latest_ocr)
 
     def update_stats(self):
@@ -789,25 +867,38 @@ class MainWin(QMainWindow):
                 with torch.no_grad():
                     if torch.cuda.is_available():
                         with torch.amp.autocast('cuda'):
-                            out, logits = self.brain(seq_imgs, seq_ocr)
+                            out, logits, delta_out = self.brain(seq_imgs, seq_ocr)
                     else:
-                        out, logits = self.brain(seq_imgs, seq_ocr)
+                        out, logits, delta_out = self.brain(seq_imgs, seq_ocr)
 
                 px, py, pc = out[0].cpu().numpy()
+                delta_pred = delta_out[0].cpu().numpy()
+                self.plan_queue.clear()
+                self.plan_queue.append((delta_pred[0], delta_pred[1]))
+                self.plan_queue.append((delta_pred[2], delta_pred[3]))
                 conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
                 blend = 0.3 + 0.7 * conf
-                self.smooth_x = (1 - blend) * self.smooth_x + blend * px
-                self.smooth_y = (1 - blend) * self.smooth_y + blend * py
+                target_x, target_y = px, py
+                if self.plan_queue:
+                    dx, dy = self.plan_queue.popleft()
+                    target_x += dx
+                    target_y += dy
+                target_x = max(0, min(1, target_x))
+                target_y = max(0, min(1, target_y))
+                self.smooth_x = (1 - blend) * self.smooth_x + blend * target_x
+                self.smooth_y = (1 - blend) * self.smooth_y + blend * target_y
 
                 self.mouse.position = (int(self.smooth_x * SCREEN_W), int(self.smooth_y * SCREEN_H))
-                if pc > 0.5 and not self.dragging:
+                now = time.time()
+                if not self.dragging and pc >= self.press_thresh:
                     self.mouse.press(mouse.Button.left)
                     self.dragging = True
-                elif pc <= 0.5 and self.dragging:
+                    self.last_press_time = now
+                elif self.dragging and pc <= self.release_thresh and now - self.last_press_time >= self.min_press:
                     self.mouse.release(mouse.Button.left)
                     self.dragging = False
-                
-                nx, ny, click = self.smooth_x, self.smooth_y, pc
+
+                nx, ny, click = self.smooth_x, self.smooth_y, (1.0 if self.dragging else 0.0)
                 source = "AI"
             else:
                 self.smooth_x, self.smooth_y = nx, ny
