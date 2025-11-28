@@ -203,7 +203,7 @@ class Brain(nn.Module):
             nn.Linear(128, 3),
             nn.Sigmoid()
         )
-        self.delta_head = nn.Sequential(nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 6), nn.Tanh())
+        self.delta_head = nn.Sequential(nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 2), nn.Tanh())
 
     def _make_layer(self, in_c, out_c, blocks, stride):
         layers = [ResBlock(in_c, out_c, stride)]
@@ -462,7 +462,8 @@ class DataWorker(QThread):
         self.last_read_tick = []
         self.stable_counts = []
         self.tick = 0
-        self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=torch.cuda.is_available())
+        use_gpu = torch.cuda.is_available()
+        self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=use_gpu, gpu_mem=500 if use_gpu else 0)
         self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.ocr_lock = threading.Lock()
         self.ocr_tasks = []
@@ -746,11 +747,9 @@ class MainWin(QMainWindow):
         self.brain = Brain().to(DEVICE)
         self.load_model()
         
-        self.sct = mss.mss()
-        self.monitor = self.sct.monitors[1]
         self.mouse = mouse.Controller()
-        
-        self.queue = queue.Queue()
+
+        self.queue = queue.Queue(maxsize=1)
         self.worker = DataWorker(self.queue)
         self.worker.start()
 
@@ -772,10 +771,8 @@ class MainWin(QMainWindow):
         self.release_thresh = 0.3
         self.min_press = 0.12
         self.last_press_time = 0.0
-        self.plan_queue = deque(maxlen=6)
         self.release_frames = 0
         self.press_frames = 0
-        self.replan_thresh = 0.05
         self.nvml_checked = False
         self.nvml_handle = None
         self.startup_info = None
@@ -966,23 +963,6 @@ class MainWin(QMainWindow):
     def update_opt_status(self, text):
         self.bar.setFormat(f"{text} - %p%")
 
-    def build_path(self, base_target, delta_pred):
-        start = np.array([self.smooth_x, self.smooth_y], dtype=np.float32)
-        cp1 = start + delta_pred[:2]
-        cp2 = start + delta_pred[2:4]
-        end = start + delta_pred[4:6]
-        base = np.array(base_target, dtype=np.float32)
-        end = 0.5 * end + 0.5 * base
-
-        def bezier(t):
-            return ((1-t)**3) * start + 3 * ((1-t)**2) * t * cp1 + 3 * (1-t) * (t**2) * cp2 + (t**3) * end
-
-        pts = []
-        for t in np.linspace(0.25, 1.0, 4):
-            p = bezier(t)
-            pts.append((float(clamp01(p[0])), float(clamp01(p[1]))))
-        return pts
-
     def update_ocr(self, vals):
         full_vals = [0]*MAX_OCR
         deltas = [0]*MAX_OCR
@@ -1062,9 +1042,11 @@ class MainWin(QMainWindow):
 
     def loop(self):
         if self.mode in ["OPTIMIZING", "SELECT"]: return
-        
+
         try:
-            img = np.array(self.sct.grab(self.monitor))
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                img = np.array(sct.grab(monitor))
             frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             proc = preprocess_frame(rgb)
@@ -1094,23 +1076,14 @@ class MainWin(QMainWindow):
 
                 px, py, pc = out[0].cpu().numpy()
                 delta_pred = delta_out[0].cpu().numpy()
-                new_pts = self.build_path((px, py), delta_pred)
-                need_replan = len(self.plan_queue) == 0
-                if not need_replan:
-                    lx, ly = self.plan_queue[-1]
-                    if (lx - px) ** 2 + (ly - py) ** 2 > self.replan_thresh:
-                        need_replan = True
-                if need_replan:
-                    self.plan_queue.clear()
-                for pt in new_pts:
-                    self.plan_queue.append(pt)
+                dx, dy = float(delta_pred[0]), float(delta_pred[1])
+                base_x, base_y = clamp01(float(px)), clamp01(float(py))
+                delta_x = clamp01(self.smooth_x + dx)
+                delta_y = clamp01(self.smooth_y + dy)
+                target_x = 0.5 * (base_x + delta_x)
+                target_y = 0.5 * (base_y + delta_y)
                 conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
                 blend = 0.3 + 0.7 * conf
-                target_x, target_y = px, py
-                if self.plan_queue:
-                    target_x, target_y = self.plan_queue.popleft()
-                target_x = clamp01(target_x)
-                target_y = clamp01(target_y)
                 self.smooth_x = (1 - blend) * self.smooth_x + blend * target_x
                 self.smooth_y = (1 - blend) * self.smooth_y + blend * target_y
 
@@ -1153,7 +1126,16 @@ class MainWin(QMainWindow):
                     self.last_record = time.time()
 
             small = letterbox(frame, INPUT_W, INPUT_H)
-            self.queue.put((frame, small, nx, ny, click, source, save))
+            if self.queue.full():
+                try:
+                    self.queue.get_nowait()
+                    self.queue.task_done()
+                except queue.Empty:
+                    pass
+            try:
+                self.queue.put_nowait((frame, small, nx, ny, click, source, save))
+            except queue.Full:
+                pass
 
         except Exception: pass
 
