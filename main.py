@@ -27,6 +27,11 @@ import pyqtgraph as pg
 from collections import deque
 from paddleocr import PaddleOCR
 import importlib.util
+import logging
+
+logging.getLogger("ppocr").setLevel(logging.ERROR)
+logging.getLogger("ppocr.utils.logging").setLevel(logging.ERROR)
+logging.getLogger("ppocr.utility").setLevel(logging.ERROR)
 
 
 try:
@@ -89,6 +94,13 @@ def get_screen_size():
 
 SCREEN_W, SCREEN_H, SCREEN_LEFT, SCREEN_TOP = get_screen_size()
 LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H = compute_letterbox_params(SCREEN_W, SCREEN_H, INPUT_W, INPUT_H)
+SCALE_PERCENT = 100
+if platform.system() == 'Windows':
+    try:
+        import ctypes
+        SCALE_PERCENT = ctypes.windll.shcore.GetScaleFactorForDevice(0)
+    except Exception:
+        SCALE_PERCENT = 100
 
 def clamp01(v):
     return max(0.0, min(1.0, v))
@@ -103,6 +115,9 @@ def letter_norm_to_screen(nx, ny):
     ly = clamp01(ny) * INPUT_H
     sx = (lx - LB_LEFT) / LB_SCALE + SCREEN_LEFT
     sy = (ly - LB_TOP) / LB_SCALE + SCREEN_TOP
+    if SCALE_PERCENT != 100:
+        sx = SCREEN_LEFT + (sx - SCREEN_LEFT) * 100.0 / SCALE_PERCENT
+        sy = SCREEN_TOP + (sy - SCREEN_TOP) * 100.0 / SCALE_PERCENT
     sx = max(SCREEN_LEFT, min(SCREEN_LEFT + SCREEN_W - 1, sx))
     sy = max(SCREEN_TOP, min(SCREEN_TOP + SCREEN_H - 1, sy))
     return sx, sy
@@ -466,8 +481,14 @@ class DataWorker(QThread):
 
     def read_ocr(self, roi):
         try:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            min_side = min(gray.shape[:2])
+            scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
+            proc = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            _, proc = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
             with self.ocr_lock:
-                result = self.ocr.ocr(roi, cls=False)
+                result = self.ocr.ocr(proc, cls=False)
             digits = ''
             if result and len(result) > 0:
                 texts = [item[1][0] for item in result[0] if len(item) > 1]
@@ -558,6 +579,20 @@ class DataWorker(QThread):
         self.save_worker.join()
         self.ocr_pool.shutdown(wait=False)
         self.wait()
+
+class InferenceThread(QThread):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        while self.running:
+            self.owner.loop()
+            time.sleep(0.001)
 
 class SciFiPlot(pg.PlotWidget):
     def __init__(self, title, color):
@@ -743,11 +778,10 @@ class MainWin(QMainWindow):
         
         self.init_ui()
         self.setup_listeners()
-        
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.loop)
-        self.timer.start(15)
-        
+
+        self.infer_thread = InferenceThread(self)
+        self.infer_thread.start()
+
         self.stat_timer = QTimer()
         self.stat_timer.timeout.connect(self.update_stats)
         self.stat_timer.start(500)
@@ -965,12 +999,13 @@ class MainWin(QMainWindow):
                     pass
         
         disk = psutil.disk_usage(os.path.abspath(os.sep))
-        scale = 100
+        scale = SCALE_PERCENT
         if platform.system() == 'Windows':
             try:
                 import ctypes
                 scale = ctypes.windll.shcore.GetScaleFactorForDevice(0)
-            except: pass
+            except Exception:
+                scale = SCALE_PERCENT
             
         self.lbl_cpu.setText(f"处理器: {cpu}%")
         self.lbl_mem.setText(f"内存: {mem}%")
@@ -1086,6 +1121,8 @@ class MainWin(QMainWindow):
         except Exception: pass
 
     def close_app(self):
+        self.infer_thread.stop()
+        self.infer_thread.wait()
         self.worker.stop()
         if self.dragging:
             self.mouse.release(mouse.Button.left)
