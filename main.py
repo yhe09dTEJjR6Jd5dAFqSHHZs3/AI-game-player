@@ -304,7 +304,7 @@ class DataWorker(QThread):
         except:
             self.regions = []
         self.prev_rois = [None] * len(self.regions)
-        self.prev_vals = [0] * len(self.regions)
+        self.prev_vals = [None] * len(self.regions)
         self.prev_change = [0.0] * len(self.regions)
 
     def run(self):
@@ -322,19 +322,15 @@ class DataWorker(QThread):
                                 roi = gray[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
                                 if idx >= len(self.prev_rois):
                                     self.prev_rois.append(None)
-                                    self.prev_vals.append(0)
+                                    self.prev_vals.append(None)
                                     self.prev_change.append(0.0)
-                                diff = 0.0
-                                if self.prev_rois[idx] is not None:
-                                    d = cv2.absdiff(roi, self.prev_rois[idx])
-                                    diff = float(np.mean(d)) / 255.0
+                                diff = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
                                 diff = 0.5 * self.prev_change[idx] + 0.5 * diff
                                 self.prev_change[idx] = diff
                                 self.prev_rois[idx] = roi
-                                prev_v = int(self.prev_vals[idx])
-                                if diff < 0.005:
-                                    val = prev_v
-                                else:
+                                prev_v = self.prev_vals[idx]
+                                need_read = diff >= 0.005 or prev_v is None
+                                if need_read:
                                     resized = cv2.resize(roi, (0, 0), fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
                                     normed = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
                                     blurred = cv2.GaussianBlur(normed, (3, 3), 0)
@@ -343,10 +339,16 @@ class DataWorker(QThread):
                                         binary = cv2.bitwise_not(binary)
                                     txt = pytesseract.image_to_string(binary, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
                                     digits = ''.join(filter(str.isdigit, txt))
-                                    val = int(digits) if digits else prev_v
-                                if diff < 0.02 and val == 0 and prev_v > 0:
-                                    val = prev_v
-                                final_v = max(0, int(round(val)))
+                                    candidate = int(digits) if digits else prev_v
+                                else:
+                                    candidate = prev_v
+                                if prev_v is not None and candidate is not None and abs(candidate - prev_v) > 2:
+                                    candidate = prev_v
+                                if candidate is None:
+                                    candidate = 0
+                                final_v = max(0, int(round(candidate)))
+                                if prev_v is not None and abs(final_v - prev_v) > 0 and diff < 0.01:
+                                    final_v = prev_v
                                 self.prev_vals[idx] = final_v
                                 ocr_vals.append(final_v)
                             except:
