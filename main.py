@@ -24,16 +24,8 @@ from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QThread, QPoint, QRect, QSize
 from PyQt5.QtGui import QColor, QPainter, QPen, QFont, QBrush, QImage, QPixmap
 import pyqtgraph as pg
 from collections import deque
+from paddleocr import PaddleOCR
 
-try:
-    import pytesseract
-except ImportError:
-    pytesseract = None
-
-if os.name == 'nt':
-    tesseract_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    if os.path.exists(tesseract_path) and pytesseract:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
 try:
     if torch.cuda.is_available():
@@ -299,6 +291,7 @@ class DataWorker(QThread):
         self.last_read_tick = []
         self.stable_counts = []
         self.tick = 0
+        self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=torch.cuda.is_available())
         self.reload_regions()
 
     def reload_regions(self):
@@ -323,63 +316,50 @@ class DataWorker(QThread):
 
                 ocr_vals = []
                 if self.regions:
-                    if pytesseract:
-                        gray = cv2.cvtColor(full_img, cv2.COLOR_BGR2GRAY)
-                        for idx, r in enumerate(self.regions):
-                            try:
-                                roi = gray[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
-                                if idx >= len(self.prev_rois):
-                                    self.prev_rois.append(None)
-                                    self.prev_vals.append(None)
-                                    self.prev_change.append(0.0)
-                                    self.histories.append(deque(maxlen=5))
-                                    self.last_read_tick.append(0)
-                                    self.stable_counts.append(0)
-                                diff = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
-                                diff = 0.5 * self.prev_change[idx] + 0.5 * diff
-                                self.prev_change[idx] = diff
-                                self.prev_rois[idx] = roi
-                                prev_v = self.prev_vals[idx]
-                                need_read = diff >= 0.003 or prev_v is None or self.tick - self.last_read_tick[idx] >= 5
-                                if need_read:
-                                    resized = cv2.resize(roi, (0, 0), fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
-                                    normed = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
-                                    blurred = cv2.GaussianBlur(normed, (3, 3), 0)
-                                    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                                    if np.mean(binary) > 150:
-                                        binary = cv2.bitwise_not(binary)
-                                    txt = pytesseract.image_to_string(binary, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
-                                    digits = ''.join(filter(str.isdigit, txt))
-                                    if not digits:
-                                        flipped = cv2.bitwise_not(binary)
-                                        alt = cv2.adaptiveThreshold(flipped, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-                                        txt = pytesseract.image_to_string(alt, config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789 -c classify_bln_numeric_mode=1')
-                                        digits = ''.join(filter(str.isdigit, txt))
-                                    self.last_read_tick[idx] = self.tick
-                                    candidate = int(digits) if digits else prev_v
-                                else:
-                                    candidate = prev_v
-                                if candidate is None:
-                                    candidate = 0
-                                self.histories[idx].append(candidate)
-                                smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else candidate
-                                stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
-                                if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
-                                    smoothed = prev_v
-                                final_v = max(0, smoothed)
-                                self.prev_vals[idx] = final_v
-                                if final_v == prev_v:
-                                    self.stable_counts[idx] = stable + 1
-                                else:
-                                    self.stable_counts[idx] = 0
-                                ocr_vals.append(final_v)
-                            except:
-                                ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
-                    else:
-                        needed = len(self.regions)
-                        if len(self.prev_vals) < needed:
-                            self.prev_vals.extend([0] * (needed - len(self.prev_vals)))
-                        ocr_vals = list(self.prev_vals[:needed])
+                    for idx, r in enumerate(self.regions):
+                        try:
+                            roi = full_img[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
+                            if roi.size == 0:
+                                raise ValueError
+                            if idx >= len(self.prev_rois):
+                                self.prev_rois.append(None)
+                                self.prev_vals.append(None)
+                                self.prev_change.append(0.0)
+                                self.histories.append(deque(maxlen=5))
+                                self.last_read_tick.append(0)
+                                self.stable_counts.append(0)
+                            diff = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
+                            diff = 0.5 * self.prev_change[idx] + 0.5 * diff
+                            self.prev_change[idx] = diff
+                            self.prev_rois[idx] = roi
+                            prev_v = self.prev_vals[idx]
+                            need_read = diff >= 0.003 or prev_v is None or self.tick - self.last_read_tick[idx] >= 5
+                            if need_read:
+                                result = self.ocr.ocr(roi, cls=False)
+                                digits = ''
+                                if result and len(result) > 0:
+                                    texts = [item[1][0] for item in result[0] if len(item) > 1]
+                                    digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
+                                self.last_read_tick[idx] = self.tick
+                                candidate = int(digits) if digits else prev_v
+                            else:
+                                candidate = prev_v
+                            if candidate is None:
+                                candidate = 0
+                            self.histories[idx].append(candidate)
+                            smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else candidate
+                            stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
+                            if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
+                                smoothed = prev_v
+                            final_v = max(0, smoothed)
+                            self.prev_vals[idx] = final_v
+                            if final_v == prev_v:
+                                self.stable_counts[idx] = stable + 1
+                            else:
+                                self.stable_counts[idx] = 0
+                            ocr_vals.append(final_v)
+                        except:
+                            ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
                     self.ocr_result.emit(ocr_vals)
                 else:
                     self.ocr_result.emit([])
