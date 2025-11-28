@@ -21,7 +21,7 @@ from pynput import mouse, keyboard
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QProgressBar,
                              QFrame, QMessageBox, QGraphicsDropShadowEffect, QDialog, QGridLayout)
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QThread, QPoint, QRect, QSize
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QThread, QPoint, QRect, QSize, QEvent
 from PyQt5.QtGui import QColor, QPainter, QPen, QFont, QBrush, QImage, QPixmap
 import pyqtgraph as pg
 from collections import deque
@@ -349,6 +349,7 @@ class ExperiencePool(Dataset):
 class OptimizerThread(QThread):
     finished_sig = pyqtSignal()
     progress_sig = pyqtSignal(int)
+    status_sig = pyqtSignal(str)
     
     def run(self):
         ds = ExperiencePool()
@@ -375,6 +376,7 @@ class OptimizerThread(QThread):
         model.train()
 
         for ep in range(epochs):
+            self.status_sig.emit(f"正在优化模型: 第 {ep+1}/{epochs} 轮")
             for i, (imgs, ocrs, targs, dirs, delta_t, ws) in enumerate(dl):
                 imgs, ocrs, targs, dirs, delta_t, ws = imgs.to(DEVICE), ocrs.to(DEVICE), targs.to(DEVICE), dirs.to(DEVICE), delta_t.to(DEVICE), ws.to(DEVICE)
                 opt.zero_grad(set_to_none=True)
@@ -405,6 +407,7 @@ class OptimizerThread(QThread):
             self.progress_sig.emit(int((ep + 1) / epochs * 100))
 
         torch.save(model.state_dict(), weight_path)
+        self.status_sig.emit("优化完成")
         self.finished_sig.emit()
 
 class SaveWorker(threading.Thread):
@@ -737,6 +740,7 @@ class MainWin(QMainWindow):
         super().__init__()
         self.setWindowTitle("神经接口系统")
         self.resize(1000, 600)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setStyleSheet("QMainWindow {background-color: #050a0f; color: #00f0ff; font-family: 'SimHei';}")
         
         self.brain = Brain().to(DEVICE)
@@ -775,6 +779,8 @@ class MainWin(QMainWindow):
         self.nvml_checked = False
         self.nvml_handle = None
         self.startup_info = None
+        self.window_dragging = False
+        self.window_drag_pos = QPoint()
         
         self.init_ui()
         self.setup_listeners()
@@ -805,15 +811,35 @@ class MainWin(QMainWindow):
         eff.setBlurRadius(15)
         eff.setColor(QColor(0, 240, 255, 80))
         frame.setGraphicsEffect(eff)
-        
+
         fl = QVBoxLayout(frame)
-        
-        header = QHBoxLayout()
+
+        header_widget = QWidget()
+        header_widget.setObjectName("header_widget")
+        header_widget.installEventFilter(self)
+        self.header_widget = header_widget
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(10, 10, 10, 10)
         self.mode_lbl = QLabel("模式: 学习模式")
         self.mode_lbl.setStyleSheet("font-size: 22px; font-weight: bold; color: #00ff00;")
-        header.addWidget(self.mode_lbl)
-        header.addStretch()
-        fl.addLayout(header)
+        header_layout.addWidget(self.mode_lbl)
+        header_layout.addStretch()
+
+        btn_style = """
+            QPushButton {background: #001a26; color: #00f0ff; border: 1px solid #00f0ff; border-radius: 6px; padding: 6px 12px; font-weight: bold;}
+            QPushButton:hover {background: #00f0ff; color: #001a26;}
+        """
+        self.btn_min = QPushButton("-")
+        self.btn_min.setFixedWidth(32)
+        self.btn_min.setStyleSheet(btn_style)
+        self.btn_min.clicked.connect(self.showMinimized)
+        self.btn_close = QPushButton("×")
+        self.btn_close.setFixedWidth(32)
+        self.btn_close.setStyleSheet(btn_style)
+        self.btn_close.clicked.connect(self.close_app)
+        header_layout.addWidget(self.btn_min)
+        header_layout.addWidget(self.btn_close)
+        fl.addWidget(header_widget)
         
         grid = QGridLayout()
         self.lbl_cpu = QLabel("处理器: 0%")
@@ -859,7 +885,7 @@ class MainWin(QMainWindow):
         btns.addWidget(b_rec)
         btns.addWidget(b_opt)
         fl.addLayout(btns)
-        
+
         self.bar = QProgressBar()
         self.bar.setStyleSheet("QProgressBar {border: 1px solid #00f0ff; text-align: center; color: white;} QProgressBar::chunk {background-color: #00f0ff;}")
         self.bar.hide()
@@ -911,8 +937,10 @@ class MainWin(QMainWindow):
         self.update_mode()
         self.bar.show()
         self.bar.setValue(0)
+        self.bar.setFormat("正在优化: %p%")
         self.opt_thread = OptimizerThread()
         self.opt_thread.progress_sig.connect(self.bar.setValue)
+        self.opt_thread.status_sig.connect(self.update_opt_status)
         self.opt_thread.finished_sig.connect(self.opt_done)
         self.opt_thread.start()
 
@@ -934,6 +962,9 @@ class MainWin(QMainWindow):
             c = "#ffff00"
         self.mode_lbl.setText(f"模式: {txt}")
         self.mode_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {c};")
+
+    def update_opt_status(self, text):
+        self.bar.setFormat(f"{text} - %p%")
 
     def build_path(self, base_target, delta_pred):
         start = np.array([self.smooth_x, self.smooth_y], dtype=np.float32)
@@ -967,6 +998,8 @@ class MainWin(QMainWindow):
         cpu = psutil.cpu_percent()
         mem = psutil.virtual_memory().percent
 
+        gpu_display = "N/A"
+        vram_display = "N/A"
         gpu_u, vram_u, vram_t = 0, 0, 1
         if torch.cuda.is_available():
             if not self.nvml_checked and pynvml is not None:
@@ -984,9 +1017,11 @@ class MainWin(QMainWindow):
                     gpu_u = float(util.gpu)
                     vram_u = mem_info.used / (1024 * 1024)
                     vram_t = max(mem_info.total / (1024 * 1024), 1)
+                    gpu_display = f"{gpu_u}%"
+                    vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
                 except Exception:
                     pass
-            elif platform.system() == 'Windows':
+            elif pynvml is not None and platform.system() == 'Windows':
                 try:
                     if self.startup_info is None:
                         si = subprocess.STARTUPINFO()
@@ -995,9 +1030,11 @@ class MainWin(QMainWindow):
                     o = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], startupinfo=self.startup_info)
                     u, m, t = map(float, o.decode('utf-8').strip().split(','))
                     gpu_u, vram_u, vram_t = u, m, t
+                    gpu_display = f"{gpu_u}%"
+                    vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
                 except Exception:
                     pass
-        
+
         disk = psutil.disk_usage(os.path.abspath(os.sep))
         scale = SCALE_PERCENT
         if platform.system() == 'Windows':
@@ -1006,18 +1043,18 @@ class MainWin(QMainWindow):
                 scale = ctypes.windll.shcore.GetScaleFactorForDevice(0)
             except Exception:
                 scale = SCALE_PERCENT
-            
+
         self.lbl_cpu.setText(f"处理器: {cpu}%")
         self.lbl_mem.setText(f"内存: {mem}%")
-        self.lbl_gpu.setText(f"显卡: {gpu_u}%")
-        self.lbl_vram.setText(f"显存: {vram_u/1024:.1f}/{vram_t/1024:.1f}GB")
+        self.lbl_gpu.setText(f"显卡: {gpu_display}")
+        self.lbl_vram.setText(f"显存: {vram_display}")
         self.lbl_disk.setText(f"磁盘可用: {disk.free/(1024**4):.2f}TB")
         self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
-        
-        for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100]):
+
+        for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0]):
             l.pop(0)
             l.append(v)
-            
+
         self.p_cpu.plot(self.d_cpu, pen=pg.mkPen('#00ff00', width=2), clear=True)
         self.p_mem.plot(self.d_mem, pen=pg.mkPen('#00ffff', width=2), clear=True)
         self.p_gpu.plot(self.d_gpu, pen=pg.mkPen('#ff0055', width=2), clear=True)
@@ -1128,6 +1165,20 @@ class MainWin(QMainWindow):
             self.mouse.release(mouse.Button.left)
         QApplication.quit()
         sys.exit()
+
+    def eventFilter(self, obj, event):
+        if obj.objectName() == "header_widget":
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.window_dragging = True
+                self.window_drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+                return True
+            elif event.type() == QEvent.MouseMove and self.window_dragging:
+                self.move(event.globalPos() - self.window_drag_pos)
+                return True
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self.window_dragging = False
+                return True
+        return super().eventFilter(obj, event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
