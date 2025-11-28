@@ -5,6 +5,7 @@ import json
 import random
 import threading
 import queue
+import concurrent.futures
 import subprocess
 import platform
 import psutil
@@ -25,6 +26,7 @@ from PyQt5.QtGui import QColor, QPainter, QPen, QFont, QBrush, QImage, QPixmap
 import pyqtgraph as pg
 from collections import deque
 from paddleocr import PaddleOCR
+import importlib.util
 
 
 try:
@@ -56,6 +58,11 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_W, INPUT_H = 320, 180
 SEQ_LEN = 4
 MAX_OCR = 16
+POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
+CACHE_MAX_BYTES = 256 * 1024 * 1024
+pynvml = None
+if importlib.util.find_spec("pynvml") is not None:
+    import pynvml
 
 def letterbox(img, new_w, new_h):
     h, w = img.shape[:2]
@@ -212,7 +219,9 @@ class ExperiencePool(Dataset):
         self.data = []
         self.cache = {}
         self.cache_order = deque()
-        self.cache_limit = 2000
+        self.cache_bytes = 0
+        self.cache_limit = CACHE_MAX_BYTES
+        self.total_bytes = 0
         try:
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
                 regions = json.load(f)
@@ -240,7 +249,12 @@ class ExperiencePool(Dataset):
                                 prev_vals = cur_vals
                             feat = pack_ocr(ocr, deltas)
                             weight = self.calc_weight(ocr, deltas)
-                            self.data.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight})
+                            size = (os.path.getsize(img_path) if os.path.exists(img_path) else 0) + 512
+                            self.data.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size})
+                            self.total_bytes += size
+                            while self.total_bytes > POOL_MAX_BYTES and self.data:
+                                dropped = self.data.pop(0)
+                                self.total_bytes -= dropped.get('size', 0)
                     except:
                         pass
         self.data.sort(key=lambda x: x['ts'])
@@ -271,12 +285,15 @@ class ExperiencePool(Dataset):
         if img is None:
             img = np.zeros((INPUT_H, INPUT_W, 3), dtype=np.uint8)
         img = preprocess_frame(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        size = img.nbytes
         self.cache[path] = img
-        self.cache_order.append(path)
-        if len(self.cache_order) > self.cache_limit:
-            old = self.cache_order.popleft()
+        self.cache_order.append((path, size))
+        self.cache_bytes += size
+        while self.cache_bytes > self.cache_limit and self.cache_order:
+            old, s = self.cache_order.popleft()
             if old in self.cache:
                 del self.cache[old]
+            self.cache_bytes -= s
         return img
 
     def __len__(self):
@@ -428,6 +445,9 @@ class DataWorker(QThread):
         self.stable_counts = []
         self.tick = 0
         self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=torch.cuda.is_available())
+        self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self.ocr_lock = threading.Lock()
+        self.ocr_tasks = []
         self.reload_regions()
 
     def reload_regions(self):
@@ -442,6 +462,19 @@ class DataWorker(QThread):
         self.histories = [deque(maxlen=5) for _ in self.regions]
         self.last_read_tick = [0] * len(self.regions)
         self.stable_counts = [0] * len(self.regions)
+        self.ocr_tasks = [None] * len(self.regions)
+
+    def read_ocr(self, roi):
+        try:
+            with self.ocr_lock:
+                result = self.ocr.ocr(roi, cls=False)
+            digits = ''
+            if result and len(result) > 0:
+                texts = [item[1][0] for item in result[0] if len(item) > 1]
+                digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
+            return int(digits) if digits else None
+        except:
+            return None
 
     def run(self):
         while self.running:
@@ -470,16 +503,21 @@ class DataWorker(QThread):
                             self.prev_rois[idx] = roi
                             prev_v = self.prev_vals[idx]
                             need_read = diff >= 0.002 or prev_v is None or self.tick - self.last_read_tick[idx] >= 3
-                            if need_read:
-                                result = self.ocr.ocr(roi, cls=False)
-                                digits = ''
-                                if result and len(result) > 0:
-                                    texts = [item[1][0] for item in result[0] if len(item) > 1]
-                                    digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
+                            candidate = prev_v
+                            if idx < len(self.ocr_tasks) and self.ocr_tasks[idx] is not None and self.ocr_tasks[idx].done():
+                                try:
+                                    res = self.ocr_tasks[idx].result()
+                                except Exception:
+                                    res = None
+                                if res is not None:
+                                    candidate = res
+                                    self.last_read_tick[idx] = self.tick
+                                self.ocr_tasks[idx] = None
+                            if need_read and (idx >= len(self.ocr_tasks) or self.ocr_tasks[idx] is None):
+                                if idx >= len(self.ocr_tasks):
+                                    self.ocr_tasks.append(None)
+                                self.ocr_tasks[idx] = self.ocr_pool.submit(self.read_ocr, roi.copy())
                                 self.last_read_tick[idx] = self.tick
-                                candidate = int(digits) if digits else prev_v
-                            else:
-                                candidate = prev_v
                             if candidate is None:
                                 candidate = 0
                             self.histories[idx].append(candidate)
@@ -518,6 +556,7 @@ class DataWorker(QThread):
         self.running = False
         self.save_worker.stop()
         self.save_worker.join()
+        self.ocr_pool.shutdown(wait=False)
         self.wait()
 
 class SciFiPlot(pg.PlotWidget):
@@ -695,6 +734,12 @@ class MainWin(QMainWindow):
         self.min_press = 0.12
         self.last_press_time = 0.0
         self.plan_queue = deque(maxlen=6)
+        self.release_frames = 0
+        self.press_frames = 0
+        self.replan_thresh = 0.05
+        self.nvml_checked = False
+        self.nvml_handle = None
+        self.startup_info = None
         
         self.init_ui()
         self.setup_listeners()
@@ -887,14 +932,37 @@ class MainWin(QMainWindow):
     def update_stats(self):
         cpu = psutil.cpu_percent()
         mem = psutil.virtual_memory().percent
-        
+
         gpu_u, vram_u, vram_t = 0, 0, 1
-        try:
-            if torch.cuda.is_available():
-                o = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
-                u, m, t = map(float, o.decode('utf-8').strip().split(','))
-                gpu_u, vram_u, vram_t = u, m, t
-        except: pass
+        if torch.cuda.is_available():
+            if not self.nvml_checked and pynvml is not None:
+                try:
+                    pynvml.nvmlInit()
+                    if pynvml.nvmlDeviceGetCount() > 0:
+                        self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                except Exception:
+                    self.nvml_handle = None
+                self.nvml_checked = True
+            if self.nvml_handle is not None:
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(self.nvml_handle)
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.nvml_handle)
+                    gpu_u = float(util.gpu)
+                    vram_u = mem_info.used / (1024 * 1024)
+                    vram_t = max(mem_info.total / (1024 * 1024), 1)
+                except Exception:
+                    pass
+            elif platform.system() == 'Windows':
+                try:
+                    if self.startup_info is None:
+                        si = subprocess.STARTUPINFO()
+                        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        self.startup_info = si
+                    o = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], startupinfo=self.startup_info)
+                    u, m, t = map(float, o.decode('utf-8').strip().split(','))
+                    gpu_u, vram_u, vram_t = u, m, t
+                except Exception:
+                    pass
         
         disk = psutil.disk_usage(os.path.abspath(os.sep))
         scale = 100
@@ -954,8 +1022,15 @@ class MainWin(QMainWindow):
 
                 px, py, pc = out[0].cpu().numpy()
                 delta_pred = delta_out[0].cpu().numpy()
-                self.plan_queue.clear()
-                for pt in self.build_path((px, py), delta_pred):
+                new_pts = self.build_path((px, py), delta_pred)
+                need_replan = len(self.plan_queue) == 0
+                if not need_replan:
+                    lx, ly = self.plan_queue[-1]
+                    if (lx - px) ** 2 + (ly - py) ** 2 > self.replan_thresh:
+                        need_replan = True
+                if need_replan:
+                    self.plan_queue.clear()
+                for pt in new_pts:
                     self.plan_queue.append(pt)
                 conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
                 blend = 0.3 + 0.7 * conf
@@ -970,13 +1045,24 @@ class MainWin(QMainWindow):
                 sx, sy = letter_norm_to_screen(self.smooth_x, self.smooth_y)
                 self.mouse.position = (int(sx), int(sy))
                 now = time.time()
-                if not self.dragging and pc >= self.press_thresh:
+                if pc >= self.press_thresh:
+                    self.press_frames += 1
+                else:
+                    self.press_frames = 0
+                if pc <= self.release_thresh:
+                    self.release_frames += 1
+                else:
+                    self.release_frames = 0
+                if not self.dragging and self.press_frames >= 2:
                     self.mouse.press(mouse.Button.left)
                     self.dragging = True
                     self.last_press_time = now
-                elif self.dragging and pc <= self.release_thresh and now - self.last_press_time >= self.min_press:
+                    self.release_frames = 0
+                elif self.dragging and (pc <= 0.1 or (self.release_frames >= 3 and now - self.last_press_time >= self.min_press)):
                     self.mouse.release(mouse.Button.left)
                     self.dragging = False
+                    self.press_frames = 0
+                    self.release_frames = 0
 
                 nx, ny, click = self.smooth_x, self.smooth_y, (1.0 if self.dragging else 0.0)
                 source = "AI"
@@ -985,6 +1071,8 @@ class MainWin(QMainWindow):
                 if self.dragging:
                     self.mouse.release(mouse.Button.left)
                     self.dragging = False
+                self.press_frames = 0
+                self.release_frames = 0
 
             save = False
             if (self.mode == "LEARNING" and source == "USER") or (self.mode == "TRAINING" and source == "AI"):
