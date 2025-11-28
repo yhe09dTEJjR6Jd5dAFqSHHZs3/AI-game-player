@@ -22,7 +22,7 @@ AI对变化幅度大的区域更加敏感。
 用户划分的区域内需要识别的内容一定是一个平滑变化的非负整数。
 
 PaddleOCR版本：v3.3.2
-Python版本：3.13.9
+Python版本：3.10.11
 操作系统：Windows 11
 GPU：NVIDIA GeForce RTX 3050 Ti
 
