@@ -20,7 +20,6 @@ AI对变化幅度大的区域更加敏感。
 用户划分的区域内需要识别的内容一定是一个平滑变化的非负整数。
 
 操作系统：Windows 11
-显卡 (GPU)：NVIDIA GeForce RTX 3050 Ti
 Python版本：3.10.11
 CUDA Toolkit：11.8
 cuDNN版本：8.9.7 (for CUDA 11.x)
