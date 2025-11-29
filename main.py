@@ -286,54 +286,63 @@ class ExperiencePool(Dataset):
             return []
 
     def load_data(self):
+        global POOL_DATA_CACHE, POOL_TOTAL_BYTES_CACHE, POOL_LAST_READ_POS, POOL_PREV_VALS_CACHE, POOL_REGION_SIGNATURE
         try:
-            entries_by_ts = {}
-            if os.path.exists(LOG_FILE):
+            with POOL_LOCK:
+                region_sig = tuple(self.region_types)
+                if POOL_REGION_SIGNATURE != region_sig:
+                    POOL_DATA_CACHE = []
+                    POOL_TOTAL_BYTES_CACHE = 0
+                    POOL_LAST_READ_POS = 0
+                    POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
+                    POOL_REGION_SIGNATURE = region_sig
+                if not os.path.exists(LOG_FILE):
+                    return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
+                file_size = os.path.getsize(LOG_FILE)
+                if file_size < POOL_LAST_READ_POS:
+                    POOL_DATA_CACHE = []
+                    POOL_TOTAL_BYTES_CACHE = 0
+                    POOL_LAST_READ_POS = 0
+                    POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
                 with open(LOG_FILE, 'r', encoding='utf-8') as f:
-                    f.readline()
-                    for line in f:
-                        parts = line.strip().split(',')
-                        if len(parts) < 6:
-                            continue
-                        try:
-                            ts = int(parts[0])
-                            img_path = parts[1]
-                            mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
-                            ocr_vals = [float(x) for x in parts[6].split('|') if x != ''] if len(parts) >= 7 else []
-                            ocr_age = [float(x) for x in parts[7].split('|') if x != ''] if len(parts) >= 8 else [0.0] * len(ocr_vals)
-                            novelty = float(parts[8]) if len(parts) >= 9 else 0.0
-                            complexity = float(parts[9]) if len(parts) >= 10 else 0.0
-                            entries_by_ts[ts] = {
-                                'ts': ts,
-                                'img': img_path,
-                                'mx': mx,
-                                'my': my,
-                                'click': click,
-                                'ocr_vals': ocr_vals,
-                                'ocr_ages': ocr_age,
-                                'novelty': novelty,
-                                'complexity': complexity
-                            }
-                        except Exception:
-                            continue
-
-            entries = sorted(entries_by_ts.values(), key=lambda x: x['ts'])
-            data = []
-            total_bytes = 0
-            prev_vals = [0] * len(self.region_types)
-            for entry in entries:
-                cur_vals = entry['ocr_vals'][:len(self.region_types)] + [0]*max(0, len(self.region_types) - len(entry['ocr_vals']))
-                deltas = [cur_vals[i] - prev_vals[i] for i in range(len(self.region_types))]
-                prev_vals = cur_vals
-                feat = pack_ocr(entry['ocr_vals'], deltas, entry.get('ocr_ages'))
-                weight = self.calc_weight(entry['ocr_vals'], deltas, entry.get('click', 0.0), entry.get('novelty', 0.0), entry.get('complexity', 0.0))
-                size = (os.path.getsize(entry['img']) if os.path.exists(entry['img']) else 0) + 512
-                data.append({'ts': entry['ts'], 'img': entry['img'], 'mx': entry['mx'], 'my': entry['my'], 'click': entry['click'], 'ocr': feat, 'weight': weight, 'size': size})
-                total_bytes += size
-                while total_bytes > POOL_MAX_BYTES and data:
-                    dropped = data.pop(0)
-                    total_bytes -= dropped.get('size', 0)
-            return data, total_bytes
+                    if POOL_LAST_READ_POS == 0:
+                        f.readline()
+                    else:
+                        f.seek(POOL_LAST_READ_POS)
+                    lines = f.readlines()
+                    POOL_LAST_READ_POS = f.tell()
+                for line in lines:
+                    parts = line.strip().split(',')
+                    if len(parts) < 6:
+                        continue
+                    try:
+                        ts = int(parts[0])
+                        img_path = parts[1]
+                        mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
+                        ocr_vals = [float(x) for x in parts[6].split('|') if x != ''] if len(parts) >= 7 else []
+                        ocr_age = [float(x) for x in parts[7].split('|') if x != ''] if len(parts) >= 8 else [0.0] * len(ocr_vals)
+                        novelty = float(parts[8]) if len(parts) >= 9 else 0.0
+                        complexity = float(parts[9]) if len(parts) >= 10 else 0.0
+                    except Exception:
+                        continue
+                    cur_vals = ocr_vals[:len(self.region_types)] + [0] * max(0, len(self.region_types) - len(ocr_vals))
+                    deltas = [cur_vals[i] - (POOL_PREV_VALS_CACHE[i] if i < len(POOL_PREV_VALS_CACHE) else 0) for i in range(len(self.region_types))]
+                    if len(POOL_PREV_VALS_CACHE) != len(self.region_types):
+                        POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
+                        deltas = cur_vals
+                    POOL_PREV_VALS_CACHE = cur_vals
+                    feat = pack_ocr(ocr_vals, deltas, ocr_age)
+                    weight = self.calc_weight(ocr_vals, deltas, click, novelty, complexity)
+                    size = 512
+                    if os.path.exists(img_path):
+                        size += os.path.getsize(img_path)
+                    entry = {'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size}
+                    POOL_DATA_CACHE.append(entry)
+                    POOL_TOTAL_BYTES_CACHE += size
+                    while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
+                        dropped = POOL_DATA_CACHE.pop(0)
+                        POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
+                return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
         except Exception:
             return [], 0
 
@@ -1103,10 +1112,11 @@ class MainWin(QMainWindow):
         self.lbl_gpu_fan = QLabel("风扇: 0%")
         self.lbl_disk_io = QLabel("磁盘IO: 0MB/s")
         self.lbl_disk_lat = QLabel("磁盘延迟: 0ms")
+        self.lbl_disk_qd = QLabel("队列深度: 0")
         self.lbl_latency = QLabel("延迟: 截屏0ms | 推理0ms | OCR0ms | 循环0ms")
         self.lbl_fps = QLabel("帧率: 0fps | 截屏间隔0ms")
 
-        info_labels = [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_disk, self.lbl_res, self.lbl_gpu_temp, self.lbl_gpu_power, self.lbl_gpu_fan, self.lbl_disk_io, self.lbl_disk_lat, self.lbl_latency, self.lbl_fps]
+        info_labels = [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_disk, self.lbl_res, self.lbl_gpu_temp, self.lbl_gpu_power, self.lbl_gpu_fan, self.lbl_disk_io, self.lbl_disk_lat, self.lbl_disk_qd, self.lbl_latency, self.lbl_fps]
         for i, l in enumerate(info_labels):
             l.setStyleSheet("color: #00f0ff; font-size: 14px; padding: 5px;")
             grid.addWidget(l, i//3, i%3)
@@ -1359,6 +1369,13 @@ class MainWin(QMainWindow):
         io_throughput = (rb + wb) / dt / (1024 * 1024)
         ops = max((now_io.read_count - self.prev_disk_io.read_count) + (now_io.write_count - self.prev_disk_io.write_count), 1)
         lat_ms = max((now_io.read_time - self.prev_disk_io.read_time) + (now_io.write_time - self.prev_disk_io.write_time), 0) / ops
+        qd = 0.0
+        if hasattr(now_io, 'busy_time'):
+            busy_ms = max(now_io.busy_time - getattr(self.prev_disk_io, 'busy_time', 0), 0)
+            qd = busy_ms / (dt * 1000.0)
+        else:
+            total_time = max((now_io.read_time - self.prev_disk_io.read_time) + (now_io.write_time - self.prev_disk_io.write_time), 0)
+            qd = total_time / (dt * 1000.0)
         self.prev_disk_io = now_io
         self.prev_disk_ts = now_ts
         scale = SCALE_PERCENT
@@ -1381,6 +1398,7 @@ class MainWin(QMainWindow):
         self.lbl_gpu_fan.setText(f"风扇: {gpu_fan:.0f}%")
         self.lbl_disk_io.setText(f"磁盘IO: {io_throughput:.2f}MB/s")
         self.lbl_disk_lat.setText(f"磁盘延迟: {lat_ms:.2f}ms")
+        self.lbl_disk_qd.setText(f"队列深度: {qd:.2f}")
         fps = 1000.0 / self.frame_interval_ms if self.frame_interval_ms > 0 else 0.0
         self.lbl_latency.setText(f"延迟: 截屏{self.capture_latency_ms:.1f}ms | 推理{self.infer_latency_ms:.1f}ms | OCR{self.ocr_latency_ms:.1f}ms | 循环{self.loop_latency_ms:.1f}ms")
         self.lbl_fps.setText(f"帧率: {fps:.1f}fps | 截屏间隔{self.frame_interval_ms:.1f}ms")
