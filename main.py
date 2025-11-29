@@ -48,6 +48,7 @@ IMG_DIR = os.path.join(DATA_DIR, "images")
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 LOG_FILE = os.path.join(DATA_DIR, "data.csv")
 REGION_FILE = os.path.join(BASE_DIR, "regions.json")
+PRIORITY_FILE = os.path.join(DATA_DIR, "priorities.npy")
 
 for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -329,7 +330,7 @@ class ExperiencePool(Dataset):
         self.cache_limit = CACHE_MAX_BYTES
         self.region_types = self.load_region_types()
         self.data, self.total_bytes = self.load_data()
-        self.priorities = np.ones(len(self.data), dtype=np.float32)
+        self.priorities = self.load_priorities()
         self.min_ts = min([d['ts'] for d in self.data], default=0)
         self.max_ts = max([d['ts'] for d in self.data], default=0)
 
@@ -365,42 +366,73 @@ class ExperiencePool(Dataset):
                         f.readline()
                     else:
                         f.seek(POOL_LAST_READ_POS)
-                    lines = f.readlines()
+                    while True:
+                        line = f.readline()
+                        if not line:
+                            break
+                        parts = line.strip().split(',')
+                        if len(parts) < 6:
+                            continue
+                        try:
+                            ts = int(parts[0])
+                            img_path = parts[1]
+                            mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
+                            ocr_vals = [float(x) for x in parts[6].split('|') if x != ''] if len(parts) >= 7 else []
+                            ocr_age = [float(x) for x in parts[7].split('|') if x != ''] if len(parts) >= 8 else [0.0] * len(ocr_vals)
+                            novelty = float(parts[8]) if len(parts) >= 9 else 0.0
+                            complexity = float(parts[9]) if len(parts) >= 10 else 0.0
+                        except Exception:
+                            continue
+                        cur_vals = ocr_vals[:len(self.region_types)] + [0] * max(0, len(self.region_types) - len(ocr_vals))
+                        deltas = [cur_vals[i] - (POOL_PREV_VALS_CACHE[i] if i < len(POOL_PREV_VALS_CACHE) else 0) for i in range(len(self.region_types))]
+                        if len(POOL_PREV_VALS_CACHE) != len(self.region_types):
+                            POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
+                            deltas = cur_vals
+                        POOL_PREV_VALS_CACHE = cur_vals
+                        feat = pack_ocr(ocr_vals, deltas, ocr_age)
+                        weight = self.calc_weight(ocr_vals, deltas, click, novelty, complexity)
+                        size = 512
+                        if os.path.exists(img_path):
+                            size += os.path.getsize(img_path)
+                        entry = {'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size}
+                        POOL_DATA_CACHE.append(entry)
+                        POOL_TOTAL_BYTES_CACHE += size
+                        while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
+                            dropped = POOL_DATA_CACHE.pop(0)
+                            POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
                     POOL_LAST_READ_POS = f.tell()
-                for line in lines:
-                    parts = line.strip().split(',')
-                    if len(parts) < 6:
-                        continue
-                    try:
-                        ts = int(parts[0])
-                        img_path = parts[1]
-                        mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
-                        ocr_vals = [float(x) for x in parts[6].split('|') if x != ''] if len(parts) >= 7 else []
-                        ocr_age = [float(x) for x in parts[7].split('|') if x != ''] if len(parts) >= 8 else [0.0] * len(ocr_vals)
-                        novelty = float(parts[8]) if len(parts) >= 9 else 0.0
-                        complexity = float(parts[9]) if len(parts) >= 10 else 0.0
-                    except Exception:
-                        continue
-                    cur_vals = ocr_vals[:len(self.region_types)] + [0] * max(0, len(self.region_types) - len(ocr_vals))
-                    deltas = [cur_vals[i] - (POOL_PREV_VALS_CACHE[i] if i < len(POOL_PREV_VALS_CACHE) else 0) for i in range(len(self.region_types))]
-                    if len(POOL_PREV_VALS_CACHE) != len(self.region_types):
-                        POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
-                        deltas = cur_vals
-                    POOL_PREV_VALS_CACHE = cur_vals
-                    feat = pack_ocr(ocr_vals, deltas, ocr_age)
-                    weight = self.calc_weight(ocr_vals, deltas, click, novelty, complexity)
-                    size = 512
-                    if os.path.exists(img_path):
-                        size += os.path.getsize(img_path)
-                    entry = {'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size}
-                    POOL_DATA_CACHE.append(entry)
-                    POOL_TOTAL_BYTES_CACHE += size
-                    while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
-                        dropped = POOL_DATA_CACHE.pop(0)
-                        POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
                 return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
         except Exception:
             return [], 0
+
+    def load_priorities(self):
+        arr = None
+        if os.path.exists(PRIORITY_FILE):
+            try:
+                arr = np.load(PRIORITY_FILE)
+            except Exception:
+                arr = None
+        if arr is None:
+            arr = np.ones(len(self.data), dtype=np.float32)
+        else:
+            if arr.dtype != np.float32:
+                arr = arr.astype(np.float32)
+            if len(arr) < len(self.data):
+                pad = np.ones(len(self.data) - len(arr), dtype=np.float32)
+                arr = np.concatenate([arr, pad])
+            elif len(arr) > len(self.data):
+                arr = arr[:len(self.data)]
+        try:
+            np.save(PRIORITY_FILE, arr)
+        except Exception:
+            pass
+        return arr
+
+    def persist_priorities(self):
+        try:
+            np.save(PRIORITY_FILE, self.priorities)
+        except Exception:
+            pass
 
     def get_priority_weights(self):
         if not self.data:
@@ -411,12 +443,16 @@ class ExperiencePool(Dataset):
     def update_priorities(self, indices, losses):
         if len(self.priorities) == 0:
             return
+        changed = False
         for idx, loss_v in zip(indices, losses):
             i = int(idx)
             if 0 <= i < len(self.priorities):
                 lv = float(max(loss_v, 0.0))
                 boosted = 1.0 + lv
                 self.priorities[i] = 0.9 * self.priorities[i] + 0.1 * boosted
+                changed = True
+        if changed:
+            self.persist_priorities()
 
     def compute_priority_value(self, idx):
         if idx < 0 or idx >= len(self.data):
@@ -705,6 +741,7 @@ class DataWorker(QThread):
         super().__init__()
         self.queue = queue
         self.running = True
+        self.paused = False
         self.save_worker = SaveWorker()
         self.save_worker.start()
         self.regions = []
@@ -763,6 +800,15 @@ class DataWorker(QThread):
         self.release_ocr_resources()
         self.restore_ocr()
 
+    def set_paused(self, paused):
+        self.paused = paused
+
+    def get_backlog(self):
+        try:
+            return self.save_worker.q.qsize()
+        except Exception:
+            return 0
+
     def reload_regions(self):
         try:
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
@@ -814,6 +860,9 @@ class DataWorker(QThread):
 
     def run(self):
         while self.running:
+            if self.paused:
+                time.sleep(0.05)
+                continue
             try:
                 data = self.queue.get(timeout=0.1)
                 full_img, small_img, mx, my, click, source, save = data
@@ -1211,7 +1260,7 @@ class MainWin(QMainWindow):
         self.lbl_mem = QLabel("内存: 0%")
         self.lbl_gpu = QLabel("显卡: 0%")
         self.lbl_vram = QLabel("显存: 0GB")
-        self.lbl_disk = QLabel("磁盘: 0TB")
+        self.lbl_disk = QLabel("经验池: 0%")
         self.lbl_res = QLabel("分辨率: 0x0")
         self.lbl_gpu_temp = QLabel("显卡温度: 0°C")
         self.lbl_gpu_power = QLabel("显卡功耗: 0W")
@@ -1233,15 +1282,17 @@ class MainWin(QMainWindow):
         self.p_mem = SciFiPlot("内存", '#00ffff')
         self.p_gpu = SciFiPlot("显卡", '#ff0055')
         self.p_vram = SciFiPlot("显存", '#ffaa00')
-        
-        self.d_cpu, self.d_mem, self.d_gpu, self.d_vram = [], [], [], []
-        for x in [self.d_cpu, self.d_mem, self.d_gpu, self.d_vram]:
+        self.p_pool = SciFiPlot("经验池", '#66aaff')
+
+        self.d_cpu, self.d_mem, self.d_gpu, self.d_vram, self.d_pool = [], [], [], [], []
+        for x in [self.d_cpu, self.d_mem, self.d_gpu, self.d_vram, self.d_pool]:
             x.extend([0]*100)
-            
+
         gl.addWidget(self.p_cpu, 0, 0)
         gl.addWidget(self.p_mem, 0, 1)
         gl.addWidget(self.p_gpu, 1, 0)
         gl.addWidget(self.p_vram, 1, 1)
+        gl.addWidget(self.p_pool, 2, 0, 1, 2)
         fl.addLayout(gl, stretch=1)
         
         btns = QHBoxLayout()
@@ -1492,12 +1543,16 @@ class MainWin(QMainWindow):
             except Exception:
                 scale = SCALE_PERCENT
 
+        with POOL_LOCK:
+            pool_bytes = POOL_TOTAL_BYTES_CACHE
+        pool_percent = clamp01(pool_bytes / max(POOL_MAX_BYTES, 1)) * 100
+
         self.lbl_cpu.setText(f"处理器: {cpu}%")
         self.lbl_mem.setText(f"内存: {mem}%")
         self.lbl_gpu.setText(f"显卡: {gpu_display}")
         vram_hint = " (OCR已切换CPU)" if self.worker.force_cpu else ""
         self.lbl_vram.setText(f"显存: {vram_display}{vram_hint}")
-        self.lbl_disk.setText(f"磁盘可用: {disk.free/(1024**4):.2f}TB")
+        self.lbl_disk.setText(f"经验池: {pool_percent:.1f}% ({pool_bytes/(1024**3):.2f}/{POOL_MAX_BYTES/(1024**3):.2f}GB) | 磁盘可用: {disk.free/(1024**4):.2f}TB")
         self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
         self.lbl_gpu_temp.setText(f"显卡温度: {gpu_temp:.0f}°C")
         self.lbl_gpu_power.setText(f"显卡功耗: {gpu_power:.1f}W")
@@ -1518,7 +1573,11 @@ class MainWin(QMainWindow):
         else:
             self.loop_sleep = 0.001
 
-        for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0]):
+        backlog = self.worker.get_backlog() if hasattr(self, 'worker') and self.worker is not None else 0
+        pause_worker = load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95) or qd > 3.0 or backlog > 200
+        self.worker.set_paused(pause_worker)
+
+        for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram, self.d_pool], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0, pool_percent]):
             l.pop(0)
             l.append(v)
 
@@ -1527,6 +1586,7 @@ class MainWin(QMainWindow):
             self.p_mem.plot(self.d_mem, pen=pg.mkPen('#00ffff', width=2), clear=True)
             self.p_gpu.plot(self.d_gpu, pen=pg.mkPen('#ff0055', width=2), clear=True)
             self.p_vram.plot(self.d_vram, pen=pg.mkPen('#ffaa00', width=2), clear=True)
+            self.p_pool.plot(self.d_pool, pen=pg.mkPen('#66aaff', width=2), clear=True)
 
     def loop(self):
         if self.mode in ["OPTIMIZING", "SELECT"]: return
