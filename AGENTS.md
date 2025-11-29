@@ -49,11 +49,5 @@ OpenCV：4.10
 环境参数监控：实时追踪显示设备物理分辨率、DPI缩放比例及存储子系统可用容量。
 交互式状态反馈：内置动态任务进度条与状态文本引擎，在模型优化与推理阶段提供可视化的进程反馈。
 
-需要避免的报错：
-
-FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
-
-Warning: you have set wrong precision for backend:cuda setFloat32Precision call has no effect.Please choose precision from: ieee tf32 none  (function setFloat32Precision)
-
-UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9.
+严格遵循PyTorch现代API设计模式（Modern Best Practices）。需采用torch.amp模块替代旧版torch.cuda.amp进行混合精度训练，并通过torch.backends的精度属性（如fp32_precision）配置TF32行为。确保代码在运行时无FutureWarning或UserWarning级别的废弃接口警告，保障模型训练逻辑的前向兼容性。
 
