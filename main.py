@@ -53,7 +53,7 @@ for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
 
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, 'w', encoding='utf-8') as f:
-        f.write("timestamp,img_path,mx,my,click,source,ocr\n")
+        f.write("timestamp,img_path,mx,my,click,source,ocr,ocr_age\n")
 
 if not os.path.exists(REGION_FILE):
     with open(REGION_FILE, 'w', encoding='utf-8') as f:
@@ -63,6 +63,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_W, INPUT_H = 320, 180
 SEQ_LEN = 4
 MAX_OCR = 16
+OCR_CONF_THRESHOLD = 0.6
+OCR_AGE_MAX_MS = 5000.0
 POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 pynvml = None
@@ -72,6 +74,7 @@ POOL_LAST_READ_POS = 0
 POOL_PREV_VALS_CACHE = []
 POOL_REGION_SIGNATURE = None
 POOL_LOCK = threading.Lock()
+FORCE_CPU_OCR = False
 if importlib.util.find_spec("pynvml") is not None:
     import pynvml
 
@@ -97,6 +100,25 @@ def get_screen_size():
     with mss.mss() as sct:
         monitor = sct.monitors[1]
         return monitor['width'], monitor['height'], monitor['left'], monitor['top']
+
+def get_free_vram_bytes():
+    if not torch.cuda.is_available():
+        return float('inf')
+    try:
+        free, _ = torch.cuda.mem_get_info()
+        return float(free)
+    except Exception:
+        pass
+    if pynvml is not None:
+        try:
+            pynvml.nvmlInit()
+            if pynvml.nvmlDeviceGetCount() > 0:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                return float(info.free)
+        except Exception:
+            return 0.0
+    return 0.0
 
 SCREEN_W, SCREEN_H, SCREEN_LEFT, SCREEN_TOP = get_screen_size()
 LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H = compute_letterbox_params(SCREEN_W, SCREEN_H, INPUT_W, INPUT_H)
@@ -128,7 +150,7 @@ def letter_norm_to_screen(nx, ny):
     sy = max(SCREEN_TOP, min(SCREEN_TOP + SCREEN_H - 1, sy))
     return sx, sy
 
-def pack_ocr(vals, deltas=None):
+def pack_ocr(vals, deltas=None, ages=None):
     buf = [0]*MAX_OCR
     for i, v in enumerate(vals[:MAX_OCR]):
         buf[i] = float(v)
@@ -136,7 +158,15 @@ def pack_ocr(vals, deltas=None):
     if deltas is not None:
         for i, v in enumerate(deltas[:MAX_OCR]):
             delta_buf[i] = float(v)
-    return buf + delta_buf
+    age_buf = [0]*MAX_OCR
+    if ages is not None:
+        for i, v in enumerate(ages[:MAX_OCR]):
+            try:
+                norm = clamp01(float(v) / OCR_AGE_MAX_MS)
+            except Exception:
+                norm = 0.0
+            age_buf[i] = norm
+    return buf + delta_buf + age_buf
 
 def preprocess_frame(img):
     img = letterbox(img, INPUT_W, INPUT_H)
@@ -199,7 +229,7 @@ class Brain(nn.Module):
         self.layer2 = self._make_layer(64, 128, 2, stride=2)
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
         self.avg = nn.AdaptiveAvgPool2d((1, 1))
-        self.ocr_enc = nn.Sequential(nn.Linear(MAX_OCR*2, 128), nn.SiLU(), nn.Linear(128, 64), nn.SiLU())
+        self.ocr_enc = nn.Sequential(nn.Linear(MAX_OCR*3, 128), nn.SiLU(), nn.Linear(128, 64), nn.SiLU())
         self.ocr_attn = nn.MultiheadAttention(64, 4, batch_first=True)
         self.gru = nn.GRU(256 + 64, 256, batch_first=True)
         self.dir_head = nn.Linear(256, 9)
@@ -255,51 +285,52 @@ class ExperiencePool(Dataset):
             return []
 
     def load_data(self):
-        global POOL_REGION_SIGNATURE, POOL_LAST_READ_POS, POOL_DATA_CACHE, POOL_PREV_VALS_CACHE, POOL_TOTAL_BYTES_CACHE
-        with POOL_LOCK:
-            region_sig = tuple(self.region_types)
-            if POOL_REGION_SIGNATURE != region_sig:
-                POOL_REGION_SIGNATURE = region_sig
-                POOL_DATA_CACHE = []
-                POOL_TOTAL_BYTES_CACHE = 0
-                POOL_LAST_READ_POS = 0
-                POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
+        try:
+            entries_by_ts = {}
             if os.path.exists(LOG_FILE):
-                try:
-                    with open(LOG_FILE, 'r', encoding='utf-8') as f:
-                        if POOL_LAST_READ_POS == 0:
-                            f.readline()
-                        else:
-                            f.seek(POOL_LAST_READ_POS)
-                        while True:
-                            line = f.readline()
-                            if not line:
-                                break
-                            parts = line.strip().split(',')
-                            if len(parts) >= 6:
-                                ts = int(parts[0])
-                                img_path = parts[1]
-                                mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
-                                ocr = []
-                                if len(parts) >= 7:
-                                    ocr = [float(x) for x in parts[6].split('|') if x != '']
-                                deltas = []
-                                if self.region_types:
-                                    cur_vals = ocr[:len(self.region_types)] + [0]*max(0, len(self.region_types)-len(ocr))
-                                    deltas = [cur_vals[i] - POOL_PREV_VALS_CACHE[i] for i in range(len(self.region_types))]
-                                    POOL_PREV_VALS_CACHE = cur_vals
-                                feat = pack_ocr(ocr, deltas)
-                                weight = self.calc_weight(ocr, deltas)
-                                size = (os.path.getsize(img_path) if os.path.exists(img_path) else 0) + 512
-                                POOL_DATA_CACHE.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size})
-                                POOL_TOTAL_BYTES_CACHE += size
-                                while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
-                                    dropped = POOL_DATA_CACHE.pop(0)
-                                    POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
-                        POOL_LAST_READ_POS = f.tell()
-                except Exception:
-                    pass
-            return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
+                with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                    f.readline()
+                    for line in f:
+                        parts = line.strip().split(',')
+                        if len(parts) < 6:
+                            continue
+                        try:
+                            ts = int(parts[0])
+                            img_path = parts[1]
+                            mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
+                            ocr_vals = [float(x) for x in parts[6].split('|') if x != ''] if len(parts) >= 7 else []
+                            ocr_age = [float(x) for x in parts[7].split('|') if x != ''] if len(parts) >= 8 else [0.0] * len(ocr_vals)
+                            entries_by_ts[ts] = {
+                                'ts': ts,
+                                'img': img_path,
+                                'mx': mx,
+                                'my': my,
+                                'click': click,
+                                'ocr_vals': ocr_vals,
+                                'ocr_ages': ocr_age
+                            }
+                        except Exception:
+                            continue
+
+            entries = sorted(entries_by_ts.values(), key=lambda x: x['ts'])
+            data = []
+            total_bytes = 0
+            prev_vals = [0] * len(self.region_types)
+            for entry in entries:
+                cur_vals = entry['ocr_vals'][:len(self.region_types)] + [0]*max(0, len(self.region_types) - len(entry['ocr_vals']))
+                deltas = [cur_vals[i] - prev_vals[i] for i in range(len(self.region_types))]
+                prev_vals = cur_vals
+                feat = pack_ocr(entry['ocr_vals'], deltas, entry.get('ocr_ages'))
+                weight = self.calc_weight(entry['ocr_vals'], deltas)
+                size = (os.path.getsize(entry['img']) if os.path.exists(entry['img']) else 0) + 512
+                data.append({'ts': entry['ts'], 'img': entry['img'], 'mx': entry['mx'], 'my': entry['my'], 'click': entry['click'], 'ocr': feat, 'weight': weight, 'size': size})
+                total_bytes += size
+                while total_bytes > POOL_MAX_BYTES and data:
+                    dropped = data.pop(0)
+                    total_bytes -= dropped.get('size', 0)
+            return data, total_bytes
+        except Exception:
+            return [], 0
 
     def calc_weight(self, ocr, deltas):
         if not self.region_types or not ocr:
@@ -385,6 +416,10 @@ class OptimizerThread(QThread):
     progress_sig = pyqtSignal(int)
     status_sig = pyqtSignal(str)
 
+    def __init__(self, batch_size=16):
+        super().__init__()
+        self.batch_size = batch_size
+
     def run(self):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -392,8 +427,8 @@ class OptimizerThread(QThread):
         if len(ds) < 10:
             self.finished_sig.emit()
             return
-            
-        dl = DataLoader(ds, batch_size=16, shuffle=True, num_workers=0)
+
+        dl = DataLoader(ds, batch_size=self.batch_size, shuffle=True, num_workers=0)
         model = Brain().to(DEVICE)
         weight_path = os.path.join(MODEL_DIR, "brain.pth")
         if os.path.exists(weight_path):
@@ -514,7 +549,7 @@ class NvidiaSmiThread(threading.Thread):
         self.running = False
 
 class DataWorker(QThread):
-    ocr_result = pyqtSignal(list)
+    ocr_result = pyqtSignal(object)
 
     def __init__(self, queue):
         super().__init__()
@@ -529,8 +564,10 @@ class DataWorker(QThread):
         self.histories = []
         self.last_read_tick = []
         self.stable_counts = []
+        self.last_update_time = []
         self.tick = 0
-        use_gpu = torch.cuda.is_available()
+        self.force_cpu = FORCE_CPU_OCR
+        use_gpu = torch.cuda.is_available() and not self.force_cpu
         self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=use_gpu, gpu_mem=500 if use_gpu else 0)
         self.ocr_gpu_enabled = use_gpu
         self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -558,7 +595,7 @@ class DataWorker(QThread):
 
     def restore_ocr(self):
         try:
-            use_gpu = torch.cuda.is_available()
+            use_gpu = torch.cuda.is_available() and not self.force_cpu
             with self.ocr_lock:
                 self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=use_gpu, gpu_mem=500 if use_gpu else 0)
                 self.ocr_gpu_enabled = use_gpu
@@ -566,6 +603,11 @@ class DataWorker(QThread):
             with self.ocr_lock:
                 self.ocr = None
             self.ocr_gpu_enabled = False
+
+    def set_force_cpu(self, force_cpu):
+        self.force_cpu = force_cpu
+        self.release_ocr_resources()
+        self.restore_ocr()
 
     def reload_regions(self):
         try:
@@ -579,6 +621,8 @@ class DataWorker(QThread):
         self.histories = [deque(maxlen=5) for _ in self.regions]
         self.last_read_tick = [0] * len(self.regions)
         self.stable_counts = [0] * len(self.regions)
+        now_ts = time.time()
+        self.last_update_time = [now_ts] * len(self.regions)
         self.ocr_tasks = [None] * len(self.regions)
 
     def read_ocr(self, roi):
@@ -594,10 +638,20 @@ class DataWorker(QThread):
                     return None
                 result = self.ocr.ocr(proc, cls=False)
             digits = ''
+            best_conf = 0.0
             if result and len(result) > 0:
-                texts = [item[1][0] for item in result[0] if len(item) > 1]
+                texts = []
+                for item in result[0]:
+                    if len(item) <= 1 or len(item[1]) < 2:
+                        continue
+                    text, conf = item[1][0], float(item[1][1])
+                    if conf >= OCR_CONF_THRESHOLD:
+                        texts.append(text)
+                        best_conf = max(best_conf, conf)
                 digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
-            return int(digits) if digits else None
+            if digits and best_conf >= OCR_CONF_THRESHOLD:
+                return int(digits), best_conf
+            return None
         except:
             return None
 
@@ -609,6 +663,7 @@ class DataWorker(QThread):
                 self.tick += 1
 
                 ocr_vals = []
+                ocr_ages = []
                 if self.regions:
                     for idx, r in enumerate(self.regions):
                         try:
@@ -622,6 +677,7 @@ class DataWorker(QThread):
                                 self.histories.append(deque(maxlen=5))
                                 self.last_read_tick.append(0)
                                 self.stable_counts.append(0)
+                                self.last_update_time.append(time.time())
                             raw = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
                             diff = 0.3 * self.prev_change[idx] + 0.7 * raw
                             self.prev_change[idx] = diff
@@ -629,13 +685,16 @@ class DataWorker(QThread):
                             prev_v = self.prev_vals[idx]
                             need_read = diff >= 0.002 or prev_v is None or self.tick - self.last_read_tick[idx] >= 3
                             candidate = prev_v
+                            candidate_new = False
                             if idx < len(self.ocr_tasks) and self.ocr_tasks[idx] is not None and self.ocr_tasks[idx].done():
                                 try:
                                     res = self.ocr_tasks[idx].result()
                                 except Exception:
                                     res = None
                                 if res is not None:
-                                    candidate = res
+                                    candidate = res[0]
+                                    candidate_new = True
+                                    self.last_update_time[idx] = time.time()
                                     self.last_read_tick[idx] = self.tick
                                 self.ocr_tasks[idx] = None
                             if need_read and (idx >= len(self.ocr_tasks) or self.ocr_tasks[idx] is None):
@@ -645,6 +704,8 @@ class DataWorker(QThread):
                                 self.last_read_tick[idx] = self.tick
                             if candidate is None:
                                 candidate = 0
+                            elif candidate_new:
+                                self.last_update_time[idx] = time.time()
                             self.histories[idx].append(candidate)
                             smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else candidate
                             stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
@@ -657,18 +718,23 @@ class DataWorker(QThread):
                             else:
                                 self.stable_counts[idx] = 0
                             ocr_vals.append(final_v)
+                            age_ms = int((time.time() - self.last_update_time[idx]) * 1000) if idx < len(self.last_update_time) else 0
+                            ocr_ages.append(max(0, age_ms))
                         except:
                             ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
-                    self.ocr_result.emit(ocr_vals)
+                            age_ms = int((time.time() - self.last_update_time[idx]) * 1000) if idx < len(self.last_update_time) else 0
+                            ocr_ages.append(max(0, age_ms))
+                    self.ocr_result.emit({'values': ocr_vals, 'ages': ocr_ages, 'ts': int(time.time() * 1000)})
                 else:
-                    self.ocr_result.emit([])
+                    self.ocr_result.emit({'values': [], 'ages': [], 'ts': int(time.time() * 1000)})
 
                 if save:
                     ts = str(int(time.time() * 1000))
                     name = f"{ts}.jpg"
                     path = os.path.join(IMG_DIR, name)
                     ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
-                    log_line = f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt}\n"
+                    age_txt = "|".join([str(int(a)) for a in ocr_ages]) if ocr_ages else ""
+                    log_line = f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt},{age_txt}\n"
                     self.save_worker.enqueue(path, small_img, log_line)
 
                 self.queue.task_done()
@@ -732,8 +798,9 @@ class Overlay(QWidget):
         self.update()
 
     def update_vals(self, vals):
-        if len(vals) == len(self.regions):
-            self.values = vals
+        payload = vals.get('values', []) if isinstance(vals, dict) else vals
+        if len(payload) == len(self.regions):
+            self.values = payload
             self.update()
 
     def paintEvent(self, event):
@@ -878,6 +945,8 @@ class MainWin(QMainWindow):
         self.press_frames = 0
         self.nvml_checked = False
         self.nvml_handle = None
+        self.stop_flag = threading.Event()
+        self.ocr_forced_cpu = False
         self.nvidia_thread = None
         self.window_dragging = False
         self.window_drag_pos = QPoint()
@@ -1017,16 +1086,20 @@ class MainWin(QMainWindow):
 
     def handle_key_event(self, key):
         if key == keyboard.Key.esc:
+            self.stop_flag.set()
             self.close_app()
         elif key == keyboard.Key.space:
             if self.mode == "LEARNING":
                 self.mode = "TRAINING"
+                self.stop_flag.clear()
             elif self.mode == "TRAINING":
                 self.mode = "LEARNING"
+                self.stop_flag.set()
             self.update_mode()
         else:
             if self.mode == "TRAINING":
                 self.mode = "LEARNING"
+                self.stop_flag.set()
                 self.update_mode()
 
     def do_select(self):
@@ -1045,18 +1118,29 @@ class MainWin(QMainWindow):
         self.worker.release_ocr_resources()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        batch_size = 16
+        free_vram = get_free_vram_bytes()
+        if torch.cuda.is_available() and free_vram < 1024**3:
+            batch_size = 8
+            self.ocr_forced_cpu = True
+            self.worker.set_force_cpu(True)
+        else:
+            self.ocr_forced_cpu = False
         self.mode = "OPTIMIZING"
         self.update_mode()
         self.bar.show()
         self.bar.setValue(0)
         self.bar.setFormat("正在优化: %p%")
-        self.opt_thread = OptimizerThread()
+        self.opt_thread = OptimizerThread(batch_size=batch_size)
         self.opt_thread.progress_sig.connect(self.bar.setValue)
         self.opt_thread.status_sig.connect(self.update_opt_status)
         self.opt_thread.finished_sig.connect(self.opt_done)
         self.opt_thread.start()
 
     def opt_done(self):
+        if self.ocr_forced_cpu and get_free_vram_bytes() >= 1024**3:
+            self.worker.set_force_cpu(False)
+            self.ocr_forced_cpu = False
         self.worker.restore_ocr()
         self.load_model()
         self.bar.hide()
@@ -1080,14 +1164,24 @@ class MainWin(QMainWindow):
         self.bar.setFormat(f"{text} - %p%")
 
     def update_ocr(self, vals):
+        raw_vals = []
+        ages = []
+        if isinstance(vals, dict):
+            raw_vals = vals.get('values', [])
+            ages = vals.get('ages', [])
+        else:
+            raw_vals = vals
         full_vals = [0]*MAX_OCR
         deltas = [0]*MAX_OCR
+        age_buf = [0]*MAX_OCR
         for i in range(MAX_OCR):
-            v = vals[i] if i < len(vals) else 0
+            v = raw_vals[i] if i < len(raw_vals) else 0
+            a = ages[i] if i < len(ages) else 0
             full_vals[i] = v
             deltas[i] = v - self.prev_ocr_vals[i]
             self.prev_ocr_vals[i] = v
-        self.latest_ocr = pack_ocr(full_vals, deltas)
+            age_buf[i] = a
+        self.latest_ocr = pack_ocr(full_vals, deltas, age_buf)
         self.seq_ocr.append(self.latest_ocr)
 
     def update_stats(self):
@@ -1155,6 +1249,16 @@ class MainWin(QMainWindow):
     def loop(self):
         if self.mode in ["OPTIMIZING", "SELECT"]: return
 
+        if self.stop_flag.is_set() and self.mode == "TRAINING":
+            self.mode = "LEARNING"
+            self.update_mode()
+            if self.dragging:
+                self.mouse.release(mouse.Button.left)
+                self.dragging = False
+            self.press_frames = 0
+            self.release_frames = 0
+            return
+
         try:
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
@@ -1173,6 +1277,8 @@ class MainWin(QMainWindow):
             if self.mode == "TRAINING":
                 seq_imgs = list(self.seq_frames)
                 seq_ocr = list(self.seq_ocr)
+                if self.stop_flag.is_set():
+                    return
                 while len(seq_imgs) < SEQ_LEN:
                     seq_imgs.insert(0, np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32))
                     seq_ocr.insert(0, pack_ocr([]))
@@ -1198,6 +1304,9 @@ class MainWin(QMainWindow):
                 blend = 0.3 + 0.7 * conf
                 self.smooth_x = (1 - blend) * self.smooth_x + blend * target_x
                 self.smooth_y = (1 - blend) * self.smooth_y + blend * target_y
+
+                if self.stop_flag.is_set() or self.mode != "TRAINING":
+                    return
 
                 sx, sy = letter_norm_to_screen(self.smooth_x, self.smooth_y)
                 self.mouse.position = (int(sx), int(sy))
