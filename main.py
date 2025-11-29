@@ -70,7 +70,7 @@ OCR_AGE_MAX_MS = 5000.0
 POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 pynvml = None
-POOL_DATA_CACHE = []
+POOL_DATA_CACHE = deque()
 POOL_TOTAL_BYTES_CACHE = 0
 POOL_LAST_READ_POS = 0
 POOL_PREV_VALS_CACHE = []
@@ -348,7 +348,7 @@ class ExperiencePool(Dataset):
             with POOL_LOCK:
                 region_sig = tuple(self.region_types)
                 if POOL_REGION_SIGNATURE != region_sig:
-                    POOL_DATA_CACHE = []
+                    POOL_DATA_CACHE = deque()
                     POOL_TOTAL_BYTES_CACHE = 0
                     POOL_LAST_READ_POS = 0
                     POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
@@ -357,7 +357,7 @@ class ExperiencePool(Dataset):
                     return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
                 file_size = os.path.getsize(LOG_FILE)
                 if file_size < POOL_LAST_READ_POS:
-                    POOL_DATA_CACHE = []
+                    POOL_DATA_CACHE = deque()
                     POOL_TOTAL_BYTES_CACHE = 0
                     POOL_LAST_READ_POS = 0
                     POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
@@ -398,7 +398,7 @@ class ExperiencePool(Dataset):
                         POOL_DATA_CACHE.append(entry)
                         POOL_TOTAL_BYTES_CACHE += size
                         while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
-                            dropped = POOL_DATA_CACHE.pop(0)
+                            dropped = POOL_DATA_CACHE.popleft()
                             POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
                     POOL_LAST_READ_POS = f.tell()
                 return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
@@ -736,6 +736,7 @@ class NvidiaSmiThread(threading.Thread):
 class DataWorker(QThread):
     ocr_result = pyqtSignal(object)
     perf_signal = pyqtSignal(object)
+    status_signal = pyqtSignal(str)
 
     def __init__(self, queue):
         super().__init__()
@@ -754,9 +755,11 @@ class DataWorker(QThread):
         self.last_update_time = []
         self.tick = 0
         self.force_cpu = FORCE_CPU_OCR
-        use_gpu = torch.cuda.is_available() and not self.force_cpu
-        self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=use_gpu, gpu_mem=500 if use_gpu else 0)
-        self.ocr_gpu_enabled = use_gpu
+        self.ocr_gpu_enabled = False
+        self.ocr_gpu = None
+        self.ocr_cpu = None
+        self.ocr = None
+        self.init_ocr_instances()
         self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.ocr_lock = threading.Lock()
         self.ocr_tasks = []
@@ -766,39 +769,59 @@ class DataWorker(QThread):
         self.prev_time = None
         self.reload_regions()
 
+    def init_ocr_instances(self):
+        try:
+            if torch.cuda.is_available():
+                self.ocr_gpu = PaddleOCR(use_angle_cls=False, use_gpu=True, gpu_mem=500)
+                self.ocr_gpu_enabled = True
+        except Exception as e:
+            self.status_signal.emit(f"GPU OCR 初始化失败: {e}")
+            self.ocr_gpu = None
+            self.ocr_gpu_enabled = False
+        try:
+            self.ocr_cpu = PaddleOCR(use_angle_cls=False, use_gpu=False)
+        except Exception as e:
+            self.status_signal.emit(f"CPU OCR 初始化失败: {e}")
+            self.ocr_cpu = None
+        self.select_active_ocr()
+
     def release_ocr_resources(self):
         try:
             for i, t in enumerate(self.ocr_tasks):
                 if t is not None and t.done():
                     continue
                 self.ocr_tasks[i] = None
-            with self.ocr_lock:
-                if self.ocr is not None:
-                    try:
-                        del self.ocr
-                    except Exception:
-                        pass
-                self.ocr = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
             pass
 
-    def restore_ocr(self):
-        try:
-            use_gpu = torch.cuda.is_available() and not self.force_cpu
-            with self.ocr_lock:
-                self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=use_gpu, gpu_mem=500 if use_gpu else 0)
-                self.ocr_gpu_enabled = use_gpu
-        except Exception:
-            with self.ocr_lock:
+    def select_active_ocr(self):
+        with self.ocr_lock:
+            if not self.force_cpu and self.ocr_gpu is not None and self.ocr_gpu_enabled:
+                self.ocr = self.ocr_gpu
+            elif self.ocr_cpu is not None:
+                self.ocr = self.ocr_cpu
+            else:
                 self.ocr = None
-            self.ocr_gpu_enabled = False
+
+    def restore_ocr(self):
+        self.select_active_ocr()
+        if self.ocr is None:
+            self.status_signal.emit("未找到可用的OCR实例")
 
     def set_force_cpu(self, force_cpu):
         self.force_cpu = force_cpu
         self.release_ocr_resources()
         self.restore_ocr()
+        mode_txt = "CPU" if self.force_cpu or self.ocr_gpu is None else "GPU"
+        self.status_signal.emit(f"OCR 已切换至 {mode_txt} 模式")
+
+    def emit_status_snapshot(self):
+        mode_txt = "未初始化"
+        if self.ocr is not None:
+            mode_txt = "GPU" if self.ocr is self.ocr_gpu else "CPU"
+        self.status_signal.emit(f"OCR 已切换至 {mode_txt} 模式")
 
     def set_paused(self, paused):
         self.paused = paused
@@ -1145,8 +1168,16 @@ class MainWin(QMainWindow):
         
         self.brain = Brain().to(DEVICE)
         self.load_model()
-        
+
         self.mouse = mouse.Controller()
+
+        self.sct = None
+        self.monitor = None
+        try:
+            self.sct = mss.mss()
+            self.monitor = self.sct.monitors[1]
+        except Exception as e:
+            self.update_status_text(f"截屏初始化失败: {e}")
 
         self.queue = queue.Queue(maxsize=1)
         self.worker = DataWorker(self.queue)
@@ -1157,6 +1188,8 @@ class MainWin(QMainWindow):
         self.worker.ocr_result.connect(self.overlay.update_vals)
         self.worker.ocr_result.connect(self.update_ocr)
         self.worker.perf_signal.connect(self.update_perf)
+        self.worker.status_signal.connect(self.update_status_text)
+        self.worker.emit_status_snapshot()
 
         self.mode = "LEARNING"
         self.smooth_x, self.smooth_y = 0.5, 0.5
@@ -1212,7 +1245,9 @@ class MainWin(QMainWindow):
             try:
                 self.brain.load_state_dict(torch.load(path, map_location=DEVICE))
                 self.brain.eval()
-            except: pass
+                self.update_status_text("模型加载成功")
+            except Exception as e:
+                self.update_status_text(f"模型加载失败: {e}")
 
     def init_ui(self):
         c = QWidget()
@@ -1315,7 +1350,11 @@ class MainWin(QMainWindow):
         self.bar.setStyleSheet("QProgressBar {border: 1px solid #00f0ff; text-align: center; color: white;} QProgressBar::chunk {background-color: #00f0ff;}")
         self.bar.hide()
         fl.addWidget(self.bar)
-        
+
+        self.status_lbl = QLabel("状态: 就绪")
+        self.status_lbl.setStyleSheet("color: #00f0ff; font-size: 14px; padding: 6px;")
+        fl.addWidget(self.status_lbl)
+
         fl.addWidget(QLabel("[空格] 切换训练 | [ESC] 退出 | 其他键中断训练", alignment=Qt.AlignCenter))
         main_layout.addWidget(frame)
 
@@ -1429,6 +1468,10 @@ class MainWin(QMainWindow):
 
     def update_opt_status(self, text):
         self.bar.setFormat(f"{text} - %p%")
+
+    def update_status_text(self, text):
+        if hasattr(self, 'status_lbl'):
+            self.status_lbl.setText(f"状态: {text}")
 
     def update_perf(self, payload):
         if isinstance(payload, dict) and 'ocr_time_ms' in payload:
@@ -1604,9 +1647,14 @@ class MainWin(QMainWindow):
         loop_start = time.time()
         try:
             cap_start = time.time()
-            with mss.mss() as sct:
-                monitor = sct.monitors[1]
-                img = np.array(sct.grab(monitor))
+            if self.sct is None or self.monitor is None:
+                try:
+                    self.sct = mss.mss()
+                    self.monitor = self.sct.monitors[1]
+                except Exception as e:
+                    self.update_status_text(f"截屏失败: {e}")
+                    return
+            img = np.array(self.sct.grab(self.monitor))
             cap_end = time.time()
             self.capture_latency_ms = (cap_end - cap_start) * 1000.0
             if self.prev_capture_ts is not None:
@@ -1660,6 +1708,8 @@ class MainWin(QMainWindow):
                     return
 
                 sx, sy = letter_norm_to_screen(self.smooth_x, self.smooth_y)
+                if self.stop_flag.is_set() or self.mode != "TRAINING":
+                    return
                 self.mouse.position = (int(sx), int(sy))
                 now = time.time()
                 if pc >= self.press_thresh:
@@ -1670,12 +1720,16 @@ class MainWin(QMainWindow):
                     self.release_frames += 1
                 else:
                     self.release_frames = 0
+                if self.stop_flag.is_set() or self.mode != "TRAINING":
+                    return
                 if not self.dragging and self.press_frames >= 2:
                     self.mouse.press(mouse.Button.left)
                     self.dragging = True
                     self.last_press_time = now
                     self.release_frames = 0
                 elif self.dragging and (pc <= 0.1 or (self.release_frames >= 3 and now - self.last_press_time >= self.min_press)):
+                    if self.stop_flag.is_set() or self.mode != "TRAINING":
+                        return
                     self.mouse.release(mouse.Button.left)
                     self.dragging = False
                     self.press_frames = 0
@@ -1721,6 +1775,11 @@ class MainWin(QMainWindow):
             self.nvidia_thread.join()
         if self.dragging:
             self.mouse.release(mouse.Button.left)
+        if self.sct is not None:
+            try:
+                self.sct.close()
+            except Exception:
+                pass
         QApplication.quit()
         sys.exit()
 
