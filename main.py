@@ -53,7 +53,7 @@ for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
 
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, 'w', encoding='utf-8') as f:
-        f.write("timestamp,img_path,mx,my,click,source,ocr,ocr_age\n")
+        f.write("timestamp,img_path,mx,my,click,source,ocr,ocr_age,novelty,complexity\n")
 
 if not os.path.exists(REGION_FILE):
     with open(REGION_FILE, 'w', encoding='utf-8') as f:
@@ -301,6 +301,8 @@ class ExperiencePool(Dataset):
                             mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
                             ocr_vals = [float(x) for x in parts[6].split('|') if x != ''] if len(parts) >= 7 else []
                             ocr_age = [float(x) for x in parts[7].split('|') if x != ''] if len(parts) >= 8 else [0.0] * len(ocr_vals)
+                            novelty = float(parts[8]) if len(parts) >= 9 else 0.0
+                            complexity = float(parts[9]) if len(parts) >= 10 else 0.0
                             entries_by_ts[ts] = {
                                 'ts': ts,
                                 'img': img_path,
@@ -308,7 +310,9 @@ class ExperiencePool(Dataset):
                                 'my': my,
                                 'click': click,
                                 'ocr_vals': ocr_vals,
-                                'ocr_ages': ocr_age
+                                'ocr_ages': ocr_age,
+                                'novelty': novelty,
+                                'complexity': complexity
                             }
                         except Exception:
                             continue
@@ -322,7 +326,7 @@ class ExperiencePool(Dataset):
                 deltas = [cur_vals[i] - prev_vals[i] for i in range(len(self.region_types))]
                 prev_vals = cur_vals
                 feat = pack_ocr(entry['ocr_vals'], deltas, entry.get('ocr_ages'))
-                weight = self.calc_weight(entry['ocr_vals'], deltas)
+                weight = self.calc_weight(entry['ocr_vals'], deltas, entry.get('click', 0.0), entry.get('novelty', 0.0), entry.get('complexity', 0.0))
                 size = (os.path.getsize(entry['img']) if os.path.exists(entry['img']) else 0) + 512
                 data.append({'ts': entry['ts'], 'img': entry['img'], 'mx': entry['mx'], 'my': entry['my'], 'click': entry['click'], 'ocr': feat, 'weight': weight, 'size': size})
                 total_bytes += size
@@ -354,9 +358,14 @@ class ExperiencePool(Dataset):
                 boosted = 1.0 + lv
                 self.priorities[i] = 0.9 * self.priorities[i] + 0.1 * boosted
 
-    def calc_weight(self, ocr, deltas):
+    def calc_weight(self, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0):
+        action_boost = 1.0 + 1.5 * abs(click)
+        novelty = float(clamp01(novelty))
+        complexity = float(clamp01(complexity))
+        novelty_boost = 1.0 + 2.0 * novelty
+        complexity_boost = 1.0 + 2.0 * complexity
         if not self.region_types or not ocr:
-            return 1.0
+            return max(0.05, action_boost * novelty_boost * complexity_boost)
         score = 0.0
         total = 0.0
         for idx, t in enumerate(self.region_types):
@@ -373,7 +382,8 @@ class ExperiencePool(Dataset):
         magnitude = 1.0 + float(np.log1p(total))
         if score < 0:
             base *= 0.5
-        return max(0.05, base * magnitude)
+        reward_boost = base * magnitude
+        return max(0.05, reward_boost * action_boost * novelty_boost * complexity_boost)
 
     def cache_image(self, path):
         if path in self.cache:
@@ -556,7 +566,7 @@ class NvidiaSmiThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.running = True
-        self.result = (0.0, 0.0, 1.0)
+        self.result = (0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
         self.startup_info = None
 
     def run(self):
@@ -566,7 +576,7 @@ class NvidiaSmiThread(threading.Thread):
                     si = subprocess.STARTUPINFO()
                     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                     self.startup_info = si
-                o = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], startupinfo=self.startup_info)
+                o = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed", "--format=csv,noheader,nounits"], startupinfo=self.startup_info)
                 self.result = tuple(map(float, o.decode('utf-8').strip().split(',')))
             except Exception:
                 pass
@@ -577,6 +587,7 @@ class NvidiaSmiThread(threading.Thread):
 
 class DataWorker(QThread):
     ocr_result = pyqtSignal(object)
+    perf_signal = pyqtSignal(object)
 
     def __init__(self, queue):
         super().__init__()
@@ -600,6 +611,10 @@ class DataWorker(QThread):
         self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.ocr_lock = threading.Lock()
         self.ocr_tasks = []
+        self.prev_small = None
+        self.prev_pos = None
+        self.prev_vel = (0.0, 0.0)
+        self.prev_time = None
         self.reload_regions()
 
     def release_ocr_resources(self):
@@ -653,6 +668,7 @@ class DataWorker(QThread):
         self.ocr_tasks = [None] * len(self.regions)
 
     def read_ocr(self, roi):
+        st = time.time()
         try:
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             min_side = min(gray.shape[:2])
@@ -681,6 +697,8 @@ class DataWorker(QThread):
             return None
         except:
             return None
+        finally:
+            self.perf_signal.emit({'ocr_time_ms': (time.time() - st) * 1000.0})
 
     def run(self):
         while self.running:
@@ -688,6 +706,29 @@ class DataWorker(QThread):
                 data = self.queue.get(timeout=0.1)
                 full_img, small_img, mx, my, click, source, save = data
                 self.tick += 1
+                now = time.time()
+                if self.prev_time is None:
+                    self.prev_time = now
+                dt = max(now - self.prev_time, 1e-3)
+                vel_x = (mx - (self.prev_pos[0] if self.prev_pos else mx)) / dt
+                vel_y = (my - (self.prev_pos[1] if self.prev_pos else my)) / dt
+                acc_x = (vel_x - self.prev_vel[0]) / dt
+                acc_y = (vel_y - self.prev_vel[1]) / dt
+                vel_mag = (vel_x**2 + vel_y**2) ** 0.5
+                prev_vel_mag = (self.prev_vel[0]**2 + self.prev_vel[1]**2) ** 0.5
+                dot = vel_x * self.prev_vel[0] + vel_y * self.prev_vel[1]
+                denom = max(vel_mag * prev_vel_mag, 1e-6)
+                angle = np.arccos(np.clip(dot / denom, -1.0, 1.0)) if denom > 1e-6 else 0.0
+                accel_mag = (acc_x**2 + acc_y**2) ** 0.5
+                complexity = clamp01(0.5 * min(accel_mag, 5.0) / 5.0 + 0.5 * (angle / np.pi))
+                novelty = 0.0
+                if self.prev_small is not None:
+                    diff = small_img.astype(np.float32) - self.prev_small.astype(np.float32)
+                    novelty = clamp01(float(np.mean(diff * diff)) / (255.0 * 255.0) * 3.0)
+                self.prev_small = small_img.copy()
+                self.prev_pos = (mx, my)
+                self.prev_vel = (vel_x, vel_y)
+                self.prev_time = now
 
                 ocr_vals = []
                 ocr_ages = []
@@ -761,7 +802,7 @@ class DataWorker(QThread):
                     path = os.path.join(IMG_DIR, name)
                     ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
                     age_txt = "|".join([str(int(a)) for a in ocr_ages]) if ocr_ages else ""
-                    log_line = f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt},{age_txt}\n"
+                    log_line = f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt},{age_txt},{novelty:.6f},{complexity:.6f}\n"
                     self.save_worker.enqueue(path, small_img, log_line)
 
                 self.queue.task_done()
@@ -954,6 +995,7 @@ class MainWin(QMainWindow):
         self.overlay.show()
         self.worker.ocr_result.connect(self.overlay.update_vals)
         self.worker.ocr_result.connect(self.update_ocr)
+        self.worker.perf_signal.connect(self.update_perf)
 
         self.mode = "LEARNING"
         self.smooth_x, self.smooth_y = 0.5, 0.5
@@ -978,6 +1020,14 @@ class MainWin(QMainWindow):
         self.window_dragging = False
         self.window_drag_pos = QPoint()
         self.vram_auto_cpu = False
+        self.capture_latency_ms = 0.0
+        self.ocr_latency_ms = 0.0
+        self.infer_latency_ms = 0.0
+        self.loop_latency_ms = 0.0
+        self.frame_interval_ms = 0.0
+        self.prev_capture_ts = None
+        self.prev_disk_io = psutil.disk_io_counters()
+        self.prev_disk_ts = time.time()
 
         self.key_signal.connect(self.handle_key_event)
         self.click_signal.connect(self.handle_click_event)
@@ -1048,8 +1098,16 @@ class MainWin(QMainWindow):
         self.lbl_vram = QLabel("显存: 0GB")
         self.lbl_disk = QLabel("磁盘: 0TB")
         self.lbl_res = QLabel("分辨率: 0x0")
-        
-        for i, l in enumerate([self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_disk, self.lbl_res]):
+        self.lbl_gpu_temp = QLabel("显卡温度: 0°C")
+        self.lbl_gpu_power = QLabel("显卡功耗: 0W")
+        self.lbl_gpu_fan = QLabel("风扇: 0%")
+        self.lbl_disk_io = QLabel("磁盘IO: 0MB/s")
+        self.lbl_disk_lat = QLabel("磁盘延迟: 0ms")
+        self.lbl_latency = QLabel("延迟: 截屏0ms | 推理0ms | OCR0ms | 循环0ms")
+        self.lbl_fps = QLabel("帧率: 0fps | 截屏间隔0ms")
+
+        info_labels = [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_disk, self.lbl_res, self.lbl_gpu_temp, self.lbl_gpu_power, self.lbl_gpu_fan, self.lbl_disk_io, self.lbl_disk_lat, self.lbl_latency, self.lbl_fps]
+        for i, l in enumerate(info_labels):
             l.setStyleSheet("color: #00f0ff; font-size: 14px; padding: 5px;")
             grid.addWidget(l, i//3, i%3)
         fl.addLayout(grid)
@@ -1114,6 +1172,10 @@ class MainWin(QMainWindow):
 
     def handle_key_event(self, key):
         if key == keyboard.Key.esc:
+            try:
+                self.mouse.release(mouse.Button.left)
+            except Exception:
+                pass
             self.stop_flag.set()
             self.close_app()
         elif key == keyboard.Key.space:
@@ -1121,11 +1183,21 @@ class MainWin(QMainWindow):
                 self.mode = "TRAINING"
                 self.stop_flag.clear()
             elif self.mode == "TRAINING":
+                try:
+                    self.mouse.release(mouse.Button.left)
+                except Exception:
+                    pass
+                self.dragging = False
                 self.mode = "LEARNING"
                 self.stop_flag.set()
             self.update_mode()
         else:
             if self.mode == "TRAINING":
+                try:
+                    self.mouse.release(mouse.Button.left)
+                except Exception:
+                    pass
+                self.dragging = False
                 self.mode = "LEARNING"
                 self.stop_flag.set()
                 self.update_mode()
@@ -1191,6 +1263,13 @@ class MainWin(QMainWindow):
     def update_opt_status(self, text):
         self.bar.setFormat(f"{text} - %p%")
 
+    def update_perf(self, payload):
+        if isinstance(payload, dict) and 'ocr_time_ms' in payload:
+            try:
+                self.ocr_latency_ms = float(payload.get('ocr_time_ms', self.ocr_latency_ms))
+            except Exception:
+                pass
+
     def update_ocr(self, vals):
         raw_vals = []
         ages = []
@@ -1219,6 +1298,9 @@ class MainWin(QMainWindow):
         gpu_display = "N/A"
         vram_display = "N/A"
         gpu_u, vram_u, vram_t = 0, 0, 1
+        gpu_temp = 0.0
+        gpu_power = 0.0
+        gpu_fan = 0.0
         if torch.cuda.is_available():
             if not self.nvml_checked and pynvml is not None:
                 try:
@@ -1235,6 +1317,9 @@ class MainWin(QMainWindow):
                     gpu_u = float(util.gpu)
                     vram_u = mem_info.used / (1024 * 1024)
                     vram_t = max(mem_info.total / (1024 * 1024), 1)
+                    gpu_temp = float(pynvml.nvmlDeviceGetTemperature(self.nvml_handle, pynvml.NVML_TEMPERATURE_GPU))
+                    gpu_power = float(pynvml.nvmlDeviceGetPowerUsage(self.nvml_handle)) / 1000.0
+                    gpu_fan = float(pynvml.nvmlDeviceGetFanSpeed(self.nvml_handle))
                     gpu_display = f"{gpu_u}%"
                     vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
                 except Exception:
@@ -1244,7 +1329,7 @@ class MainWin(QMainWindow):
                     self.nvidia_thread = NvidiaSmiThread()
                     self.nvidia_thread.start()
                 stats = self.nvidia_thread.result
-                gpu_u, vram_u, vram_t = stats if len(stats) == 3 else (0, 0, 1)
+                gpu_u, vram_u, vram_t, gpu_temp, gpu_power, gpu_fan = stats if len(stats) == 6 else (0, 0, 1, 0, 0, 0)
                 gpu_display = f"{gpu_u}%"
                 vram_total = max(vram_t, 1)
                 vram_display = f"{vram_u/1024:.1f}/{vram_total/1024:.1f}GB"
@@ -1266,6 +1351,16 @@ class MainWin(QMainWindow):
                 self.ocr_forced_cpu = False
 
         disk = psutil.disk_usage(os.path.abspath(os.sep))
+        now_io = psutil.disk_io_counters()
+        now_ts = time.time()
+        dt = max(now_ts - self.prev_disk_ts, 1e-6)
+        rb = max(now_io.read_bytes - self.prev_disk_io.read_bytes, 0)
+        wb = max(now_io.write_bytes - self.prev_disk_io.write_bytes, 0)
+        io_throughput = (rb + wb) / dt / (1024 * 1024)
+        ops = max((now_io.read_count - self.prev_disk_io.read_count) + (now_io.write_count - self.prev_disk_io.write_count), 1)
+        lat_ms = max((now_io.read_time - self.prev_disk_io.read_time) + (now_io.write_time - self.prev_disk_io.write_time), 0) / ops
+        self.prev_disk_io = now_io
+        self.prev_disk_ts = now_ts
         scale = SCALE_PERCENT
         if platform.system() == 'Windows':
             try:
@@ -1281,6 +1376,14 @@ class MainWin(QMainWindow):
         self.lbl_vram.setText(f"显存: {vram_display}{vram_hint}")
         self.lbl_disk.setText(f"磁盘可用: {disk.free/(1024**4):.2f}TB")
         self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
+        self.lbl_gpu_temp.setText(f"显卡温度: {gpu_temp:.0f}°C")
+        self.lbl_gpu_power.setText(f"显卡功耗: {gpu_power:.1f}W")
+        self.lbl_gpu_fan.setText(f"风扇: {gpu_fan:.0f}%")
+        self.lbl_disk_io.setText(f"磁盘IO: {io_throughput:.2f}MB/s")
+        self.lbl_disk_lat.setText(f"磁盘延迟: {lat_ms:.2f}ms")
+        fps = 1000.0 / self.frame_interval_ms if self.frame_interval_ms > 0 else 0.0
+        self.lbl_latency.setText(f"延迟: 截屏{self.capture_latency_ms:.1f}ms | 推理{self.infer_latency_ms:.1f}ms | OCR{self.ocr_latency_ms:.1f}ms | 循环{self.loop_latency_ms:.1f}ms")
+        self.lbl_fps.setText(f"帧率: {fps:.1f}fps | 截屏间隔{self.frame_interval_ms:.1f}ms")
 
         for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0]):
             l.pop(0)
@@ -1304,10 +1407,17 @@ class MainWin(QMainWindow):
             self.release_frames = 0
             return
 
+        loop_start = time.time()
         try:
+            cap_start = time.time()
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
                 img = np.array(sct.grab(monitor))
+            cap_end = time.time()
+            self.capture_latency_ms = (cap_end - cap_start) * 1000.0
+            if self.prev_capture_ts is not None:
+                self.frame_interval_ms = (cap_start - self.prev_capture_ts) * 1000.0
+            self.prev_capture_ts = cap_start
             frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             proc = preprocess_frame(rgb)
@@ -1330,12 +1440,14 @@ class MainWin(QMainWindow):
                 seq_imgs = torch.tensor(np.stack(seq_imgs)[None, ...], dtype=torch.float32, device=DEVICE)
                 seq_ocr = torch.tensor(np.stack(seq_ocr)[None, ...], dtype=torch.float32, device=DEVICE)
 
+                infer_st = time.time()
                 with torch.no_grad():
                     if torch.cuda.is_available():
                         with torch.amp.autocast('cuda'):
                             out, logits, delta_out = self.brain(seq_imgs, seq_ocr)
                     else:
                         out, logits, delta_out = self.brain(seq_imgs, seq_ocr)
+                self.infer_latency_ms = (time.time() - infer_st) * 1000.0
 
                 px, py, pc = out[0].cpu().numpy()
                 delta_pred = delta_out[0].cpu().numpy()
@@ -1402,6 +1514,7 @@ class MainWin(QMainWindow):
                 self.queue.put_nowait((frame, small, nx, ny, click, source, save))
             except queue.Full:
                 pass
+            self.loop_latency_ms = (time.time() - loop_start) * 1000.0
 
         except Exception: pass
 
