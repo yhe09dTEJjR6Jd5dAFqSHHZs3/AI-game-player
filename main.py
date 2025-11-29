@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import json
+import math
 import random
 import threading
 import queue
@@ -16,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset
 from pynput import mouse, keyboard
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QProgressBar,
@@ -265,6 +266,61 @@ class Brain(nn.Module):
         dirs = self.dir_head(feat)
         return self.fc(feat), dirs, self.delta_head(feat)
 
+class SumTree:
+    def __init__(self, capacity):
+        cap = 1
+        while cap < max(1, capacity):
+            cap <<= 1
+        self.capacity = cap
+        self.size = capacity
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def build(self, values):
+        n = min(len(values), self.capacity)
+        self.tree[self.capacity:self.capacity + n] = values[:n]
+        for i in range(self.capacity - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    @property
+    def total(self):
+        return float(self.tree[1]) if len(self.tree) > 1 else 0.0
+
+    def update(self, idx, value):
+        if idx < 0 or idx >= self.size:
+            return
+        pos = self.capacity + idx
+        self.tree[pos] = float(value)
+        pos //= 2
+        while pos >= 1:
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+            pos //= 2
+
+    def sample(self, batch_size):
+        res = []
+        weights = []
+        if self.total <= 0:
+            return res, weights
+        segment = self.total / batch_size
+        for i in range(batch_size):
+            target = random.random() * segment + i * segment
+            res.append(self._find(target))
+            weights.append(self.tree[self.capacity + res[-1]] if res[-1] is not None else 0.0)
+        return res, weights
+
+    def _find(self, value):
+        idx = 1
+        while idx < self.capacity:
+            left = 2 * idx
+            if self.tree[left] == 0 and self.tree[left + 1] == 0:
+                idx = left
+            elif value <= self.tree[left]:
+                idx = left
+            else:
+                value -= self.tree[left]
+                idx = left + 1
+        res_idx = idx - self.capacity
+        return res_idx if res_idx < self.size else self.size - 1
+
 class ExperiencePool(Dataset):
     def __init__(self):
         self.cache = {}
@@ -349,13 +405,8 @@ class ExperiencePool(Dataset):
     def get_priority_weights(self):
         if not self.data:
             return []
-        base = np.array([d.get('weight', 1.0) for d in self.data], dtype=np.float32)
-        scaled = (base * (self.priorities + 1e-3)) ** 1.2
-        scaled = np.clip(scaled, 1e-3, None)
-        max_v = float(np.max(scaled)) if scaled.size > 0 else 1.0
-        if max_v > 0:
-            scaled = scaled / max_v
-        return scaled.tolist()
+        vals = [self.compute_priority_value(i) for i in range(len(self.data))]
+        return vals
 
     def update_priorities(self, indices, losses):
         if len(self.priorities) == 0:
@@ -366,6 +417,13 @@ class ExperiencePool(Dataset):
                 lv = float(max(loss_v, 0.0))
                 boosted = 1.0 + lv
                 self.priorities[i] = 0.9 * self.priorities[i] + 0.1 * boosted
+
+    def compute_priority_value(self, idx):
+        if idx < 0 or idx >= len(self.data):
+            return 0.0
+        base = float(self.data[idx].get('weight', 1.0))
+        scaled = (base * (float(self.priorities[idx]) + 1e-3)) ** 1.2
+        return float(max(scaled, 1e-3))
 
     def calc_weight(self, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0):
         action_boost = 1.0 + 1.5 * abs(click)
@@ -426,6 +484,7 @@ class ExperiencePool(Dataset):
         for j in range(start, idx + 1):
             item = self.data[j]
             img = self.cache_image(item['img'])
+            img = self.augment_image(img)
             seq_imgs.append(img)
             seq_ocr.append(item['ocr'])
         mx, my, click = self.data[idx]['mx'], self.data[idx]['my'], self.data[idx]['click']
@@ -451,6 +510,27 @@ class ExperiencePool(Dataset):
             recency_ratio = (idx + 1) / max(1, len(self.data))
         w = torch.tensor(self.data[idx]['weight'] * (0.5 + 0.5 * recency_ratio), dtype=torch.float32)
         return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w, torch.tensor(idx, dtype=torch.long)
+
+    def augment_image(self, img):
+        if random.random() < 0.5:
+            return img
+        h, w = img.shape[1], img.shape[2]
+        arr = np.transpose(img, (1, 2, 0)).copy()
+        if random.random() < 0.5:
+            gain = 0.8 + 0.4 * random.random()
+            bias = (random.random() - 0.5) * 0.1
+            arr[..., :3] = np.clip(arr[..., :3] * gain + bias, 0.0, 1.0)
+        if random.random() < 0.3:
+            noise = np.random.normal(0, 0.02, size=(h, w, 3)).astype(np.float32)
+            arr[..., :3] = np.clip(arr[..., :3] + noise, 0.0, 1.0)
+        if random.random() < 0.3:
+            cut_ratio = 0.2 * random.random()
+            ch = int(h * cut_ratio)
+            cw = int(w * cut_ratio)
+            cy = random.randint(0, max(0, h - ch))
+            cx = random.randint(0, max(0, w - cw))
+            arr[cy:cy + ch, cx:cx + cw, :3] = 0
+        return np.transpose(arr.astype(np.float32), (2, 0, 1))
 
 class OptimizerThread(QThread):
     finished_sig = pyqtSignal()
@@ -488,11 +568,28 @@ class OptimizerThread(QThread):
 
         for ep in range(epochs):
             weights = ds.get_priority_weights()
-            sampler = WeightedRandomSampler(weights=weights, num_samples=len(ds), replacement=True) if weights else None
-            dl = DataLoader(ds, batch_size=self.batch_size, sampler=sampler, shuffle=sampler is None, num_workers=0)
+            tree = SumTree(len(weights))
+            tree.build(weights)
+            steps = math.ceil(len(ds) / self.batch_size)
             self.status_sig.emit(f"正在优化模型: 第 {ep+1}/{epochs} 轮")
-            for i, (imgs, ocrs, targs, dirs, delta_t, ws, idxs) in enumerate(dl):
-                imgs, ocrs, targs, dirs, delta_t, ws = imgs.to(DEVICE), ocrs.to(DEVICE), targs.to(DEVICE), dirs.to(DEVICE), delta_t.to(DEVICE), ws.to(DEVICE)
+            for step in range(steps):
+                idxs, _ = tree.sample(self.batch_size)
+                if not idxs:
+                    break
+                fixed = []
+                for i in idxs:
+                    if i is None or i < 0 or i >= len(ds):
+                        fixed.append(random.randint(0, len(ds) - 1))
+                    else:
+                        fixed.append(i)
+                batch = [ds[i] for i in fixed]
+                imgs = torch.stack([b[0] for b in batch]).to(DEVICE)
+                ocrs = torch.stack([b[1] for b in batch]).to(DEVICE)
+                targs = torch.stack([b[2] for b in batch]).to(DEVICE)
+                dirs = torch.stack([b[3] for b in batch]).to(DEVICE)
+                delta_t = torch.stack([b[4] for b in batch]).to(DEVICE)
+                ws = torch.stack([b[5] for b in batch]).to(DEVICE)
+                idx_tensor = torch.stack([b[6] for b in batch])
                 opt.zero_grad(set_to_none=True)
 
                 if scaler:
@@ -519,7 +616,13 @@ class OptimizerThread(QThread):
                     opt.step()
 
                 with torch.no_grad():
-                    ds.update_priorities(idxs.cpu().numpy(), (comb.detach().cpu().numpy()))
+                    loss_arr = comb.detach().cpu().numpy()
+                    idx_arr = idx_tensor.cpu().numpy()
+                    ds.update_priorities(idx_arr, loss_arr)
+                    for j in idx_arr:
+                        tree.update(int(j), ds.compute_priority_value(int(j)))
+
+                self.progress_sig.emit(int(((ep * steps) + step + 1) / (epochs * steps) * 100))
 
             self.progress_sig.emit(int((ep + 1) / epochs * 100))
 
@@ -839,7 +942,7 @@ class InferenceThread(QThread):
     def run(self):
         while self.running:
             self.owner.loop()
-            time.sleep(0.001)
+            time.sleep(self.owner.loop_sleep)
 
 class SciFiPlot(pg.PlotWidget):
     def __init__(self, title, color):
@@ -1037,6 +1140,9 @@ class MainWin(QMainWindow):
         self.prev_capture_ts = None
         self.prev_disk_io = psutil.disk_io_counters()
         self.prev_disk_ts = time.time()
+        self.process = psutil.Process(os.getpid())
+        self.loop_sleep = 0.001
+        self.plot_pause_until = 0.0
 
         self.key_signal.connect(self.handle_key_event)
         self.click_signal.connect(self.handle_click_event)
@@ -1302,8 +1408,8 @@ class MainWin(QMainWindow):
         self.seq_ocr.append(self.latest_ocr)
 
     def update_stats(self):
-        cpu = psutil.cpu_percent()
-        mem = psutil.virtual_memory().percent
+        cpu = self.process.cpu_percent()
+        mem = self.process.memory_info().rss / max(psutil.virtual_memory().total, 1) * 100
 
         gpu_display = "N/A"
         vram_display = "N/A"
@@ -1374,8 +1480,8 @@ class MainWin(QMainWindow):
             busy_ms = max(now_io.busy_time - getattr(self.prev_disk_io, 'busy_time', 0), 0)
             qd = busy_ms / (dt * 1000.0)
         else:
-            total_time = max((now_io.read_time - self.prev_disk_io.read_time) + (now_io.write_time - self.prev_disk_io.write_time), 0)
-            qd = total_time / (dt * 1000.0)
+            iops = ops / dt if dt > 0 else 0.0
+            qd = iops * (lat_ms / 1000.0)
         self.prev_disk_io = now_io
         self.prev_disk_ts = now_ts
         scale = SCALE_PERCENT
@@ -1403,14 +1509,24 @@ class MainWin(QMainWindow):
         self.lbl_latency.setText(f"延迟: 截屏{self.capture_latency_ms:.1f}ms | 推理{self.infer_latency_ms:.1f}ms | OCR{self.ocr_latency_ms:.1f}ms | 循环{self.loop_latency_ms:.1f}ms")
         self.lbl_fps.setText(f"帧率: {fps:.1f}fps | 截屏间隔{self.frame_interval_ms:.1f}ms")
 
+        load = max(cpu, gpu_u)
+        if load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95):
+            self.loop_sleep = 0.02
+            self.plot_pause_until = time.time() + 2.0
+        elif load > 80:
+            self.loop_sleep = 0.008
+        else:
+            self.loop_sleep = 0.001
+
         for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0]):
             l.pop(0)
             l.append(v)
 
-        self.p_cpu.plot(self.d_cpu, pen=pg.mkPen('#00ff00', width=2), clear=True)
-        self.p_mem.plot(self.d_mem, pen=pg.mkPen('#00ffff', width=2), clear=True)
-        self.p_gpu.plot(self.d_gpu, pen=pg.mkPen('#ff0055', width=2), clear=True)
-        self.p_vram.plot(self.d_vram, pen=pg.mkPen('#ffaa00', width=2), clear=True)
+        if time.time() >= self.plot_pause_until:
+            self.p_cpu.plot(self.d_cpu, pen=pg.mkPen('#00ff00', width=2), clear=True)
+            self.p_mem.plot(self.d_mem, pen=pg.mkPen('#00ffff', width=2), clear=True)
+            self.p_gpu.plot(self.d_gpu, pen=pg.mkPen('#ff0055', width=2), clear=True)
+            self.p_vram.plot(self.d_vram, pen=pg.mkPen('#ffaa00', width=2), clear=True)
 
     def loop(self):
         if self.mode in ["OPTIMIZING", "SELECT"]: return
