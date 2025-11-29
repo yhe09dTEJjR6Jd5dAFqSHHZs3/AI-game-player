@@ -66,6 +66,12 @@ MAX_OCR = 16
 POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 pynvml = None
+POOL_DATA_CACHE = []
+POOL_TOTAL_BYTES_CACHE = 0
+POOL_LAST_READ_POS = 0
+POOL_PREV_VALS_CACHE = []
+POOL_REGION_SIGNATURE = None
+POOL_LOCK = threading.Lock()
 if importlib.util.find_spec("pynvml") is not None:
     import pynvml
 
@@ -231,48 +237,67 @@ class Brain(nn.Module):
 
 class ExperiencePool(Dataset):
     def __init__(self):
-        self.data = []
         self.cache = {}
         self.cache_order = deque()
         self.cache_bytes = 0
         self.cache_limit = CACHE_MAX_BYTES
-        self.total_bytes = 0
+        self.region_types = self.load_region_types()
+        self.data, self.total_bytes = self.load_data()
+
+    def load_region_types(self):
         try:
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
                 regions = json.load(f)
-                self.region_types = [r.get('type', 'red') for r in regions]
+                return [r.get('type', 'red') for r in regions]
         except:
-            self.region_types = []
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, 'r', encoding='utf-8') as f:
-                lines = f.readlines()[1:]
-                prev_vals = [0]*len(self.region_types)
-                for line in lines:
-                    try:
-                        parts = line.strip().split(',')
-                        if len(parts) >= 6:
-                            ts = int(parts[0])
-                            img_path = parts[1]
-                            mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
-                            ocr = []
-                            if len(parts) >= 7:
-                                ocr = [float(x) for x in parts[6].split('|') if x != '']
-                            deltas = []
-                            if self.region_types:
-                                cur_vals = ocr[:len(self.region_types)] + [0]*max(0, len(self.region_types)-len(ocr))
-                                deltas = [cur_vals[i] - prev_vals[i] for i in range(len(self.region_types))]
-                                prev_vals = cur_vals
-                            feat = pack_ocr(ocr, deltas)
-                            weight = self.calc_weight(ocr, deltas)
-                            size = (os.path.getsize(img_path) if os.path.exists(img_path) else 0) + 512
-                            self.data.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size})
-                            self.total_bytes += size
-                            while self.total_bytes > POOL_MAX_BYTES and self.data:
-                                dropped = self.data.pop(0)
-                                self.total_bytes -= dropped.get('size', 0)
-                    except:
-                        pass
-        self.data.sort(key=lambda x: x['ts'])
+            return []
+
+    def load_data(self):
+        global POOL_REGION_SIGNATURE, POOL_LAST_READ_POS, POOL_DATA_CACHE, POOL_PREV_VALS_CACHE, POOL_TOTAL_BYTES_CACHE
+        with POOL_LOCK:
+            region_sig = tuple(self.region_types)
+            if POOL_REGION_SIGNATURE != region_sig:
+                POOL_REGION_SIGNATURE = region_sig
+                POOL_DATA_CACHE = []
+                POOL_TOTAL_BYTES_CACHE = 0
+                POOL_LAST_READ_POS = 0
+                POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
+            if os.path.exists(LOG_FILE):
+                try:
+                    with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                        if POOL_LAST_READ_POS == 0:
+                            f.readline()
+                        else:
+                            f.seek(POOL_LAST_READ_POS)
+                        while True:
+                            line = f.readline()
+                            if not line:
+                                break
+                            parts = line.strip().split(',')
+                            if len(parts) >= 6:
+                                ts = int(parts[0])
+                                img_path = parts[1]
+                                mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
+                                ocr = []
+                                if len(parts) >= 7:
+                                    ocr = [float(x) for x in parts[6].split('|') if x != '']
+                                deltas = []
+                                if self.region_types:
+                                    cur_vals = ocr[:len(self.region_types)] + [0]*max(0, len(self.region_types)-len(ocr))
+                                    deltas = [cur_vals[i] - POOL_PREV_VALS_CACHE[i] for i in range(len(self.region_types))]
+                                    POOL_PREV_VALS_CACHE = cur_vals
+                                feat = pack_ocr(ocr, deltas)
+                                weight = self.calc_weight(ocr, deltas)
+                                size = (os.path.getsize(img_path) if os.path.exists(img_path) else 0) + 512
+                                POOL_DATA_CACHE.append({'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size})
+                                POOL_TOTAL_BYTES_CACHE += size
+                                while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
+                                    dropped = POOL_DATA_CACHE.pop(0)
+                                    POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
+                        POOL_LAST_READ_POS = f.tell()
+                except Exception:
+                    pass
+            return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
 
     def calc_weight(self, ocr, deltas):
         if not self.region_types or not ocr:
@@ -288,10 +313,12 @@ class ExperiencePool(Dataset):
                 else:
                     score -= d
         norm = total + 1e-3
-        base = 1.0 + score/(norm*2)
+        direction = score / norm
+        base = 1.0 + 0.5 * direction
+        magnitude = 1.0 + float(np.log1p(total))
         if score < 0:
             base *= 0.5
-        return max(0.05, base)
+        return max(0.05, base * magnitude)
 
     def cache_image(self, path):
         if path in self.cache:
@@ -444,6 +471,29 @@ class SaveWorker(threading.Thread):
                 self.q.task_done()
             except queue.Empty:
                 break
+
+class NvidiaSmiThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.running = True
+        self.result = (0.0, 0.0, 1.0)
+        self.startup_info = None
+
+    def run(self):
+        while self.running:
+            try:
+                if self.startup_info is None and platform.system() == 'Windows':
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    self.startup_info = si
+                o = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], startupinfo=self.startup_info)
+                self.result = tuple(map(float, o.decode('utf-8').strip().split(',')))
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    def stop(self):
+        self.running = False
 
 class DataWorker(QThread):
     ocr_result = pyqtSignal(list)
@@ -775,7 +825,7 @@ class MainWin(QMainWindow):
         self.press_frames = 0
         self.nvml_checked = False
         self.nvml_handle = None
-        self.startup_info = None
+        self.nvidia_thread = None
         self.window_dragging = False
         self.window_drag_pos = QPoint()
         
@@ -1002,18 +1052,14 @@ class MainWin(QMainWindow):
                 except Exception:
                     pass
             elif pynvml is not None and platform.system() == 'Windows':
-                try:
-                    if self.startup_info is None:
-                        si = subprocess.STARTUPINFO()
-                        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                        self.startup_info = si
-                    o = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], startupinfo=self.startup_info)
-                    u, m, t = map(float, o.decode('utf-8').strip().split(','))
-                    gpu_u, vram_u, vram_t = u, m, t
-                    gpu_display = f"{gpu_u}%"
-                    vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
-                except Exception:
-                    pass
+                if self.nvidia_thread is None:
+                    self.nvidia_thread = NvidiaSmiThread()
+                    self.nvidia_thread.start()
+                stats = self.nvidia_thread.result
+                gpu_u, vram_u, vram_t = stats if len(stats) == 3 else (0, 0, 1)
+                gpu_display = f"{gpu_u}%"
+                vram_total = max(vram_t, 1)
+                vram_display = f"{vram_u/1024:.1f}/{vram_total/1024:.1f}GB"
 
         disk = psutil.disk_usage(os.path.abspath(os.sep))
         scale = SCALE_PERCENT
@@ -1143,6 +1189,9 @@ class MainWin(QMainWindow):
         self.infer_thread.stop()
         self.infer_thread.wait()
         self.worker.stop()
+        if self.nvidia_thread is not None:
+            self.nvidia_thread.stop()
+            self.nvidia_thread.join()
         if self.dragging:
             self.mouse.release(mouse.Button.left)
         QApplication.quit()
