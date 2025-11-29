@@ -63,7 +63,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_W, INPUT_H = 320, 180
 SEQ_LEN = 4
 MAX_OCR = 16
-POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
+POOL_MAX_BYTES = 15 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 pynvml = None
 POOL_DATA_CACHE = []
@@ -440,11 +440,20 @@ class OptimizerThread(QThread):
 class SaveWorker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self.q = queue.Queue()
+        self.q = queue.Queue(maxsize=256)
         self.running = True
 
     def enqueue(self, path, img, log_line):
-        self.q.put((path, img, log_line))
+        if self.q.full():
+            try:
+                self.q.get_nowait()
+                self.q.task_done()
+            except queue.Empty:
+                return
+        try:
+            self.q.put_nowait((path, img, log_line))
+        except queue.Full:
+            pass
 
     def run(self):
         while self.running or not self.q.empty():
@@ -787,6 +796,9 @@ class RegionEditor(QDialog):
         self.update()
 
 class MainWin(QMainWindow):
+    key_signal = pyqtSignal(object)
+    click_signal = pyqtSignal(object, bool)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("神经接口系统")
@@ -828,7 +840,10 @@ class MainWin(QMainWindow):
         self.nvidia_thread = None
         self.window_dragging = False
         self.window_drag_pos = QPoint()
-        
+
+        self.key_signal.connect(self.handle_key_event)
+        self.click_signal.connect(self.handle_click_event)
+
         self.init_ui()
         self.setup_listeners()
 
@@ -948,12 +963,18 @@ class MainWin(QMainWindow):
         self.m_listen.start()
 
     def on_click(self, x, y, b, p):
+        self.click_signal.emit(b, p)
+
+    def on_key(self, key):
+        self.key_signal.emit(key)
+
+    def handle_click_event(self, b, p):
         if p and b == mouse.Button.left:
             self.mouse_pressed = True
         elif not p and b == mouse.Button.left:
             self.mouse_pressed = False
 
-    def on_key(self, key):
+    def handle_key_event(self, key):
         if key == keyboard.Key.esc:
             self.close_app()
         elif key == keyboard.Key.space:
@@ -1167,7 +1188,7 @@ class MainWin(QMainWindow):
 
             save = False
             if (self.mode == "LEARNING" and source == "USER") or (self.mode == "TRAINING" and source == "AI"):
-                if time.time() - self.last_record > 0.1:
+                if time.time() - self.last_record > 0.033:
                     save = True
                     self.last_record = time.time()
 
