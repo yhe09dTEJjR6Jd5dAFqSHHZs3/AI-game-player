@@ -63,7 +63,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_W, INPUT_H = 320, 180
 SEQ_LEN = 4
 MAX_OCR = 16
-POOL_MAX_BYTES = 15 * 1024 * 1024 * 1024
+POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 pynvml = None
 POOL_DATA_CACHE = []
@@ -243,6 +243,8 @@ class ExperiencePool(Dataset):
         self.cache_limit = CACHE_MAX_BYTES
         self.region_types = self.load_region_types()
         self.data, self.total_bytes = self.load_data()
+        self.min_ts = min([d['ts'] for d in self.data], default=0)
+        self.max_ts = max([d['ts'] for d in self.data], default=0)
 
     def load_region_types(self):
         try:
@@ -370,15 +372,22 @@ class ExperiencePool(Dataset):
         d2 = torch.tensor([next2['mx']-mx, next2['my']-my], dtype=torch.float32)
         d3 = torch.tensor([next3['mx']-mx, next3['my']-my], dtype=torch.float32)
         delta_target = torch.cat([d1, d2, d3])
-        w = torch.tensor(self.data[idx]['weight'], dtype=torch.float32)
+        recency_ratio = 0.0
+        if self.max_ts > self.min_ts:
+            recency_ratio = (self.data[idx]['ts'] - self.min_ts) / (self.max_ts - self.min_ts)
+        else:
+            recency_ratio = (idx + 1) / max(1, len(self.data))
+        w = torch.tensor(self.data[idx]['weight'] * (0.5 + 0.5 * recency_ratio), dtype=torch.float32)
         return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w
 
 class OptimizerThread(QThread):
     finished_sig = pyqtSignal()
     progress_sig = pyqtSignal(int)
     status_sig = pyqtSignal(str)
-    
+
     def run(self):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         ds = ExperiencePool()
         if len(ds) < 10:
             self.finished_sig.emit()
@@ -523,10 +532,40 @@ class DataWorker(QThread):
         self.tick = 0
         use_gpu = torch.cuda.is_available()
         self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=use_gpu, gpu_mem=500 if use_gpu else 0)
+        self.ocr_gpu_enabled = use_gpu
         self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.ocr_lock = threading.Lock()
         self.ocr_tasks = []
         self.reload_regions()
+
+    def release_ocr_resources(self):
+        try:
+            for i, t in enumerate(self.ocr_tasks):
+                if t is not None and t.done():
+                    continue
+                self.ocr_tasks[i] = None
+            with self.ocr_lock:
+                if self.ocr is not None:
+                    try:
+                        del self.ocr
+                    except Exception:
+                        pass
+                self.ocr = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def restore_ocr(self):
+        try:
+            use_gpu = torch.cuda.is_available()
+            with self.ocr_lock:
+                self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=use_gpu, gpu_mem=500 if use_gpu else 0)
+                self.ocr_gpu_enabled = use_gpu
+        except Exception:
+            with self.ocr_lock:
+                self.ocr = None
+            self.ocr_gpu_enabled = False
 
     def reload_regions(self):
         try:
@@ -551,6 +590,8 @@ class DataWorker(QThread):
             _, proc = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
             with self.ocr_lock:
+                if self.ocr is None:
+                    return None
                 result = self.ocr.ocr(proc, cls=False)
             digits = ''
             if result and len(result) > 0:
@@ -1001,6 +1042,9 @@ class MainWin(QMainWindow):
 
     def do_opt(self):
         if self.mode != "LEARNING": return
+        self.worker.release_ocr_resources()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.mode = "OPTIMIZING"
         self.update_mode()
         self.bar.show()
@@ -1013,6 +1057,7 @@ class MainWin(QMainWindow):
         self.opt_thread.start()
 
     def opt_done(self):
+        self.worker.restore_ocr()
         self.load_model()
         self.bar.hide()
         QMessageBox.information(self, "完成", "神经网络优化完成。")
