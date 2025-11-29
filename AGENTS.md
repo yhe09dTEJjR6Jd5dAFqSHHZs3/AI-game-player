@@ -40,7 +40,7 @@ OpenCV：4.10
 
 本地化交互（Localization）： 用户界面（UI/UX）需完全采用简体中文构建，确保语义准确。
 单体化交付（Monolithic Architecture）： 系统需封装为单一Python脚本，移除所有注释与文档字符串（Docstrings）以优化代码密度，实现零外部文件依赖的开箱即用。
-自适应资源治理（Adaptive Resource Governance）： 集成实时硬件遥测模块，对CPU/GPU/VRAM进行毫秒级监控；建立优雅降级（Graceful Degradation）机制，在资源负载接近饱和阈值时，自动动态调整计算精度或挂起非关键线程。
+自适应资源治理（Adaptive Resource Governance）： 集成实时硬件遥测模块，对CPU/内存/GPU/显存进行毫秒级监控；建立优雅降级（Graceful Degradation）机制，在资源负载接近饱和阈值时，自动动态调整计算精度或挂起非关键线程。
 结构化持久存储（Structured Persistence）： 严格约束文件I/O路径，所有运行时产物（模型权重、经验回放池、日志）必须锚定于Desktop\AAA及其子目录，确保数据管理的原子性。
 
 集成基于PyQt5与pyqtgraph构建的实时系统遥测仪表盘（System Telemetry Dashboard）。该模块提供赛博朋克风格的用户界面，具备以下核心功能：
