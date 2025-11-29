@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from pynput import mouse, keyboard
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QProgressBar,
@@ -273,6 +273,7 @@ class ExperiencePool(Dataset):
         self.cache_limit = CACHE_MAX_BYTES
         self.region_types = self.load_region_types()
         self.data, self.total_bytes = self.load_data()
+        self.priorities = np.ones(len(self.data), dtype=np.float32)
         self.min_ts = min([d['ts'] for d in self.data], default=0)
         self.max_ts = max([d['ts'] for d in self.data], default=0)
 
@@ -331,6 +332,27 @@ class ExperiencePool(Dataset):
             return data, total_bytes
         except Exception:
             return [], 0
+
+    def get_priority_weights(self):
+        if not self.data:
+            return []
+        base = np.array([d.get('weight', 1.0) for d in self.data], dtype=np.float32)
+        scaled = (base * (self.priorities + 1e-3)) ** 1.2
+        scaled = np.clip(scaled, 1e-3, None)
+        max_v = float(np.max(scaled)) if scaled.size > 0 else 1.0
+        if max_v > 0:
+            scaled = scaled / max_v
+        return scaled.tolist()
+
+    def update_priorities(self, indices, losses):
+        if len(self.priorities) == 0:
+            return
+        for idx, loss_v in zip(indices, losses):
+            i = int(idx)
+            if 0 <= i < len(self.priorities):
+                lv = float(max(loss_v, 0.0))
+                boosted = 1.0 + lv
+                self.priorities[i] = 0.9 * self.priorities[i] + 0.1 * boosted
 
     def calc_weight(self, ocr, deltas):
         if not self.region_types or not ocr:
@@ -409,7 +431,7 @@ class ExperiencePool(Dataset):
         else:
             recency_ratio = (idx + 1) / max(1, len(self.data))
         w = torch.tensor(self.data[idx]['weight'] * (0.5 + 0.5 * recency_ratio), dtype=torch.float32)
-        return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w
+        return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w, torch.tensor(idx, dtype=torch.long)
 
 class OptimizerThread(QThread):
     finished_sig = pyqtSignal()
@@ -428,7 +450,6 @@ class OptimizerThread(QThread):
             self.finished_sig.emit()
             return
 
-        dl = DataLoader(ds, batch_size=self.batch_size, shuffle=True, num_workers=0)
         model = Brain().to(DEVICE)
         weight_path = os.path.join(MODEL_DIR, "brain.pth")
         if os.path.exists(weight_path):
@@ -447,8 +468,11 @@ class OptimizerThread(QThread):
         model.train()
 
         for ep in range(epochs):
+            weights = ds.get_priority_weights()
+            sampler = WeightedRandomSampler(weights=weights, num_samples=len(ds), replacement=True) if weights else None
+            dl = DataLoader(ds, batch_size=self.batch_size, sampler=sampler, shuffle=sampler is None, num_workers=0)
             self.status_sig.emit(f"正在优化模型: 第 {ep+1}/{epochs} 轮")
-            for i, (imgs, ocrs, targs, dirs, delta_t, ws) in enumerate(dl):
+            for i, (imgs, ocrs, targs, dirs, delta_t, ws, idxs) in enumerate(dl):
                 imgs, ocrs, targs, dirs, delta_t, ws = imgs.to(DEVICE), ocrs.to(DEVICE), targs.to(DEVICE), dirs.to(DEVICE), delta_t.to(DEVICE), ws.to(DEVICE)
                 opt.zero_grad(set_to_none=True)
 
@@ -474,6 +498,9 @@ class OptimizerThread(QThread):
                     loss = (comb * ws).sum() / (ws.sum() + 1e-6)
                     loss.backward()
                     opt.step()
+
+                with torch.no_grad():
+                    ds.update_priorities(idxs.cpu().numpy(), (comb.detach().cpu().numpy()))
 
             self.progress_sig.emit(int((ep + 1) / epochs * 100))
 
@@ -950,6 +977,7 @@ class MainWin(QMainWindow):
         self.nvidia_thread = None
         self.window_dragging = False
         self.window_drag_pos = QPoint()
+        self.vram_auto_cpu = False
 
         self.key_signal.connect(self.handle_key_event)
         self.click_signal.connect(self.handle_click_event)
@@ -1221,6 +1249,22 @@ class MainWin(QMainWindow):
                 vram_total = max(vram_t, 1)
                 vram_display = f"{vram_u/1024:.1f}/{vram_total/1024:.1f}GB"
 
+        if torch.cuda.is_available():
+            vram_limit_mb = 3500
+            vram_recover_mb = 2800
+            if vram_u >= vram_limit_mb and not self.worker.force_cpu:
+                self.worker.set_force_cpu(True)
+                self.vram_auto_cpu = True
+                self.ocr_forced_cpu = True
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            elif self.vram_auto_cpu and vram_u < vram_recover_mb:
+                self.worker.set_force_cpu(False)
+                self.vram_auto_cpu = False
+                self.ocr_forced_cpu = False
+
         disk = psutil.disk_usage(os.path.abspath(os.sep))
         scale = SCALE_PERCENT
         if platform.system() == 'Windows':
@@ -1233,7 +1277,8 @@ class MainWin(QMainWindow):
         self.lbl_cpu.setText(f"处理器: {cpu}%")
         self.lbl_mem.setText(f"内存: {mem}%")
         self.lbl_gpu.setText(f"显卡: {gpu_display}")
-        self.lbl_vram.setText(f"显存: {vram_display}")
+        vram_hint = " (OCR已切换CPU)" if self.worker.force_cpu else ""
+        self.lbl_vram.setText(f"显存: {vram_display}{vram_hint}")
         self.lbl_disk.setText(f"磁盘可用: {disk.free/(1024**4):.2f}TB")
         self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
 
