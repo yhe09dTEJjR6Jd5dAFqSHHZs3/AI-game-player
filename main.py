@@ -72,7 +72,6 @@ INPUT_W, INPUT_H = 320, 180
 SEQ_LEN = 4
 MAX_OCR = 16
 OCR_CONF_THRESHOLD = 0.6
-OCR_JUMP_THRESHOLD = 200.0
 OCR_AGE_MAX_MS = 5000.0
 POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
@@ -1259,13 +1258,9 @@ class OcrWorker(threading.Thread):
         pred_x = state['x'] + state['v'] * dt
         pred_p = state['p'] + (dt * 8.0) ** 2
         observation_used = False
-        is_warmup = (now - self.start_ts) < 10.0
         if measurement is not None:
-            meas_val, meas_conf = measurement
-            if not is_warmup and prev_v is not None and abs(float(meas_val) - float(prev_v)) > OCR_JUMP_THRESHOLD and meas_conf < 0.9:
-                meas_val = None
-            else:
-                meas_val = float(meas_val)
+            meas_val, _ = measurement
+            meas_val = float(meas_val)
             if meas_val is not None:
                 k = pred_p / (pred_p + 16.0)
                 state['x'] = pred_x + k * (meas_val - pred_x)
@@ -1473,8 +1468,6 @@ class OcrWorker(threading.Thread):
                 self.histories[idx].append(filtered)
                 smoothed = float(np.median(self.histories[idx])) if self.histories[idx] else filtered
                 stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
-                if not is_warmup and prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
-                    smoothed = prev_v
                 final_v = max(0.0, smoothed)
                 if idx < len(self.prev_vals):
                     self.prev_vals[idx] = final_v
@@ -1959,6 +1952,22 @@ class RegionEditor(QDialog):
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
                 self.regions = json.load(f)
         except: pass
+
+    def finalize_temp_rect(self):
+        if self.temp_rect and self.temp_rect.width() > 5 and self.temp_rect.height() > 5:
+            self.regions.append({
+                'type': self.current_type,
+                'x': self.temp_rect.x(), 'y': self.temp_rect.y(),
+                'w': self.temp_rect.width(), 'h': self.temp_rect.height()
+            })
+        self.start_p = None
+        self.temp_rect = None
+
+    def save_and_exit(self):
+        self.finalize_temp_rect()
+        with open(REGION_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.regions, f)
+        self.accept()
         
     def paintEvent(self, event):
         p = QPainter(self)
@@ -2007,23 +2016,14 @@ class RegionEditor(QDialog):
 
     def mouseReleaseEvent(self, e):
         if self.start_p and self.temp_rect:
-            if self.temp_rect.width() > 5 and self.temp_rect.height() > 5:
-                self.regions.append({
-                    'type': self.current_type,
-                    'x': self.temp_rect.x(), 'y': self.temp_rect.y(),
-                    'w': self.temp_rect.width(), 'h': self.temp_rect.height()
-                })
-            self.start_p = None
-            self.temp_rect = None
+            self.finalize_temp_rect()
             self.update()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_1: self.current_type = 'red'
         elif e.key() == Qt.Key_2: self.current_type = 'blue'
         elif e.key() in [Qt.Key_Return, Qt.Key_Enter]:
-            with open(REGION_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.regions, f)
-            self.accept()
+            self.save_and_exit()
         elif e.key() == Qt.Key_Escape:
             self.reject()
         self.update()
