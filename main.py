@@ -70,6 +70,101 @@ GPU_HYSTERESIS_SEC = 2.5
 FORCE_CPU_OCR = False
 pynvml = None
 
+def resolve_perf_name(name):
+    if win32pdh is None:
+        return name
+    try:
+        idx = win32pdh.LookupPerfIndexByName(None, name)
+        if idx:
+            return win32pdh.LookupPerfNameByIndex(None, idx)
+    except Exception:
+        pass
+    return name
+
+class CtypesMouse:
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes = ctypes
+        self.wintypes = wintypes
+        self.user32 = ctypes.windll.user32
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+        class INPUTUNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT)]
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_ulong), ("union", INPUTUNION)]
+        self.MOUSEINPUT = MOUSEINPUT
+        self.INPUTUNION = INPUTUNION
+        self.INPUT = INPUT
+        self.INPUT_MOUSE = 0
+        self.MOUSEEVENTF_MOVE = 0x0001
+        self.MOUSEEVENTF_LEFTDOWN = 0x0002
+        self.MOUSEEVENTF_LEFTUP = 0x0004
+        self.POINT = wintypes.POINT
+
+    @property
+    def position(self):
+        pt = self.POINT()
+        self.user32.GetCursorPos(self.ctypes.byref(pt))
+        return (pt.x, pt.y)
+
+    @position.setter
+    def position(self, pos):
+        self.move_to(pos[0], pos[1])
+
+    def move_to(self, x, y):
+        cx, cy = self.position
+        dx, dy = int(x - cx), int(y - cy)
+        if dx == 0 and dy == 0:
+            return
+        self._send(dx, dy, self.MOUSEEVENTF_MOVE)
+
+    def press(self, button):
+        if button == mouse.Button.left:
+            self._send(0, 0, self.MOUSEEVENTF_LEFTDOWN)
+
+    def release(self, button):
+        if button == mouse.Button.left:
+            self._send(0, 0, self.MOUSEEVENTF_LEFTUP)
+
+    def _send(self, dx, dy, flags):
+        extra = self.ctypes.c_ulong(0)
+        mi = self.MOUSEINPUT(dx, dy, 0, flags, 0, self.ctypes.pointer(extra))
+        inp = self.INPUT(self.INPUT_MOUSE, self.INPUTUNION(mi))
+        self.user32.SendInput(1, self.ctypes.byref(inp), self.ctypes.sizeof(self.INPUT))
+
+class InputController:
+    def __init__(self):
+        self.backend = None
+        if platform.system() == 'Windows':
+            try:
+                self.backend = CtypesMouse()
+            except Exception:
+                self.backend = None
+        if self.backend is None:
+            self.backend = mouse.Controller()
+
+    @property
+    def position(self):
+        return self.backend.position
+
+    @position.setter
+    def position(self, pos):
+        self.backend.position = pos
+
+    def press(self, button):
+        try:
+            self.backend.press(button)
+        except Exception:
+            pass
+
+    def release(self, button):
+        try:
+            self.backend.release(button)
+        except Exception:
+            pass
+
 class WindowsDiskStats:
     def __init__(self):
         self.available = False
@@ -77,10 +172,18 @@ class WindowsDiskStats:
         if platform.system() != 'Windows' or win32pdh is None:
             return
         try:
+            obj = resolve_perf_name('PhysicalDisk')
+            inst = resolve_perf_name('_Total')
+            c_qd = resolve_perf_name('Current Disk Queue Length')
+            c_lat = resolve_perf_name('Avg. Disk sec/Transfer')
+            c_bps = resolve_perf_name('Disk Bytes/sec')
+            path_qd = f"\\\\{obj}({inst})\\{c_qd}"
+            path_lat = f"\\\\{obj}({inst})\\{c_lat}"
+            path_bps = f"\\\\{obj}({inst})\\{c_bps}"
             self.query = win32pdh.OpenQuery()
-            self.counter_qd = win32pdh.AddCounter(self.query, r'\\PhysicalDisk(_Total)\\Current Disk Queue Length')
-            self.counter_lat = win32pdh.AddCounter(self.query, r'\\PhysicalDisk(_Total)\\Avg. Disk sec/Transfer')
-            self.counter_bps = win32pdh.AddCounter(self.query, r'\\PhysicalDisk(_Total)\\Disk Bytes/sec')
+            self.counter_qd = win32pdh.AddCounter(self.query, path_qd)
+            self.counter_lat = win32pdh.AddCounter(self.query, path_lat)
+            self.counter_bps = win32pdh.AddCounter(self.query, path_bps)
             self.available = True
             win32pdh.CollectQueryData(self.query)
         except Exception:
@@ -1558,7 +1661,7 @@ class MainWin(QMainWindow):
         self.brain = Brain().to(DEVICE)
         self.load_model()
 
-        self.mouse = mouse.Controller()
+        self.mouse = InputController()
 
         self.sct = None
         self.monitor = None
