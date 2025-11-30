@@ -528,7 +528,10 @@ class PathPlanner:
 def pack_ocr(vals, deltas=None, ages=None):
     buf = [0]*MAX_OCR
     for i, v in enumerate(vals[:MAX_OCR]):
-        buf[i] = float(v)
+        try:
+            buf[i] = max(0.0, float(v))
+        except Exception:
+            buf[i] = 0.0
     delta_buf = [0]*MAX_OCR
     if deltas is not None:
         for i, v in enumerate(deltas[:MAX_OCR]):
@@ -710,8 +713,8 @@ class ExperiencePool(Dataset):
         self.region_types = self.load_region_types()
         self.data, self.total_bytes = self.load_data()
         self.priorities = self.load_priorities()
-        self.min_ts = min([d['ts'] for d in self.data], default=0)
-        self.max_ts = max([d['ts'] for d in self.data], default=0)
+        self.restrict_to_top_quality()
+        self.refresh_time_bounds()
 
     def load_region_types(self):
         try:
@@ -755,6 +758,20 @@ class ExperiencePool(Dataset):
             np.save(PRIORITY_FILE, self.priorities)
         except Exception:
             pass
+
+    def restrict_to_top_quality(self, limit=2048):
+        if limit is None or limit <= 0 or len(self.data) <= limit:
+            return
+        scores = [self.compute_priority_value(i) for i in range(len(self.data))]
+        order = np.argsort(np.array(scores))[::-1][:limit]
+        self.data = [self.data[int(i)] for i in order]
+        if len(self.priorities) > 0:
+            self.priorities = np.take(self.priorities, order)
+        self.refresh_time_bounds()
+
+    def refresh_time_bounds(self):
+        self.min_ts = min([d.get('ts', 0) for d in self.data], default=0)
+        self.max_ts = max([d.get('ts', 0) for d in self.data], default=0)
 
     def get_priority_weights(self):
         if not self.data:
@@ -1727,8 +1744,6 @@ class MainWin(QMainWindow):
         self.loop_latency_ms = 0.0
         self.frame_interval_ms = 0.0
         self.prev_capture_ts = None
-        self.prev_disk_io = psutil.disk_io_counters()
-        self.prev_disk_ts = time.time()
         self.process = psutil.Process(os.getpid())
         self.loop_sleep = 0.001
         self.plot_pause_until = 0.0
@@ -1802,39 +1817,29 @@ class MainWin(QMainWindow):
         self.lbl_mem = QLabel("内存: 0%")
         self.lbl_gpu = QLabel("显卡: 0%")
         self.lbl_vram = QLabel("显存: 0GB")
-        self.lbl_disk = QLabel("经验池: 0%")
         self.lbl_res = QLabel("分辨率: 0x0")
-        self.lbl_gpu_temp = QLabel("显卡温度: 0°C")
-        self.lbl_gpu_power = QLabel("显卡功耗: 0W")
-        self.lbl_gpu_fan = QLabel("风扇: 0%")
-        self.lbl_disk_io = QLabel("系统磁盘IO: 0MB/s")
-        self.lbl_disk_lat = QLabel("系统磁盘延迟: 0ms")
-        self.lbl_disk_qd = QLabel("系统磁盘队列: 0")
-        self.lbl_latency = QLabel("延迟: 截屏0ms | 推理0ms | OCR0ms | 循环0ms")
         self.lbl_fps = QLabel("帧率: 0fps | 截屏间隔0ms")
 
-        info_labels = [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_disk, self.lbl_res, self.lbl_gpu_temp, self.lbl_gpu_power, self.lbl_gpu_fan, self.lbl_disk_io, self.lbl_disk_lat, self.lbl_disk_qd, self.lbl_latency, self.lbl_fps]
+        info_labels = [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_res, self.lbl_fps]
         for i, l in enumerate(info_labels):
             l.setStyleSheet("color: #00f0ff; font-size: 14px; padding: 5px;")
             grid.addWidget(l, i//3, i%3)
         fl.addLayout(grid)
-        
+
         gl = QGridLayout()
         self.p_cpu = SciFiPlot("处理器", '#00ff00')
         self.p_mem = SciFiPlot("内存", '#00ffff')
         self.p_gpu = SciFiPlot("显卡", '#ff0055')
         self.p_vram = SciFiPlot("显存", '#ffaa00')
-        self.p_pool = SciFiPlot("经验池", '#66aaff')
 
-        self.d_cpu, self.d_mem, self.d_gpu, self.d_vram, self.d_pool = [], [], [], [], []
-        for x in [self.d_cpu, self.d_mem, self.d_gpu, self.d_vram, self.d_pool]:
+        self.d_cpu, self.d_mem, self.d_gpu, self.d_vram = [], [], [], []
+        for x in [self.d_cpu, self.d_mem, self.d_gpu, self.d_vram]:
             x.extend([0]*100)
 
         gl.addWidget(self.p_cpu, 0, 0)
         gl.addWidget(self.p_mem, 0, 1)
         gl.addWidget(self.p_gpu, 1, 0)
         gl.addWidget(self.p_vram, 1, 1)
-        gl.addWidget(self.p_pool, 2, 0, 1, 2)
         fl.addLayout(gl, stretch=1)
         
         btns = QHBoxLayout()
@@ -2066,34 +2071,6 @@ class MainWin(QMainWindow):
                 self.worker.set_force_cpu(False)
                 self.vram_auto_cpu = False
                 self.ocr_forced_cpu = False
-
-        disk = psutil.disk_usage(os.path.abspath(os.sep))
-        now_io = psutil.disk_io_counters()
-        now_ts = time.time()
-        dt = max(now_ts - self.prev_disk_ts, 1e-6)
-        rb = max(now_io.read_bytes - self.prev_disk_io.read_bytes, 0)
-        wb = max(now_io.write_bytes - self.prev_disk_io.write_bytes, 0)
-        io_throughput = (rb + wb) / dt / (1024 * 1024)
-        ops = max((now_io.read_count - self.prev_disk_io.read_count) + (now_io.write_count - self.prev_disk_io.write_count), 1)
-        lat_ms = max((now_io.read_time - self.prev_disk_io.read_time) + (now_io.write_time - self.prev_disk_io.write_time), 0) / ops
-        qd = 0.0
-        win_disk = WINDOWS_DISK.collect()
-        if win_disk is not None:
-            io_throughput = win_disk['throughput_mb']
-            lat_ms = win_disk['lat_ms']
-            qd = win_disk['qd']
-        elif hasattr(now_io, 'busy_time'):
-            busy_ms = max(now_io.busy_time - getattr(self.prev_disk_io, 'busy_time', 0), 0)
-            if platform.system() != 'Windows' or busy_ms > 0:
-                qd = busy_ms / (dt * 1000.0)
-            else:
-                iops = ops / dt if dt > 0 else 0.0
-                qd = iops * (lat_ms / 1000.0)
-        else:
-            iops = ops / dt if dt > 0 else 0.0
-            qd = iops * (lat_ms / 1000.0)
-        self.prev_disk_io = now_io
-        self.prev_disk_ts = now_ts
         scale = SCALE_PERCENT
         if platform.system() == 'Windows':
             try:
@@ -2102,24 +2079,13 @@ class MainWin(QMainWindow):
             except Exception:
                 scale = SCALE_PERCENT
 
-        pool_bytes = POOL_CACHE.get_total_bytes()
-        pool_percent = clamp01(pool_bytes / max(POOL_MAX_BYTES, 1)) * 100
-
         self.lbl_cpu.setText(f"处理器: {cpu}%")
         self.lbl_mem.setText(f"内存: {mem}%")
         self.lbl_gpu.setText(f"显卡: {gpu_display}")
         vram_hint = " (OCR已切换CPU)" if self.worker.force_cpu else ""
         self.lbl_vram.setText(f"显存: {vram_display}{vram_hint}")
-        self.lbl_disk.setText(f"经验池: {pool_percent:.1f}% ({pool_bytes/(1024**3):.2f}/{POOL_MAX_BYTES/(1024**3):.2f}GB) | 磁盘可用: {disk.free/(1024**4):.2f}TB")
         self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
-        self.lbl_gpu_temp.setText(f"显卡温度: {gpu_temp:.0f}°C")
-        self.lbl_gpu_power.setText(f"显卡功耗: {gpu_power:.1f}W")
-        self.lbl_gpu_fan.setText(f"风扇: {gpu_fan:.0f}%")
-        self.lbl_disk_io.setText(f"系统磁盘IO: {io_throughput:.2f}MB/s")
-        self.lbl_disk_lat.setText(f"系统磁盘延迟: {lat_ms:.2f}ms")
-        self.lbl_disk_qd.setText(f"系统磁盘队列: {qd:.2f}")
         fps = 1000.0 / self.frame_interval_ms if self.frame_interval_ms > 0 else 0.0
-        self.lbl_latency.setText(f"延迟: 截屏{self.capture_latency_ms:.1f}ms | 推理{self.infer_latency_ms:.1f}ms | OCR{self.ocr_latency_ms:.1f}ms | 循环{self.loop_latency_ms:.1f}ms")
         self.lbl_fps.setText(f"帧率: {fps:.1f}fps | 截屏间隔{self.frame_interval_ms:.1f}ms")
 
         load = max(cpu, gpu_u)
@@ -2132,10 +2098,10 @@ class MainWin(QMainWindow):
             self.loop_sleep = 0.001
 
         backlog = self.worker.get_backlog() if hasattr(self, 'worker') and self.worker is not None else 0
-        pause_worker = load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95) or qd > 3.0 or backlog > 200
+        pause_worker = load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95) or backlog > 200
         self.worker.set_paused(pause_worker)
 
-        for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram, self.d_pool], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0, pool_percent]):
+        for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0]):
             l.pop(0)
             l.append(v)
 
@@ -2144,7 +2110,6 @@ class MainWin(QMainWindow):
             self.p_mem.plot(self.d_mem, pen=pg.mkPen('#00ffff', width=2), clear=True)
             self.p_gpu.plot(self.d_gpu, pen=pg.mkPen('#ff0055', width=2), clear=True)
             self.p_vram.plot(self.d_vram, pen=pg.mkPen('#ffaa00', width=2), clear=True)
-            self.p_pool.plot(self.d_pool, pen=pg.mkPen('#66aaff', width=2), clear=True)
 
     def loop(self):
         if self.mode in ["OPTIMIZING", "SELECT"]: return
