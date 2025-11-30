@@ -29,12 +29,19 @@ from PyQt5.QtGui import QColor, QPainter, QPen, QFont, QBrush, QImage, QPixmap
 import pyqtgraph as pg
 from collections import deque
 from paddleocr import PaddleOCR
+import importlib
 import importlib.util
 import logging
+import warnings
 
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 logging.getLogger("ppocr.utils.logging").setLevel(logging.ERROR)
 logging.getLogger("ppocr.utility").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=r"`torch.cuda.amp.GradScaler.*deprecated`")
+warnings.filterwarnings("ignore", message=r"The parameter use_angle_cls has been deprecated")
+warnings.filterwarnings("ignore", message=r"Warning: you have set wrong precision for backend:cuda")
+warnings.filterwarnings("ignore", message=r"FutureWarning: The pynvml package is deprecated")
+warnings.filterwarnings("ignore", message=r"UserWarning: Please use the new API settings to control TF32 behavior")
 
 try:
     import win32pdh
@@ -70,6 +77,21 @@ GPU_VRAM_HIGH = 1200 * 1024 * 1024
 GPU_HYSTERESIS_SEC = 2.5
 FORCE_CPU_OCR = True
 pynvml = None
+
+
+def load_pynvml():
+    global pynvml
+    if pynvml is not None:
+        return
+    for name in ("pynvml", "nvidia.nvml"):
+        try:
+            if importlib.util.find_spec(name) is not None:
+                module_name = "pynvml" if name == "nvidia.nvml" else name
+                pynvml = importlib.import_module(module_name)
+                return
+        except Exception:
+            continue
+    pynvml = None
 
 def resolve_perf_name(name):
     if win32pdh is None:
@@ -1276,7 +1298,7 @@ class OcrWorker(threading.Thread):
     def init_ocr(self):
         try:
             with StdSilencer():
-                self.ocr = PaddleOCR(lang="ch", ocr_version='PP-OCRv4', show_log=False)
+                self.ocr = PaddleOCR(lang="ch", ocr_version='PP-OCRv4', show_log=False, use_gpu=False, use_angle_cls=False, device='cpu', cpu_threads=4)
             if self.status_cb:
                 self.status_cb("OCR 已切换至 CPU 模式")
         except Exception as e:
@@ -1341,7 +1363,8 @@ class OcrWorker(threading.Thread):
             min_side = min(roi.shape[:2])
             scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
             proc = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            proc = cv2.GaussianBlur(proc, (3, 3), 0)
+            kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+            proc = cv2.filter2D(proc, -1, kernel)
             result = self.ocr.ocr(proc)
             parsed = None
             best_conf = 0.0
@@ -1577,6 +1600,7 @@ class DataWorker(QThread):
         self.prev_pos = None
         self.prev_vel = (0.0, 0.0)
         self.prev_time = None
+        self.dynamic_delay = 0.0
         self.reload_regions()
 
     def init_ocr_instances(self):
@@ -1613,6 +1637,12 @@ class DataWorker(QThread):
 
     def set_paused(self, paused):
         self.paused = paused
+
+    def set_processing_delay(self, delay):
+        try:
+            self.dynamic_delay = max(0.0, float(delay))
+        except Exception:
+            self.dynamic_delay = 0.0
 
     def get_backlog(self):
         try:
@@ -1693,6 +1723,8 @@ class DataWorker(QThread):
                     }
                     self.save_worker.enqueue(full_img, meta)
                 self.queue.task_done()
+                if self.dynamic_delay > 0:
+                    time.sleep(self.dynamic_delay)
             except queue.Empty:
                 pass
             except Exception:
@@ -2105,6 +2137,7 @@ class MainWin(QMainWindow):
         self.press_frames = 0
         self.nvml_checked = False
         self.nvml_handle = None
+        self.nvml_index = None
         self.stop_flag = threading.Event()
         self.ocr_forced_cpu = False
         self.nvidia_thread = None
@@ -2444,13 +2477,46 @@ class MainWin(QMainWindow):
                 self.path_planner.reset((self.smooth_x, self.smooth_y))
 
     def ensure_nvml_handle(self):
-        if not torch.cuda.is_available() or pynvml is None:
+        if not torch.cuda.is_available():
+            return False
+        load_pynvml()
+        if pynvml is None:
             return False
         if not self.nvml_checked:
             try:
                 pynvml.nvmlInit()
-                if pynvml.nvmlDeviceGetCount() > 0:
-                    self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                device_count = pynvml.nvmlDeviceGetCount()
+                if device_count > 0:
+                    pid = os.getpid()
+                    selected = None
+                    for idx in range(device_count):
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                        try:
+                            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                        except Exception:
+                            procs = []
+                        if any(getattr(p, 'pid', None) == pid for p in procs):
+                            selected = (handle, idx)
+                            break
+                    if selected is None:
+                        env_idx = None
+                        try:
+                            env_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+                            if env_vis:
+                                env_idx = int(env_vis.split(',')[0].strip())
+                        except Exception:
+                            env_idx = None
+                        torch_idx = None
+                        try:
+                            torch_idx = torch.cuda.current_device()
+                        except Exception:
+                            torch_idx = None
+                        prefer_idx = env_idx if env_idx is not None else torch_idx
+                        if prefer_idx is not None and 0 <= prefer_idx < device_count:
+                            selected = (pynvml.nvmlDeviceGetHandleByIndex(prefer_idx), prefer_idx)
+                    if selected is None:
+                        selected = (pynvml.nvmlDeviceGetHandleByIndex(0), 0)
+                    self.nvml_handle, self.nvml_index = selected
             except Exception:
                 self.nvml_handle = None
             self.nvml_checked = True
@@ -2511,6 +2577,8 @@ class MainWin(QMainWindow):
         self.lbl_fps.setText(f"帧率: {fps:.1f}fps")
 
         load = max(cpu, gpu_u)
+        backlog = self.worker.get_backlog() if hasattr(self, 'worker') and self.worker is not None else 0
+        vram_ratio = (vram_u / vram_t) if vram_t else 0.0
         if load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95):
             self.loop_sleep = 0.02
             self.plot_pause_until = time.time() + 2.0
@@ -2519,9 +2587,14 @@ class MainWin(QMainWindow):
         else:
             self.loop_sleep = 0.001
 
-        backlog = self.worker.get_backlog() if hasattr(self, 'worker') and self.worker is not None else 0
+        worker_delay = 0.0
+        if load > 95 or vram_ratio >= 0.9 or backlog > 220:
+            worker_delay = 0.01
+        elif load > 80 or vram_ratio >= 0.8 or backlog > 140:
+            worker_delay = 0.005
+        self.worker.set_processing_delay(worker_delay)
+
         target_fps = 60
-        vram_ratio = (vram_u / vram_t) if vram_t else 0.0
         if load > 95 or vram_ratio >= 0.9 or backlog > 200:
             target_fps = 15
         elif load > 80 or vram_ratio >= 0.8 or backlog > 120:
