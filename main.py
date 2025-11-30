@@ -407,7 +407,7 @@ class PoolCacheManager:
                     feat = pack_ocr(ocr_vals, deltas, ocr_age)
                     weight = ExperiencePool.calc_weight_static(region_types, ocr_vals, deltas, click, novelty, complexity, pred_err)
                     size = 512 + (len(img_bytes) if img_bytes is not None else 0)
-                    entry = {'ts': ts, 'img': '', 'img_bytes': img_bytes, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
+                    entry = {'ts': ts, 'img_bytes': None, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err, 'id': decode_key(cur.key())}
                     batch.append(entry)
                     self.last_key = decode_key(cur.key())
                     if len(batch) >= chunk_size:
@@ -724,11 +724,19 @@ class ExperiencePool(Dataset):
         self.cache_order = deque()
         self.cache_bytes = 0
         self.cache_limit = CACHE_MAX_BYTES
+        self.priority_flush_interval = 128
+        self.priority_dirty = False
+        self.priority_updates = 0
+        self.last_priority_flush = time.time()
         self.region_types = self.load_region_types()
         self.data, self.total_bytes = self.load_data()
         self.priorities = self.load_priorities()
         self.restrict_to_top_quality()
         self.refresh_time_bounds()
+        try:
+            self.env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 4, subdir=True, readonly=True, lock=False, readahead=False)
+        except Exception:
+            self.env = None
 
     def load_region_types(self):
         try:
@@ -770,8 +778,17 @@ class ExperiencePool(Dataset):
     def persist_priorities(self):
         try:
             np.save(PRIORITY_FILE, self.priorities)
+            self.priority_dirty = False
+            self.priority_updates = 0
+            self.last_priority_flush = time.time()
         except Exception:
             pass
+
+    def flush_priorities(self, force=False):
+        if not force and not self.priority_dirty:
+            return
+        if force or self.priority_updates >= self.priority_flush_interval or time.time() - self.last_priority_flush >= 5.0:
+            self.persist_priorities()
 
     def restrict_to_top_quality(self, limit=2048):
         if limit is None or limit <= 0 or len(self.data) <= limit:
@@ -805,7 +822,9 @@ class ExperiencePool(Dataset):
                 self.priorities[i] = 0.9 * self.priorities[i] + 0.1 * boosted
                 changed = True
         if changed:
-            self.persist_priorities()
+            self.priority_dirty = True
+            self.priority_updates += 1
+            self.flush_priorities()
 
     def compute_priority_value(self, idx):
         if idx < 0 or idx >= len(self.data):
@@ -858,6 +877,14 @@ class ExperiencePool(Dataset):
         if key in self.cache:
             return self.cache[key]
         img_bytes = item.get('img_bytes')
+        if img_bytes is None and self.env is not None and 'id' in item:
+            try:
+                with self.env.begin(write=False) as txn:
+                    raw = txn.get(encode_key(int(item['id'])))
+                    if raw is not None:
+                        _, img_bytes = unpack_entry(raw)
+            except Exception:
+                img_bytes = None
         img = None
         if img_bytes:
             try:
@@ -1043,6 +1070,7 @@ class OptimizerThread(QThread):
         tmp_path = weight_path + '.tmp'
         torch.save(model.state_dict(), tmp_path)
         os.replace(tmp_path, weight_path)
+        ds.flush_priorities(force=True)
         self.status_sig.emit("优化完成")
         self.finished_sig.emit()
 
@@ -1055,7 +1083,7 @@ class SaveWorker(threading.Thread):
         self.buffer_bytes = 0
         self.flush_threshold = 4096
         self.last_flush = time.time()
-        self.env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 2, subdir=True, max_dbs=1, lock=True)
+        self.env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 4, subdir=True, max_dbs=1, lock=True)
         self.next_id = read_index_value(self.env)
 
     def enqueue(self, img, meta):
@@ -1569,6 +1597,8 @@ class DataWorker(QThread):
         self.wait()
 
 class InferenceThread(QThread):
+    status_signal = pyqtSignal(str)
+
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
@@ -1587,8 +1617,162 @@ class InferenceThread(QThread):
                         torch.cuda.empty_cache()
                 except Exception:
                     pass
-            self.owner.loop()
+            self.process_loop()
             time.sleep(self.owner.loop_sleep)
+
+    def process_loop(self):
+        w = self.owner
+        if w.mode in ["OPTIMIZING", "SELECT"]:
+            return
+
+        if w.stop_flag.is_set() and w.mode == "TRAINING":
+            w.mode = "LEARNING"
+            w.update_mode()
+            if w.dragging:
+                w.mouse.release(mouse.Button.left)
+                w.dragging = False
+            w.press_frames = 0
+            w.release_frames = 0
+            return
+
+        loop_start = time.time()
+        try:
+            cap_start = time.time()
+            if w.sct is None or w.monitor is None:
+                try:
+                    w.sct = mss.mss()
+                    w.monitor = w.sct.monitors[1]
+                except Exception as e:
+                    self.status_signal.emit(f"截屏失败: {e}")
+                    return
+            shot = w.sct.grab(w.monitor)
+            img = np.frombuffer(shot.raw, dtype=np.uint8).reshape((shot.height, shot.width, 4))
+            cap_end = time.time()
+            w.capture_latency_ms = (cap_end - cap_start) * 1000.0
+            if w.prev_capture_ts is not None:
+                w.frame_interval_ms = (cap_start - w.prev_capture_ts) * 1000.0
+            w.prev_capture_ts = cap_start
+            frame_ts = int(cap_start * 1000)
+            frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            w.frame_counter += 1
+            frame_id = w.frame_counter
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            proc = preprocess_frame(rgb)
+            w.seq_frames.append((frame_id, proc))
+            valid_ids = {fid for fid, _ in w.seq_frames}
+            drop_keys = [k for k in list(w.ocr_frame_map.keys()) if k not in valid_ids]
+            for k in drop_keys:
+                w.ocr_frame_map.pop(k, None)
+            mx, my = w.mouse.position
+            nx, ny = screen_to_letter_norm(mx, my)
+            click = 1.0 if w.mouse_pressed else 0.0
+            source = "USER"
+            prediction_error = 0.0
+
+            if w.mode == "TRAINING":
+                seq_frames = list(w.seq_frames)
+                if w.stop_flag.is_set():
+                    return
+                while len(seq_frames) < SEQ_LEN:
+                    seq_frames.insert(0, (None, np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32)))
+                seq_imgs = torch.tensor(np.stack([img for _, img in seq_frames])[None, ...], dtype=torch.float32, device=DEVICE)
+                seq_ocr = torch.tensor(np.stack([w.get_ocr_for_frame(fid) for fid, _ in seq_frames])[None, ...], dtype=torch.float32, device=DEVICE)
+
+                infer_st = time.time()
+                with torch.no_grad():
+                    if torch.cuda.is_available():
+                        with torch.amp.autocast('cuda'):
+                            out, logits, delta_out = w.brain(seq_imgs, seq_ocr)
+                    else:
+                        out, logits, delta_out = w.brain(seq_imgs, seq_ocr)
+                w.infer_latency_ms = (time.time() - infer_st) * 1000.0
+
+                px, py, pc = out[0].cpu().numpy()
+                delta_pred = delta_out[0].cpu().numpy()
+                dx, dy = float(delta_pred[0]), float(delta_pred[1])
+                base_x, base_y = clamp01(float(px)), clamp01(float(py))
+                delta_x = clamp01(w.smooth_x + dx)
+                delta_y = clamp01(w.smooth_y + dy)
+                target_x = 0.5 * (base_x + delta_x)
+                target_y = 0.5 * (base_y + delta_y)
+                conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
+                blend = 0.3 + 0.7 * conf
+                planned_target_x = (1 - blend) * w.smooth_x + blend * target_x
+                planned_target_y = (1 - blend) * w.smooth_y + blend * target_y
+                target_pair = (planned_target_x, planned_target_y)
+                dist = ((target_pair[0] - w.last_target[0]) ** 2 + (target_pair[1] - w.last_target[1]) ** 2) ** 0.5
+                if w.path_planner.should_replan((w.smooth_x, w.smooth_y), target_pair) or dist >= 0.05:
+                    w.path_planner.plan((w.smooth_x, w.smooth_y), target_pair, (dx, dy))
+                    w.last_target = target_pair
+                nx, ny = w.path_planner.next_point()
+                w.smooth_x, w.smooth_y = nx, ny
+                prediction_error = float(-math.log(max(conf, 1e-6)))
+
+                if w.stop_flag.is_set() or w.mode != "TRAINING":
+                    return
+
+                sx, sy = letter_norm_to_screen(w.smooth_x, w.smooth_y)
+                if w.stop_flag.is_set() or w.mode != "TRAINING":
+                    return
+                w.mouse.position = (int(sx), int(sy))
+                now = time.time()
+                if pc >= w.press_thresh:
+                    w.press_frames += 1
+                else:
+                    w.press_frames = 0
+                if pc <= w.release_thresh:
+                    w.release_frames += 1
+                else:
+                    w.release_frames = 0
+                if w.stop_flag.is_set() or w.mode != "TRAINING":
+                    return
+                if not w.dragging and w.press_frames >= 2:
+                    w.mouse.press(mouse.Button.left)
+                    w.dragging = True
+                    w.last_press_time = now
+                    w.release_frames = 0
+                elif w.dragging and (pc <= 0.1 or (w.release_frames >= 3 and now - w.last_press_time >= w.min_press)):
+                    if w.stop_flag.is_set() or w.mode != "TRAINING":
+                        return
+                    w.mouse.release(mouse.Button.left)
+                    w.dragging = False
+                    w.press_frames = 0
+                    w.release_frames = 0
+
+                nx, ny, click = w.smooth_x, w.smooth_y, (1.0 if w.dragging else 0.0)
+                source = "AI"
+            else:
+                w.smooth_x, w.smooth_y = nx, ny
+                w.path_planner.reset((w.smooth_x, w.smooth_y))
+                w.last_target = (w.smooth_x, w.smooth_y)
+                if w.dragging:
+                    w.mouse.release(mouse.Button.left)
+                    w.dragging = False
+                w.press_frames = 0
+                w.release_frames = 0
+
+            save = False
+            if (w.mode == "LEARNING" and source == "USER") or (w.mode == "TRAINING" and source == "AI"):
+                if time.time() - w.last_record > 0.033:
+                    save = True
+                    w.last_record = time.time()
+
+            small = letterbox(frame, INPUT_W, INPUT_H)
+            if w.queue.full():
+                try:
+                    w.queue.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                w.queue.put_nowait((frame, small, frame_id, frame_ts, nx, ny, click, source, save, prediction_error))
+            except queue.Full:
+                pass
+
+            w.loop_latency_ms = (time.time() - loop_start) * 1000.0
+            if w.mode == "TRAINING" and w.loop_latency_ms > 120.0:
+                w.maybe_adjust_resolution()
+        except Exception as e:
+            self.status_signal.emit(f"循环异常: {e}")
 
 class SciFiPlot(pg.PlotWidget):
     def __init__(self, title, color):
@@ -1818,6 +2002,7 @@ class MainWin(QMainWindow):
         self.setup_listeners()
 
         self.infer_thread = InferenceThread(self)
+        self.infer_thread.status_signal.connect(self.update_status_text)
         self.infer_thread.start()
 
         self.stat_timer = QTimer()
@@ -2003,6 +2188,7 @@ class MainWin(QMainWindow):
         self.ocr_forced_cpu = True
         self.mode = "OPTIMIZING"
         self.update_mode()
+        self.worker.set_paused(True)
         self.bar.show()
         self.bar.setValue(0)
         self.bar.setFormat("正在优化: %p%")
@@ -2015,6 +2201,7 @@ class MainWin(QMainWindow):
     def opt_done(self):
         self.ocr_forced_cpu = False
         self.worker.restore_ocr()
+        self.worker.set_paused(False)
         self.load_model()
         self.bar.hide()
         QMessageBox.information(self, "完成", "神经网络优化完成。")
@@ -2198,157 +2385,6 @@ class MainWin(QMainWindow):
             self.p_mem.plot(self.d_mem, pen=pg.mkPen('#00ffff', width=2), clear=True)
             self.p_gpu.plot(self.d_gpu, pen=pg.mkPen('#ff0055', width=2), clear=True)
             self.p_vram.plot(self.d_vram, pen=pg.mkPen('#ffaa00', width=2), clear=True)
-
-    def loop(self):
-        if self.mode in ["OPTIMIZING", "SELECT"]: return
-
-        if self.stop_flag.is_set() and self.mode == "TRAINING":
-            self.mode = "LEARNING"
-            self.update_mode()
-            if self.dragging:
-                self.mouse.release(mouse.Button.left)
-                self.dragging = False
-            self.press_frames = 0
-            self.release_frames = 0
-            return
-
-        loop_start = time.time()
-        try:
-            cap_start = time.time()
-            if self.sct is None or self.monitor is None:
-                try:
-                    self.sct = mss.mss()
-                    self.monitor = self.sct.monitors[1]
-                except Exception as e:
-                    self.update_status_text(f"截屏失败: {e}")
-                    return
-            shot = self.sct.grab(self.monitor)
-            img = np.frombuffer(shot.raw, dtype=np.uint8).reshape((shot.height, shot.width, 4))
-            cap_end = time.time()
-            self.capture_latency_ms = (cap_end - cap_start) * 1000.0
-            if self.prev_capture_ts is not None:
-                self.frame_interval_ms = (cap_start - self.prev_capture_ts) * 1000.0
-            self.prev_capture_ts = cap_start
-            frame_ts = int(cap_start * 1000)
-            frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            self.frame_counter += 1
-            frame_id = self.frame_counter
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            proc = preprocess_frame(rgb)
-            self.seq_frames.append((frame_id, proc))
-            valid_ids = {fid for fid, _ in self.seq_frames}
-            drop_keys = [k for k in list(self.ocr_frame_map.keys()) if k not in valid_ids]
-            for k in drop_keys:
-                self.ocr_frame_map.pop(k, None)
-            mx, my = self.mouse.position
-            nx, ny = screen_to_letter_norm(mx, my)
-            click = 1.0 if self.mouse_pressed else 0.0
-            source = "USER"
-            prediction_error = 0.0
-
-            if self.mode == "TRAINING":
-                seq_frames = list(self.seq_frames)
-                if self.stop_flag.is_set():
-                    return
-                while len(seq_frames) < SEQ_LEN:
-                    seq_frames.insert(0, (None, np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32)))
-                seq_imgs = torch.tensor(np.stack([img for _, img in seq_frames])[None, ...], dtype=torch.float32, device=DEVICE)
-                seq_ocr = torch.tensor(np.stack([self.get_ocr_for_frame(fid) for fid, _ in seq_frames])[None, ...], dtype=torch.float32, device=DEVICE)
-
-                infer_st = time.time()
-                with torch.no_grad():
-                    if torch.cuda.is_available():
-                        with torch.amp.autocast('cuda'):
-                            out, logits, delta_out = self.brain(seq_imgs, seq_ocr)
-                    else:
-                        out, logits, delta_out = self.brain(seq_imgs, seq_ocr)
-                self.infer_latency_ms = (time.time() - infer_st) * 1000.0
-
-                px, py, pc = out[0].cpu().numpy()
-                delta_pred = delta_out[0].cpu().numpy()
-                dx, dy = float(delta_pred[0]), float(delta_pred[1])
-                base_x, base_y = clamp01(float(px)), clamp01(float(py))
-                delta_x = clamp01(self.smooth_x + dx)
-                delta_y = clamp01(self.smooth_y + dy)
-                target_x = 0.5 * (base_x + delta_x)
-                target_y = 0.5 * (base_y + delta_y)
-                conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
-                blend = 0.3 + 0.7 * conf
-                planned_target_x = (1 - blend) * self.smooth_x + blend * target_x
-                planned_target_y = (1 - blend) * self.smooth_y + blend * target_y
-                target_pair = (planned_target_x, planned_target_y)
-                dist = ((target_pair[0] - self.last_target[0]) ** 2 + (target_pair[1] - self.last_target[1]) ** 2) ** 0.5
-                if self.path_planner.should_replan((self.smooth_x, self.smooth_y), target_pair) or dist >= 0.05:
-                    self.path_planner.plan((self.smooth_x, self.smooth_y), target_pair, (dx, dy))
-                    self.last_target = target_pair
-                nx, ny = self.path_planner.next_point()
-                self.smooth_x, self.smooth_y = nx, ny
-                prediction_error = float(-math.log(max(conf, 1e-6)))
-
-                if self.stop_flag.is_set() or self.mode != "TRAINING":
-                    return
-
-                sx, sy = letter_norm_to_screen(self.smooth_x, self.smooth_y)
-                if self.stop_flag.is_set() or self.mode != "TRAINING":
-                    return
-                self.mouse.position = (int(sx), int(sy))
-                now = time.time()
-                if pc >= self.press_thresh:
-                    self.press_frames += 1
-                else:
-                    self.press_frames = 0
-                if pc <= self.release_thresh:
-                    self.release_frames += 1
-                else:
-                    self.release_frames = 0
-                if self.stop_flag.is_set() or self.mode != "TRAINING":
-                    return
-                if not self.dragging and self.press_frames >= 2:
-                    self.mouse.press(mouse.Button.left)
-                    self.dragging = True
-                    self.last_press_time = now
-                    self.release_frames = 0
-                elif self.dragging and (pc <= 0.1 or (self.release_frames >= 3 and now - self.last_press_time >= self.min_press)):
-                    if self.stop_flag.is_set() or self.mode != "TRAINING":
-                        return
-                    self.mouse.release(mouse.Button.left)
-                    self.dragging = False
-                    self.press_frames = 0
-                    self.release_frames = 0
-
-                nx, ny, click = self.smooth_x, self.smooth_y, (1.0 if self.dragging else 0.0)
-                source = "AI"
-            else:
-                self.smooth_x, self.smooth_y = nx, ny
-                self.path_planner.reset((self.smooth_x, self.smooth_y))
-                self.last_target = (self.smooth_x, self.smooth_y)
-                if self.dragging:
-                    self.mouse.release(mouse.Button.left)
-                    self.dragging = False
-                self.press_frames = 0
-                self.release_frames = 0
-
-            save = False
-            if (self.mode == "LEARNING" and source == "USER") or (self.mode == "TRAINING" and source == "AI"):
-                if time.time() - self.last_record > 0.033:
-                    save = True
-                    self.last_record = time.time()
-
-            small = letterbox(frame, INPUT_W, INPUT_H)
-            if self.queue.full():
-                try:
-                    self.queue.get_nowait()
-                    self.queue.task_done()
-                except queue.Empty:
-                    pass
-            try:
-                self.queue.put_nowait((frame, small, frame_id, frame_ts, nx, ny, click, source, save, prediction_error))
-            except queue.Full:
-                pass
-            self.loop_latency_ms = (time.time() - loop_start) * 1000.0
-            self.maybe_adjust_resolution()
-
-        except Exception: pass
 
     def close_app(self):
         self.infer_thread.stop()
