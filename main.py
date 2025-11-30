@@ -14,6 +14,7 @@ import psutil
 import cv2
 import numpy as np
 import mss
+import base64
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -51,6 +52,24 @@ LOG_DB = os.path.join(DATA_DIR, "data.lmdb")
 LOG_INDEX_FILE = os.path.join(DATA_DIR, "index.meta")
 REGION_FILE = os.path.join(BASE_DIR, "regions.json")
 PRIORITY_FILE = os.path.join(DATA_DIR, "priorities.npy")
+INPUT_W, INPUT_H = 320, 180
+SEQ_LEN = 4
+MAX_OCR = 16
+OCR_CONF_THRESHOLD = 0.6
+OCR_AGE_MAX_MS = 5000.0
+POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
+CACHE_MAX_BYTES = 256 * 1024 * 1024
+GPU_VRAM_LOW = 600 * 1024 * 1024
+GPU_VRAM_HIGH = 1200 * 1024 * 1024
+GPU_HYSTERESIS_SEC = 2.5
+POOL_DATA_CACHE = deque()
+POOL_TOTAL_BYTES_CACHE = 0
+POOL_LAST_KEY = -1
+POOL_PREV_VALS_CACHE = []
+POOL_REGION_SIGNATURE = None
+POOL_LOCK = threading.Lock()
+FORCE_CPU_OCR = False
+pynvml = None
 
 for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -64,21 +83,6 @@ if not os.path.exists(REGION_FILE):
         json.dump([], f)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-INPUT_W, INPUT_H = 320, 180
-SEQ_LEN = 4
-MAX_OCR = 16
-OCR_CONF_THRESHOLD = 0.6
-OCR_AGE_MAX_MS = 5000.0
-POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
-CACHE_MAX_BYTES = 256 * 1024 * 1024
-pynvml = None
-POOL_DATA_CACHE = deque()
-POOL_TOTAL_BYTES_CACHE = 0
-POOL_LAST_KEY = -1
-POOL_PREV_VALS_CACHE = []
-POOL_REGION_SIGNATURE = None
-POOL_LOCK = threading.Lock()
-FORCE_CPU_OCR = False
 if importlib.util.find_spec("pynvml") is not None:
     import pynvml
 
@@ -430,6 +434,8 @@ class ExperiencePool(Dataset):
                         try:
                             ts = int(meta.get('ts', 0))
                             img_path = meta.get('img', '')
+                            img_b64 = meta.get('img_b64', '')
+                            img_bytes = base64.b64decode(img_b64.encode('ascii')) if isinstance(img_b64, str) and img_b64 else None
                             mx, my, click = float(meta.get('mx', 0.0)), float(meta.get('my', 0.0)), float(meta.get('click', 0.0))
                             ocr_vals = [float(x) for x in meta.get('ocr', [])]
                             ocr_age = [float(x) for x in meta.get('ocr_age', [])]
@@ -448,9 +454,16 @@ class ExperiencePool(Dataset):
                         feat = pack_ocr(ocr_vals, deltas, ocr_age)
                         weight = self.calc_weight(ocr_vals, deltas, click, novelty, complexity, pred_err)
                         size = 512
-                        if os.path.exists(img_path):
+                        if img_bytes is not None:
+                            size += len(img_bytes)
+                        elif os.path.exists(img_path):
                             size += os.path.getsize(img_path)
-                        entry = {'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
+                            try:
+                                with open(img_path, 'rb') as fb:
+                                    img_bytes = fb.read()
+                            except Exception:
+                                img_bytes = None
+                        entry = {'ts': ts, 'img': img_path, 'img_bytes': img_bytes, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
                         POOL_DATA_CACHE.append(entry)
                         POOL_TOTAL_BYTES_CACHE += size
                         while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
@@ -548,16 +561,26 @@ class ExperiencePool(Dataset):
         reward_boost = base * magnitude
         return max(0.05, reward_boost * action_boost * novelty_boost * complexity_boost * err_boost)
 
-    def cache_image(self, path):
-        if path in self.cache:
-            return self.cache[path]
-        img = cv2.imread(path)
+    def cache_image(self, item):
+        key = str(item.get('id', id(item)))
+        if key in self.cache:
+            return self.cache[key]
+        img_bytes = item.get('img_bytes')
+        img = None
+        if img_bytes:
+            try:
+                arr = np.frombuffer(img_bytes, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            except Exception:
+                img = None
+        if img is None and item.get('img'):
+            img = cv2.imread(item.get('img'))
         if img is None:
             img = np.zeros((INPUT_H, INPUT_W, 3), dtype=np.uint8)
         img = preprocess_frame(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         size = img.nbytes
-        self.cache[path] = img
-        self.cache_order.append((path, size))
+        self.cache[key] = img
+        self.cache_order.append((key, size))
         self.cache_bytes += size
         while self.cache_bytes > self.cache_limit and self.cache_order:
             old, s = self.cache_order.popleft()
@@ -579,7 +602,7 @@ class ExperiencePool(Dataset):
             seq_ocr.append(pack_ocr([]))
         for j in range(start, idx + 1):
             item = self.data[j]
-            img = self.cache_image(item['img'])
+            img = self.cache_image(item)
             img = self.augment_image(img)
             seq_imgs.append(img)
             seq_ocr.append(item['ocr'])
@@ -757,7 +780,10 @@ class SaveWorker(threading.Thread):
             with self.env.begin(write=True) as txn:
                 for path, img, meta in self.buffer:
                     try:
-                        cv2.imwrite(path, img)
+                        ok, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        if not ok:
+                            continue
+                        meta['img_b64'] = base64.b64encode(enc.tobytes()).decode('ascii')
                     except Exception:
                         continue
                     meta['id'] = self.next_id
@@ -859,6 +885,9 @@ class DataWorker(QThread):
         self.prev_pos = None
         self.prev_vel = (0.0, 0.0)
         self.prev_time = None
+        self.vram_low_since = None
+        self.vram_high_since = None
+        self.last_vram_check = 0.0
         self.reload_regions()
 
     def init_ocr_instances(self):
@@ -903,11 +932,40 @@ class DataWorker(QThread):
             self.status_signal.emit("未找到可用的OCR实例")
 
     def set_force_cpu(self, force_cpu):
+        if self.force_cpu == force_cpu:
+            return
         self.force_cpu = force_cpu
         self.release_ocr_resources()
         self.restore_ocr()
         mode_txt = "CPU" if self.force_cpu or self.ocr_gpu is None else "GPU"
         self.status_signal.emit(f"OCR 已切换至 {mode_txt} 模式")
+
+    def manage_ocr_mode(self):
+        if not torch.cuda.is_available():
+            return
+        now = time.time()
+        if now - self.last_vram_check < 0.5:
+            return
+        self.last_vram_check = now
+        free = get_free_vram_bytes()
+        if not self.force_cpu and free < GPU_VRAM_LOW:
+            if self.vram_low_since is None:
+                self.vram_low_since = now
+            if now - self.vram_low_since >= GPU_HYSTERESIS_SEC:
+                self.ocr_gpu_enabled = False
+                self.set_force_cpu(True)
+                self.vram_high_since = None
+        else:
+            self.vram_low_since = None
+        if self.force_cpu and free >= GPU_VRAM_HIGH:
+            if self.vram_high_since is None:
+                self.vram_high_since = now
+            if now - self.vram_high_since >= GPU_HYSTERESIS_SEC:
+                self.ocr_gpu_enabled = True
+                self.set_force_cpu(False)
+                self.vram_low_since = None
+        elif self.force_cpu:
+            self.vram_high_since = None
 
     def emit_status_snapshot(self):
         mode_txt = "未初始化"
@@ -978,6 +1036,7 @@ class DataWorker(QThread):
             if self.paused:
                 time.sleep(0.05)
                 continue
+            self.manage_ocr_mode()
             try:
                 data = self.queue.get(timeout=0.1)
                 full_img, small_img, mx, my, click, source, save, prediction_error = data
