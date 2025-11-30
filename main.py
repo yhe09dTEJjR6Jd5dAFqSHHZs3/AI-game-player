@@ -1846,12 +1846,15 @@ class RegionEditor(QDialog):
         self.setGeometry(SCREEN_LEFT, SCREEN_TOP, SCREEN_W, SCREEN_H)
         self.setCursor(Qt.CrossCursor)
         self.regions = []
+        self.modified = False
+        self.original_regions = []
         self.current_type = 'red'
         self.start_p = None
         self.temp_rect = None
         try:
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
                 self.regions = json.load(f)
+                self.original_regions = json.loads(json.dumps(self.regions))
         except: pass
 
     def finalize_temp_rect(self):
@@ -1861,13 +1864,15 @@ class RegionEditor(QDialog):
                 'x': self.temp_rect.x(), 'y': self.temp_rect.y(),
                 'w': self.temp_rect.width(), 'h': self.temp_rect.height()
             })
+            self.modified = True
         self.start_p = None
         self.temp_rect = None
 
     def save_and_exit(self):
         self.finalize_temp_rect()
-        with open(REGION_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.regions, f)
+        if self.modified or self.regions != self.original_regions:
+            with open(REGION_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.regions, f)
         self.accept()
         
     def paintEvent(self, event):
@@ -1907,6 +1912,7 @@ class RegionEditor(QDialog):
                 r = self.regions[i]
                 if QRect(r['x'], r['y'], r['w'], r['h']).contains(e.pos()):
                     del self.regions[i]
+                    self.modified = True
                     self.update()
                     break
 
