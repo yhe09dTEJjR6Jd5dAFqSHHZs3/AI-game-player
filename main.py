@@ -62,12 +62,6 @@ CACHE_MAX_BYTES = 256 * 1024 * 1024
 GPU_VRAM_LOW = 600 * 1024 * 1024
 GPU_VRAM_HIGH = 1200 * 1024 * 1024
 GPU_HYSTERESIS_SEC = 2.5
-POOL_DATA_CACHE = deque()
-POOL_TOTAL_BYTES_CACHE = 0
-POOL_LAST_KEY = -1
-POOL_PREV_VALS_CACHE = []
-POOL_REGION_SIGNATURE = None
-POOL_LOCK = threading.Lock()
 FORCE_CPU_OCR = False
 pynvml = None
 
@@ -128,11 +122,154 @@ def get_free_vram_bytes():
             return 0.0
     return 0.0
 
+def get_total_vram_bytes():
+    if not torch.cuda.is_available():
+        return 0.0
+    try:
+        props = torch.cuda.get_device_properties(0)
+        return float(getattr(props, 'total_memory', 0.0))
+    except Exception:
+        pass
+    if pynvml is not None:
+        try:
+            pynvml.nvmlInit()
+            if pynvml.nvmlDeviceGetCount() > 0:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                info = pynvml.nvmlDeviceMemoryInfo(handle)
+                return float(info.total)
+        except Exception:
+            return 0.0
+    return 0.0
+
 def encode_key(v):
     return int(v).to_bytes(8, byteorder='big', signed=False)
 
 def decode_key(b):
     return int.from_bytes(b, byteorder='big', signed=False)
+
+class StdSilencer:
+    def __enter__(self):
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+        self.null = open(os.devnull, 'w')
+        sys.stdout = self.null
+        sys.stderr = self.null
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout = self.stdout
+        sys.stderr = self.stderr
+        try:
+            self.null.close()
+        except Exception:
+            pass
+
+class PoolCacheManager:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.lock = threading.Lock()
+            cls._instance.data = []
+            cls._instance.total_bytes = 0
+            cls._instance.last_key = -1
+            cls._instance.prev_vals = []
+            cls._instance.region_signature = None
+        return cls._instance
+
+    def reset_if_region_changed(self, region_types):
+        sig = tuple(region_types)
+        with self.lock:
+            if self.region_signature != sig:
+                self.data = []
+                self.total_bytes = 0
+                self.last_key = -1
+                self.prev_vals = [0] * len(region_types)
+                self.region_signature = sig
+
+    def _commit_batch(self, batch):
+        with self.lock:
+            for entry in batch:
+                self.data.append(entry)
+                self.total_bytes += entry.get('size', 0)
+                while self.total_bytes > POOL_MAX_BYTES and self.data:
+                    dropped = self.data.pop(0)
+                    self.total_bytes -= dropped.get('size', 0)
+
+    def get_snapshot(self):
+        with self.lock:
+            return self.data, self.total_bytes
+
+    def get_total_bytes(self):
+        with self.lock:
+            return self.total_bytes
+
+    def load_from_db(self, region_types, chunk_size=256):
+        self.reset_if_region_changed(region_types)
+        if not os.path.exists(LOG_DB):
+            return self.get_snapshot()
+
+        env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 2, subdir=True, max_dbs=1, readonly=True, lock=False, readahead=False)
+        batch = []
+        try:
+            with env.begin(write=False) as txn:
+                cur = txn.cursor()
+                start_key = encode_key(self.last_key + 1) if self.last_key >= 0 else None
+                has = cur.set_range(start_key) if start_key is not None else cur.first()
+                while has:
+                    try:
+                        meta = json.loads(cur.value().decode('utf-8'))
+                    except Exception:
+                        has = cur.next()
+                        continue
+                    try:
+                        ts = int(meta.get('ts', 0))
+                        img_path = meta.get('img', '')
+                        img_b64 = meta.get('img_b64', '')
+                        img_bytes = base64.b64decode(img_b64.encode('ascii')) if isinstance(img_b64, str) and img_b64 else None
+                        mx, my, click = float(meta.get('mx', 0.0)), float(meta.get('my', 0.0)), float(meta.get('click', 0.0))
+                        ocr_vals = [float(x) for x in meta.get('ocr', [])]
+                        ocr_age = [float(x) for x in meta.get('ocr_age', [])]
+                        novelty = float(meta.get('novelty', 0.0))
+                        complexity = float(meta.get('complexity', 0.0))
+                        pred_err = float(meta.get('prediction_error', 0.0))
+                    except Exception:
+                        has = cur.next()
+                        continue
+                    cur_vals = ocr_vals[:len(region_types)] + [0] * max(0, len(region_types) - len(ocr_vals))
+                    with self.lock:
+                        if len(self.prev_vals) != len(region_types):
+                            self.prev_vals = [0] * len(region_types)
+                        deltas = [cur_vals[i] - (self.prev_vals[i] if i < len(self.prev_vals) else 0) for i in range(len(region_types))]
+                        self.prev_vals = cur_vals
+                    feat = pack_ocr(ocr_vals, deltas, ocr_age)
+                    weight = ExperiencePool.calc_weight_static(region_types, ocr_vals, deltas, click, novelty, complexity, pred_err)
+                    size = 512
+                    if img_bytes is not None:
+                        size += len(img_bytes)
+                    elif os.path.exists(img_path):
+                        size += os.path.getsize(img_path)
+                        try:
+                            with open(img_path, 'rb') as fb:
+                                img_bytes = fb.read()
+                        except Exception:
+                            img_bytes = None
+                    entry = {'ts': ts, 'img': img_path, 'img_bytes': img_bytes, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
+                    batch.append(entry)
+                    self.last_key = decode_key(cur.key())
+                    if len(batch) >= chunk_size:
+                        self._commit_batch(batch)
+                        batch = []
+                    has = cur.next()
+        finally:
+            env.close()
+
+        if batch:
+            self._commit_batch(batch)
+        return self.get_snapshot()
+
+POOL_CACHE = PoolCacheManager()
 
 def atomic_write_text(path, text):
     tmp = path + ".tmp"
@@ -408,71 +545,8 @@ class ExperiencePool(Dataset):
             return []
 
     def load_data(self):
-        global POOL_DATA_CACHE, POOL_TOTAL_BYTES_CACHE, POOL_LAST_KEY, POOL_PREV_VALS_CACHE, POOL_REGION_SIGNATURE
         try:
-            with POOL_LOCK:
-                region_sig = tuple(self.region_types)
-                if POOL_REGION_SIGNATURE != region_sig:
-                    POOL_DATA_CACHE = deque()
-                    POOL_TOTAL_BYTES_CACHE = 0
-                    POOL_LAST_KEY = -1
-                    POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
-                    POOL_REGION_SIGNATURE = region_sig
-                if not os.path.exists(LOG_DB):
-                    return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
-                env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 2, subdir=True, max_dbs=1, readonly=True, lock=False, readahead=False)
-                with env.begin(write=False) as txn:
-                    cur = txn.cursor()
-                    start_key = encode_key(POOL_LAST_KEY + 1) if POOL_LAST_KEY >= 0 else None
-                    has = cur.set_range(start_key) if start_key is not None else cur.first()
-                    while has:
-                        try:
-                            meta = json.loads(cur.value().decode('utf-8'))
-                        except Exception:
-                            has = cur.next()
-                            continue
-                        try:
-                            ts = int(meta.get('ts', 0))
-                            img_path = meta.get('img', '')
-                            img_b64 = meta.get('img_b64', '')
-                            img_bytes = base64.b64decode(img_b64.encode('ascii')) if isinstance(img_b64, str) and img_b64 else None
-                            mx, my, click = float(meta.get('mx', 0.0)), float(meta.get('my', 0.0)), float(meta.get('click', 0.0))
-                            ocr_vals = [float(x) for x in meta.get('ocr', [])]
-                            ocr_age = [float(x) for x in meta.get('ocr_age', [])]
-                            novelty = float(meta.get('novelty', 0.0))
-                            complexity = float(meta.get('complexity', 0.0))
-                            pred_err = float(meta.get('prediction_error', 0.0))
-                        except Exception:
-                            has = cur.next()
-                            continue
-                        cur_vals = ocr_vals[:len(self.region_types)] + [0] * max(0, len(self.region_types) - len(ocr_vals))
-                        deltas = [cur_vals[i] - (POOL_PREV_VALS_CACHE[i] if i < len(POOL_PREV_VALS_CACHE) else 0) for i in range(len(self.region_types))]
-                        if len(POOL_PREV_VALS_CACHE) != len(self.region_types):
-                            POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
-                            deltas = cur_vals
-                        POOL_PREV_VALS_CACHE = cur_vals
-                        feat = pack_ocr(ocr_vals, deltas, ocr_age)
-                        weight = self.calc_weight(ocr_vals, deltas, click, novelty, complexity, pred_err)
-                        size = 512
-                        if img_bytes is not None:
-                            size += len(img_bytes)
-                        elif os.path.exists(img_path):
-                            size += os.path.getsize(img_path)
-                            try:
-                                with open(img_path, 'rb') as fb:
-                                    img_bytes = fb.read()
-                            except Exception:
-                                img_bytes = None
-                        entry = {'ts': ts, 'img': img_path, 'img_bytes': img_bytes, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
-                        POOL_DATA_CACHE.append(entry)
-                        POOL_TOTAL_BYTES_CACHE += size
-                        while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
-                            dropped = POOL_DATA_CACHE.popleft()
-                            POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
-                        POOL_LAST_KEY = decode_key(cur.key())
-                        has = cur.next()
-                env.close()
-                return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
+            return POOL_CACHE.load_from_db(self.region_types)
         except Exception:
             return [], 0
 
@@ -533,6 +607,10 @@ class ExperiencePool(Dataset):
         return float(max(scaled, 1e-3))
 
     def calc_weight(self, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0, prediction_error=0.0):
+        return ExperiencePool.calc_weight_static(self.region_types, ocr, deltas, click, novelty, complexity, prediction_error)
+
+    @staticmethod
+    def calc_weight_static(region_types, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0, prediction_error=0.0):
         action_boost = 1.0 + 1.5 * abs(click)
         novelty = float(clamp01(novelty))
         complexity = float(clamp01(complexity))
@@ -540,11 +618,11 @@ class ExperiencePool(Dataset):
         complexity_boost = 1.0 + 2.0 * complexity
         err = float(max(prediction_error, 0.0))
         err_boost = 1.0 + min(err, 5.0)
-        if not self.region_types or not ocr:
+        if not region_types or not ocr:
             return max(0.05, action_boost * novelty_boost * complexity_boost * err_boost)
         score = 0.0
         total = 0.0
-        for idx, t in enumerate(self.region_types):
+        for idx, t in enumerate(region_types):
             if idx < len(deltas):
                 d = deltas[idx]
                 total += abs(d)
@@ -889,6 +967,7 @@ class DataWorker(QThread):
         self.vram_low_since = None
         self.vram_high_since = None
         self.last_vram_check = 0.0
+        self.gpu_forced_off = False
         self.reload_regions()
 
     def apply_kalman(self, idx, measurement, now, measurement_valid):
@@ -919,20 +998,50 @@ class DataWorker(QThread):
         return max(0, int(round(state['x'])))
 
     def init_ocr_instances(self):
+        total_vram = get_total_vram_bytes()
+        if total_vram > 0 and total_vram <= 4 * 1024 * 1024 * 1024:
+            self.force_cpu = True
+            self.gpu_forced_off = True
+            self.status_signal.emit("显存<=4GB，默认使用CPU OCR")
+        self.init_gpu_ocr()
+        self.init_cpu_ocr()
+        self.select_active_ocr()
+
+    def init_gpu_ocr(self):
+        if self.ocr_gpu is not None or self.force_cpu or self.gpu_forced_off or not torch.cuda.is_available():
+            return
         try:
-            if torch.cuda.is_available():
+            with StdSilencer():
                 self.ocr_gpu = PaddleOCR(use_angle_cls=False, use_gpu=True, gpu_mem=500)
-                self.ocr_gpu_enabled = True
+            self.ocr_gpu_enabled = True
         except Exception as e:
             self.status_signal.emit(f"GPU OCR 初始化失败: {e}")
             self.ocr_gpu = None
             self.ocr_gpu_enabled = False
+
+    def init_cpu_ocr(self):
+        if self.ocr_cpu is not None:
+            return
         try:
-            self.ocr_cpu = PaddleOCR(use_angle_cls=False, use_gpu=False)
+            with StdSilencer():
+                self.ocr_cpu = PaddleOCR(use_angle_cls=False, use_gpu=False)
         except Exception as e:
             self.status_signal.emit(f"CPU OCR 初始化失败: {e}")
             self.ocr_cpu = None
-        self.select_active_ocr()
+
+    def drop_gpu_ocr(self):
+        try:
+            if self.ocr_gpu is not None:
+                del self.ocr_gpu
+        except Exception:
+            pass
+        self.ocr_gpu = None
+        self.ocr_gpu_enabled = False
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def release_ocr_resources(self):
         try:
@@ -959,17 +1068,21 @@ class DataWorker(QThread):
         if self.ocr is None:
             self.status_signal.emit("未找到可用的OCR实例")
 
-    def set_force_cpu(self, force_cpu):
-        if self.force_cpu == force_cpu:
+    def set_force_cpu(self, force_cpu, drop_gpu=False):
+        if self.force_cpu == force_cpu and not drop_gpu:
             return
         self.force_cpu = force_cpu
+        if drop_gpu:
+            self.drop_gpu_ocr()
         self.release_ocr_resources()
+        if not self.force_cpu:
+            self.init_gpu_ocr()
         self.restore_ocr()
         mode_txt = "CPU" if self.force_cpu or self.ocr_gpu is None else "GPU"
         self.status_signal.emit(f"OCR 已切换至 {mode_txt} 模式")
 
     def manage_ocr_mode(self):
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available() or self.gpu_forced_off:
             return
         now = time.time()
         if now - self.last_vram_check < 0.5:
@@ -981,11 +1094,11 @@ class DataWorker(QThread):
                 self.vram_low_since = now
             if now - self.vram_low_since >= GPU_HYSTERESIS_SEC:
                 self.ocr_gpu_enabled = False
-                self.set_force_cpu(True)
+                self.set_force_cpu(True, drop_gpu=True)
                 self.vram_high_since = None
         else:
             self.vram_low_since = None
-        if self.force_cpu and free >= GPU_VRAM_HIGH:
+        if self.force_cpu and free >= GPU_VRAM_HIGH and not self.gpu_forced_off:
             if self.vram_high_since is None:
                 self.vram_high_since = now
             if now - self.vram_high_since >= GPU_HYSTERESIS_SEC:
@@ -1494,9 +1607,9 @@ class MainWin(QMainWindow):
         self.lbl_gpu_temp = QLabel("显卡温度: 0°C")
         self.lbl_gpu_power = QLabel("显卡功耗: 0W")
         self.lbl_gpu_fan = QLabel("风扇: 0%")
-        self.lbl_disk_io = QLabel("磁盘IO: 0MB/s")
-        self.lbl_disk_lat = QLabel("磁盘延迟: 0ms")
-        self.lbl_disk_qd = QLabel("队列深度: 0")
+        self.lbl_disk_io = QLabel("系统磁盘IO: 0MB/s")
+        self.lbl_disk_lat = QLabel("系统磁盘延迟: 0ms")
+        self.lbl_disk_qd = QLabel("系统磁盘队列: 0")
         self.lbl_latency = QLabel("延迟: 截屏0ms | 推理0ms | OCR0ms | 循环0ms")
         self.lbl_fps = QLabel("帧率: 0fps | 截屏间隔0ms")
 
@@ -1623,7 +1736,7 @@ class MainWin(QMainWindow):
         if torch.cuda.is_available() and free_vram < 1024**3:
             batch_size = 8
             self.ocr_forced_cpu = True
-            self.worker.set_force_cpu(True)
+            self.worker.set_force_cpu(True, drop_gpu=True)
         else:
             self.ocr_forced_cpu = False
         self.mode = "OPTIMIZING"
@@ -1742,7 +1855,7 @@ class MainWin(QMainWindow):
             vram_limit_mb = 3500
             vram_recover_mb = 2800
             if vram_u >= vram_limit_mb and not self.worker.force_cpu:
-                self.worker.set_force_cpu(True)
+                self.worker.set_force_cpu(True, drop_gpu=True)
                 self.vram_auto_cpu = True
                 self.ocr_forced_cpu = True
                 try:
@@ -1780,8 +1893,7 @@ class MainWin(QMainWindow):
             except Exception:
                 scale = SCALE_PERCENT
 
-        with POOL_LOCK:
-            pool_bytes = POOL_TOTAL_BYTES_CACHE
+        pool_bytes = POOL_CACHE.get_total_bytes()
         pool_percent = clamp01(pool_bytes / max(POOL_MAX_BYTES, 1)) * 100
 
         self.lbl_cpu.setText(f"处理器: {cpu}%")
@@ -1794,9 +1906,9 @@ class MainWin(QMainWindow):
         self.lbl_gpu_temp.setText(f"显卡温度: {gpu_temp:.0f}°C")
         self.lbl_gpu_power.setText(f"显卡功耗: {gpu_power:.1f}W")
         self.lbl_gpu_fan.setText(f"风扇: {gpu_fan:.0f}%")
-        self.lbl_disk_io.setText(f"磁盘IO: {io_throughput:.2f}MB/s")
-        self.lbl_disk_lat.setText(f"磁盘延迟: {lat_ms:.2f}ms")
-        self.lbl_disk_qd.setText(f"队列深度: {qd:.2f}")
+        self.lbl_disk_io.setText(f"系统磁盘IO: {io_throughput:.2f}MB/s")
+        self.lbl_disk_lat.setText(f"系统磁盘延迟: {lat_ms:.2f}ms")
+        self.lbl_disk_qd.setText(f"系统磁盘队列: {qd:.2f}")
         fps = 1000.0 / self.frame_interval_ms if self.frame_interval_ms > 0 else 0.0
         self.lbl_latency.setText(f"延迟: 截屏{self.capture_latency_ms:.1f}ms | 推理{self.infer_latency_ms:.1f}ms | OCR{self.ocr_latency_ms:.1f}ms | 循环{self.loop_latency_ms:.1f}ms")
         self.lbl_fps.setText(f"帧率: {fps:.1f}fps | 截屏间隔{self.frame_interval_ms:.1f}ms")
