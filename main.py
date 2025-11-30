@@ -2102,6 +2102,8 @@ class MainWin(QMainWindow):
         self.loop_sleep = 0.001
         self.target_fps = 60
         self.plot_pause_until = 0.0
+        self.nvidia_smi_checked = False
+        self.nvidia_smi_available = False
 
         self.key_signal.connect(self.handle_key_event)
         self.click_signal.connect(self.handle_click_event)
@@ -2174,7 +2176,7 @@ class MainWin(QMainWindow):
         self.lbl_gpu = QLabel("显卡: 0%")
         self.lbl_vram = QLabel("显存: 0GB")
         self.lbl_res = QLabel("分辨率: 0x0")
-        self.lbl_fps = QLabel("帧率: 0fps | 截屏间隔0ms")
+        self.lbl_fps = QLabel("帧率: 0fps")
 
         info_labels = [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_vram, self.lbl_res, self.lbl_fps]
         for i, l in enumerate(info_labels):
@@ -2450,6 +2452,34 @@ class MainWin(QMainWindow):
                     vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
                 except Exception:
                     pass
+            elif not self.nvidia_smi_checked:
+                self.nvidia_smi_checked = True
+                try:
+                    subprocess.check_output([
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader,nounits"
+                    ], stderr=subprocess.DEVNULL)
+                    self.nvidia_smi_available = True
+                except Exception:
+                    self.nvidia_smi_available = False
+            if self.nvidia_smi_available and self.nvml_handle is None:
+                try:
+                    out = subprocess.check_output([
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader,nounits"
+                    ], stderr=subprocess.DEVNULL, text=True).strip()
+                    if out:
+                        parts = out.split('\n')[0].split(',')
+                        if len(parts) >= 3:
+                            gpu_u = float(parts[0].strip())
+                            vram_u = float(parts[1].strip())
+                            vram_t = max(float(parts[2].strip()), 1.0)
+                            gpu_display = f"{gpu_u}%"
+                            vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
+                except Exception:
+                    pass
 
         scale = SCALE_PERCENT
         if platform.system() == 'Windows':
@@ -2462,11 +2492,10 @@ class MainWin(QMainWindow):
         self.lbl_cpu.setText(f"处理器: {cpu}%")
         self.lbl_mem.setText(f"内存: {mem}%")
         self.lbl_gpu.setText(f"显卡: {gpu_display}")
-        vram_hint = " (OCR已切换CPU)" if self.worker.force_cpu else ""
-        self.lbl_vram.setText(f"显存: {vram_display}{vram_hint}")
+        self.lbl_vram.setText(f"显存: {vram_display}")
         self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
         fps = 1000.0 / self.frame_interval_ms if self.frame_interval_ms > 0 else 0.0
-        self.lbl_fps.setText(f"帧率: {fps:.1f}fps | 截屏间隔{self.frame_interval_ms:.1f}ms")
+        self.lbl_fps.setText(f"帧率: {fps:.1f}fps")
 
         load = max(cpu, gpu_u)
         if load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95):
