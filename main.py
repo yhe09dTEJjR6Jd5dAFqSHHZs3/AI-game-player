@@ -605,8 +605,7 @@ class Brain(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(256, 128),
             nn.SiLU(),
-            nn.Linear(128, 3),
-            nn.Sigmoid()
+            nn.Linear(128, 3)
         )
         self.delta_head = nn.Sequential(nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 2), nn.Tanh())
 
@@ -632,7 +631,10 @@ class Brain(nn.Module):
         out, _ = self.gru(seq)
         feat = out[:, -1, :]
         dirs = self.dir_head(feat)
-        return self.fc(feat), dirs, self.delta_head(feat)
+        logits = self.fc(feat)
+        pos = torch.sigmoid(logits[:, :2])
+        click_logit = logits[:, 2:3]
+        return torch.cat([pos, click_logit], dim=1), dirs, self.delta_head(feat)
 
 class SumTree:
     def __init__(self, capacity):
@@ -1016,7 +1018,7 @@ class OptimizerThread(QThread):
 
         opt = optim.AdamW(model.parameters(), lr=8e-4)
         reg_loss = nn.SmoothL1Loss(reduction='none')
-        bce = nn.BCELoss(reduction='none')
+        bce = nn.BCEWithLogitsLoss(reduction='none')
 
         # Updated GradScaler usage
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
@@ -1278,7 +1280,7 @@ class OcrWorker(threading.Thread):
             state['x'] = pred_x
             state['p'] = pred_p
         self.kalman_time[idx] = now
-        return max(0, int(round(state['x']))), observation_used
+        return max(0.0, float(state['x'])), observation_used
 
     def parse_ocr_result(self, result):
         parsed = None
@@ -1310,23 +1312,20 @@ class OcrWorker(threading.Thread):
             if min_side < 10:
                 return None
             scale = 2 if min_side < 50 else 1
-            if roi.ndim == 3 and roi.shape[2] == 3:
-                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = roi
-            norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-            pad = max(2, int(0.1 * min(norm.shape[:2])))
-            proc = cv2.copyMakeBorder(norm, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+            proc = roi
+            if proc.ndim == 2 or (proc.ndim == 3 and proc.shape[2] == 1):
+                proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
+            elif proc.shape[2] == 4:
+                proc = cv2.cvtColor(proc, cv2.COLOR_BGRA2BGR)
             if scale > 1:
-                proc = cv2.resize(proc, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
+                proc = cv2.resize(proc, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
 
             parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=True, rec=True))
             if parsed is None:
                 parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=False, rec=True))
             if parsed and best_conf >= OCR_CONF_THRESHOLD:
                 try:
-                    return int(round(float(parsed))), best_conf
+                    return float(parsed), best_conf
                 except Exception:
                     pass
         except Exception:
@@ -1464,17 +1463,17 @@ class OcrWorker(threading.Thread):
                 if idx >= len(self.histories):
                     self.histories.append(deque(maxlen=5))
                 self.histories[idx].append(filtered)
-                smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else filtered
+                smoothed = float(np.median(self.histories[idx])) if self.histories[idx] else filtered
                 stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
                 if not is_warmup and prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
                     smoothed = prev_v
-                final_v = max(0, smoothed)
+                final_v = max(0.0, smoothed)
                 if idx < len(self.prev_vals):
                     self.prev_vals[idx] = final_v
                 else:
                     self.prev_vals.append(final_v)
                 if idx < len(self.stable_counts):
-                    self.stable_counts[idx] = stable + 1 if final_v == prev_v else 0
+                    self.stable_counts[idx] = stable + 1 if prev_v is not None and abs(final_v - prev_v) < 1e-3 else 0
                 else:
                     self.stable_counts.append(0)
                 ocr_vals.append(final_v)
@@ -1794,7 +1793,8 @@ class InferenceThread(QThread):
                         out, logits, delta_out = w.brain(seq_imgs, seq_ocr)
                 w.infer_latency_ms = (time.time() - infer_st) * 1000.0
 
-                px, py, pc = out[0].cpu().numpy()
+                px, py = out[0, :2].cpu().numpy()
+                pc = float(torch.sigmoid(out[0, 2]).cpu())
                 delta_pred = delta_out[0].cpu().numpy()
                 dx, dy = float(delta_pred[0]), float(delta_pred[1])
                 base_x, base_y = clamp01(float(px)), clamp01(float(py))
