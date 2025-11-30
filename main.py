@@ -32,18 +32,12 @@ import importlib
 import importlib.util
 import logging
 import warnings
-logging.getLogger("ppocr").setLevel(logging.ERROR)
-logging.getLogger("ppocr.utils.logging").setLevel(logging.ERROR)
-logging.getLogger("ppocr.utility").setLevel(logging.ERROR)
+import pytesseract
+from pytesseract import Output
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*pynvml.*deprecated.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=r".*torch\.cuda\.amp\.GradScaler.*deprecated.*")
-warnings.filterwarnings("ignore", category=UserWarning, message=r"The parameter use_angle_cls has been deprecated")
 warnings.filterwarnings("ignore", category=UserWarning, message=r"Warning: you have set wrong precision for backend:cuda")
 warnings.filterwarnings("ignore", category=UserWarning, message=r"Please use the new API settings to control TF32 behavior")
-try:
-    from paddleocr import PaddleOCR
-except ImportError:
-    PaddleOCR = None
 
 try:
     import win32pdh
@@ -1207,17 +1201,8 @@ class OcrWorker(threading.Thread):
 
     def init_ocr(self):
         try:
-            with StdSilencer():
-                # use_angle_cls 默认为 True，这里设为 False 提升数字识别速度
-                # lang='ch' 覆盖数字和中文
-                self.ocr = PaddleOCR(
-                    lang="ch",
-                    ocr_version='PP-OCRv4',
-                    show_log=False,
-                    use_gpu=False,
-                    use_angle_cls=False,
-                    drop_score=0.5
-                )
+            pytesseract.get_tesseract_version()
+            self.ocr = pytesseract
             if self.status_cb:
                 self.status_cb("OCR 已切换至 CPU 轻量模式")
         except Exception as e:
@@ -1237,29 +1222,21 @@ class OcrWorker(threading.Thread):
         with self.lock:
             self.latest_snapshot = {'values': [0]*len(self.regions), 'ages': [0]*len(self.regions), 'types': ['obs']*len(self.regions), 'frame_id': None, 'ts': int(now_ts * 1000)}
 
-    def parse_ocr_result(self, result):
+    def parse_ocr_result(self, texts, confs):
         parsed = None
         best_conf = 0.0
-        if result and len(result) > 0 and result[0]:
-            texts = []
-            for item in result[0]:
-                if not item:
-                    continue
-                if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], (list, tuple)) and len(item[1]) >= 2:
-                    text, conf = item[1][0], float(item[1][1])
-                elif isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[0], str):
-                    text, conf = item[0], float(item[1])
-                else:
-                    continue
-                texts.append(text)
-                best_conf = max(best_conf, conf)
-            merged = ''.join(texts)
-            m = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", merged)
-            if m:
-                try:
-                    parsed = float(m.group(0).replace(',', ''))
-                except:
-                    parsed = None
+        merged = ''.join(texts)
+        m = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", merged)
+        if m:
+            try:
+                parsed = float(m.group(0).replace(',', ''))
+            except Exception:
+                parsed = None
+        for c in confs:
+            try:
+                best_conf = max(best_conf, float(c) / 100.0)
+            except Exception:
+                continue
         return parsed, best_conf
 
     def read_ocr(self, roi):
@@ -1270,9 +1247,7 @@ class OcrWorker(threading.Thread):
             h, w = roi.shape[:2]
             if h < 5 or w < 5:
                 return None
-                
-            # --- 图像预处理改进 ---
-            # 1. 转换为 RGB (PaddleOCR 内部通常处理 RGB)
+
             if roi.ndim == 2:
                 proc = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
             elif roi.shape[2] == 4:
@@ -1280,29 +1255,27 @@ class OcrWorker(threading.Thread):
             else:
                 proc = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
 
-            # 2. 智能放大：对于游戏中的小字体，放大 2-3 倍能显著提高识别率
-            # 不再强制缩放到固定高度，而是保持比例
             scale = 1.0
             if h < 30:
                 scale = 3.0
             elif h < 60:
                 scale = 2.0
-            
+
             if scale > 1.0:
                 proc = cv2.resize(proc, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-            # 3. 识别 (det=False 只进行识别，速度更快，适合固定区域)
-            # 先尝试纯识别模式
-            res = self.ocr.ocr(proc, cls=False, det=False, rec=True)
-            val, conf = self.parse_ocr_result(res)
-
-            # 如果纯识别失败或置信度低，尝试检测+识别模式
-            if val is None or conf < OCR_CONF_THRESHOLD:
-                 res = self.ocr.ocr(proc, cls=False, det=True, rec=True)
-                 val2, conf2 = self.parse_ocr_result(res)
-                 if val2 is not None and conf2 > conf:
-                     val, conf = val2, conf2
-
+            data = self.ocr.image_to_data(proc, output_type=Output.DICT, config="--psm 7 -c tessedit_char_whitelist=0123456789.,+-")
+            texts = []
+            confs = []
+            for t, c in zip(data.get('text', []), data.get('conf', [])):
+                if t is None:
+                    continue
+                t = str(t).strip()
+                if not t:
+                    continue
+                texts.append(t)
+                confs.append(c)
+            val, conf = self.parse_ocr_result(texts, confs)
             if val is not None:
                 return val, conf
                 
