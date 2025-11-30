@@ -41,6 +41,8 @@ OpenCV：4.10
 
 简体中文界面。
 
+使用RapidOCR。
+
 不依赖Windows API。
 
 仅用一个无注释、无硬编码的Python脚本实现所有功能。
