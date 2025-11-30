@@ -1280,42 +1280,50 @@ class OcrWorker(threading.Thread):
         self.kalman_time[idx] = now
         return max(0, int(round(state['x']))), observation_used
 
+    def parse_ocr_result(self, result):
+        parsed = None
+        best_conf = 0.0
+        if result and len(result) > 0 and result[0]:
+            texts = []
+            for item in result[0]:
+                if not item or len(item) < 2:
+                    continue
+                text_info = item[1]
+                if len(text_info) < 2:
+                    continue
+                text, conf = text_info[0], float(text_info[1])
+                if conf >= OCR_CONF_THRESHOLD:
+                    texts.append(text)
+                    best_conf = max(best_conf, conf)
+            merged = ''.join(texts)
+            m = re.search(r"\d+(?:\.\d+)?", merged)
+            if m:
+                parsed = m.group(0)
+        return parsed, best_conf
+
     def read_ocr(self, roi):
         if self.ocr is None:
             return None
         st = time.time()
         try:
-            # 简化预处理，避免破坏文字特征
             min_side = min(roi.shape[:2])
-            if min_side < 10: return None
-            # 适当放大以提高小字体识别率
+            if min_side < 10:
+                return None
             scale = 2 if min_side < 50 else 1
-            if scale > 1:
-                proc = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            if roi.ndim == 3 and roi.shape[2] == 3:
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             else:
-                proc = roi
-            
-            result = self.ocr.ocr(proc, cls=False, det=True, rec=True)
-            parsed = None
-            best_conf = 0.0
-            
-            # 增强解析逻辑，处理PaddleOCR返回None的情况
-            if result and len(result) > 0 and result[0]:
-                texts = []
-                for item in result[0]:
-                    if not item or len(item) < 2: continue
-                    text_info = item[1]
-                    if len(text_info) < 2: continue
-                    text, conf = text_info[0], float(text_info[1])
-                    if conf >= OCR_CONF_THRESHOLD:
-                        texts.append(text)
-                        best_conf = max(best_conf, conf)
-                merged = ''.join(texts)
-                # 宽松正则匹配
-                m = re.search(r"\d+(?:\.\d+)?", merged)
-                if m:
-                    parsed = m.group(0)
-            
+                gray = roi
+            norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            pad = max(2, int(0.1 * min(norm.shape[:2])))
+            proc = cv2.copyMakeBorder(norm, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+            if scale > 1:
+                proc = cv2.resize(proc, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
+
+            parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=True, rec=True))
+            if parsed is None:
+                parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=False, rec=True))
             if parsed and best_conf >= OCR_CONF_THRESHOLD:
                 try:
                     return int(round(float(parsed))), best_conf
