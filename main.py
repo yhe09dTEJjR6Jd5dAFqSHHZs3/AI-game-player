@@ -1225,7 +1225,7 @@ class OcrWorker(threading.Thread):
             with StdSilencer():
                 self.ocr = PaddleOCR(lang="ch", ocr_version='PP-OCRv4', show_log=False, use_gpu=False, use_angle_cls=False, device='cpu', cpu_threads=4)
             if self.status_cb:
-                self.status_cb("OCR 已切换至 CPU 模式")
+                self.status_cb("OCR 已切换至 CPU 轻量模式")
         except Exception as e:
             self.ocr = None
             if self.status_cb:
@@ -1328,15 +1328,19 @@ class OcrWorker(threading.Thread):
             scale = target_h / float(proc.shape[0])
             target_w = max(1, int(proc.shape[1] * scale))
             proc = cv2.resize(proc, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-
-            parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=True, rec=True))
-            if parsed is None:
-                parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=False, rec=True))
-            if parsed and best_conf >= OCR_CONF_THRESHOLD:
-                try:
-                    return float(parsed), best_conf
-                except Exception:
-                    pass
+            small_numeric = max(h, w) <= 120
+            modes = [(False, small_numeric)]
+            if not small_numeric:
+                modes.append((True, False))
+            for det_mode, force_small in modes:
+                parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=det_mode, rec=True))
+                if parsed and best_conf >= OCR_CONF_THRESHOLD:
+                    try:
+                        return float(parsed), best_conf
+                    except Exception:
+                        pass
+                if force_small:
+                    break
         except Exception:
             pass
         finally:
@@ -1427,16 +1431,11 @@ class OcrWorker(threading.Thread):
             return
         
         frame_h, frame_w = frame.shape[:2]
-        # 修正：MSS抓取的图像已经是物理分辨率，直接基于SCREEN_W比较即可
-        # 如果有DPI缩放，regions的坐标可能是逻辑坐标，需要根据缩放比例调整
-        scale_x = frame_w / max(SCREEN_W, 1)
-        scale_y = frame_h / max(SCREEN_H, 1)
-        
-        # 尝试检测系统DPI缩放
-        if platform.system() == 'Windows' and abs(scale_x - 1.0) < 0.1:
-            # 如果SCREEN_W和frame_w接近，说明它们是同一个单位。
-            # 但regions可能是基于逻辑像素的，如果开启了DPI缩放，frame_w通常会比逻辑SCREEN_W大
-            pass 
+        scale_factor = max(SCALE_PERCENT, 1) / 100.0
+        logical_w = SCREEN_W / scale_factor
+        logical_h = SCREEN_H / scale_factor
+        scale_x = frame_w / max(logical_w, 1)
+        scale_y = frame_h / max(logical_h, 1)
 
         for idx, r in enumerate(self.regions):
             try:
@@ -1579,13 +1578,13 @@ class DataWorker(QThread):
 
     def set_force_cpu(self, force_cpu, drop_gpu=False):
         self.force_cpu = True
-        self.status_signal.emit("OCR 已锁定 CPU 模式")
+        self.status_signal.emit("OCR 已锁定 CPU 轻量模式")
 
     def manage_ocr_mode(self):
         return
 
     def emit_status_snapshot(self):
-        self.status_signal.emit("OCR 已切换至 CPU 模式")
+        self.status_signal.emit("OCR 已切换至 CPU 轻量模式")
 
     def set_paused(self, paused):
         self.paused = paused
@@ -2041,7 +2040,6 @@ class MainWin(QMainWindow):
         self.setStyleSheet("QMainWindow {background-color: #050a0f; color: #00f0ff; font-family: 'SimHei';}")
         
         self.brain = Brain().to(DEVICE)
-        self.load_model()
 
         self.mouse = InputController()
 
@@ -2114,6 +2112,7 @@ class MainWin(QMainWindow):
         self.click_signal.connect(self.handle_click_event)
 
         self.init_ui()
+        QTimer.singleShot(0, self.load_model)
         self.setup_listeners()
 
         self.infer_thread = InferenceThread(self)
