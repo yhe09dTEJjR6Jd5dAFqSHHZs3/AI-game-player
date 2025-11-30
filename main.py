@@ -1277,8 +1277,13 @@ class OcrWorker(threading.Thread):
                 state['x'] = pred_x
                 state['p'] = pred_p
         else:
-            state['x'] = pred_x
-            state['p'] = pred_p
+            inertia = math.exp(-dt * 0.35)
+            state['v'] = state['v'] * inertia
+            if prev_v is not None:
+                state['x'] = pred_x * inertia + prev_v * (1.0 - inertia)
+            else:
+                state['x'] = pred_x
+            state['p'] = pred_p * 1.1
         self.kalman_time[idx] = now
         return max(0.0, float(state['x'])), observation_used
 
@@ -1311,14 +1316,18 @@ class OcrWorker(threading.Thread):
             min_side = min(roi.shape[:2])
             if min_side < 10:
                 return None
-            scale = 2 if min_side < 50 else 1
             proc = roi
             if proc.ndim == 2 or (proc.ndim == 3 and proc.shape[2] == 1):
                 proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
             elif proc.shape[2] == 4:
                 proc = cv2.cvtColor(proc, cv2.COLOR_BGRA2BGR)
-            if scale > 1:
-                proc = cv2.resize(proc, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            h, w = proc.shape[:2]
+            pad = max(4, int(0.08 * max(h, w)))
+            proc = cv2.copyMakeBorder(proc, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+            target_h = 64
+            scale = target_h / float(proc.shape[0])
+            target_w = max(1, int(proc.shape[1] * scale))
+            proc = cv2.resize(proc, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
             parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=True, rec=True))
             if parsed is None:
@@ -1433,8 +1442,8 @@ class OcrWorker(threading.Thread):
             try:
                 px = int(round(r['x'] * scale_x))
                 py = int(round(r['y'] * scale_y))
-                pw = int(round(r['w'] * scale_x))
-                ph = int(round(r['h'] * scale_y))
+                pw = max(1, int(round(r['w'] * scale_x)))
+                ph = max(1, int(round(r['h'] * scale_y)))
                 x1 = max(0, min(px, frame_w - 1))
                 y1 = max(0, min(py, frame_h - 1))
                 x2 = max(x1 + 1, min(px + pw, frame_w))
