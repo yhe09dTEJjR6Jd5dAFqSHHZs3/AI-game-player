@@ -43,8 +43,6 @@ OpenCV：4.10
 
 使用RapidOCR。
 
-不依赖Windows API。
-
 仅用一个无注释、无硬编码的Python脚本实现所有功能。
 
 对CPU占用率、内存占用率、GPU占用率、显存占用率进行监控（1Hz），并建立自适应机制：
