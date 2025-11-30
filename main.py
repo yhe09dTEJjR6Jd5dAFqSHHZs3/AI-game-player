@@ -1117,6 +1117,228 @@ class SaveWorker(threading.Thread):
         except Exception:
             pass
 
+class OcrWorker(threading.Thread):
+    def __init__(self, status_cb=None, perf_cb=None):
+        super().__init__(daemon=True)
+        self.status_cb = status_cb
+        self.perf_cb = perf_cb
+        self.running = True
+        self.q = queue.Queue(maxsize=4)
+        self.lock = threading.Lock()
+        self.regions = []
+        self.prev_rois = []
+        self.prev_vals = []
+        self.prev_change = []
+        self.histories = []
+        self.last_read_tick = []
+        self.stable_counts = []
+        self.last_update_time = []
+        self.kalman_states = []
+        self.kalman_time = []
+        self.tick = 0
+        self.ocr = None
+        self.latest_snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': None, 'ts': int(time.time() * 1000)}
+        self.last_latency_ms = 0.0
+        self.reload_regions()
+        self.init_ocr()
+
+    def init_ocr(self):
+        try:
+            with StdSilencer():
+                self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=False)
+            if self.status_cb:
+                self.status_cb("OCR 已切换至 CPU 模式")
+        except Exception as e:
+            self.ocr = None
+            if self.status_cb:
+                self.status_cb(f"OCR 初始化失败: {e}")
+
+    def reload_regions(self):
+        try:
+            with open(REGION_FILE, 'r', encoding='utf-8') as f:
+                self.regions = json.load(f)
+        except Exception:
+            self.regions = []
+        self.prev_rois = [None] * len(self.regions)
+        self.prev_vals = [None] * len(self.regions)
+        self.prev_change = [0.0] * len(self.regions)
+        self.histories = [deque(maxlen=5) for _ in self.regions]
+        self.last_read_tick = [0] * len(self.regions)
+        self.stable_counts = [0] * len(self.regions)
+        now_ts = time.time()
+        self.last_update_time = [now_ts] * len(self.regions)
+        self.kalman_states = [{'x': 0.0, 'v': 0.0, 'p': 25.0} for _ in self.regions]
+        self.kalman_time = [now_ts] * len(self.regions)
+        with self.lock:
+            self.latest_snapshot = {'values': [0]*len(self.regions), 'ages': [0]*len(self.regions), 'types': ['pred']*len(self.regions), 'frame_id': None, 'ts': int(now_ts * 1000)}
+
+    def apply_kalman(self, idx, measurement, now):
+        prev_v = self.prev_vals[idx] if idx < len(self.prev_vals) else None
+        dt = max(now - self.kalman_time[idx], 1e-3)
+        state = self.kalman_states[idx]
+        pred_x = state['x'] + state['v'] * dt
+        pred_p = state['p'] + (dt * 8.0) ** 2
+        observation_used = False
+        if measurement is not None:
+            meas_val, meas_conf = measurement
+            if prev_v is not None and abs(float(meas_val) - float(prev_v)) > OCR_JUMP_THRESHOLD and meas_conf < 0.9:
+                meas_val = None
+            else:
+                meas_val = float(meas_val)
+            if meas_val is not None:
+                k = pred_p / (pred_p + 16.0)
+                state['x'] = pred_x + k * (meas_val - pred_x)
+                state['v'] = (state['x'] - pred_x) / dt
+                state['p'] = (1.0 - k) * pred_p
+                self.last_update_time[idx] = now
+                observation_used = True
+            else:
+                state['x'] = pred_x
+                state['p'] = pred_p
+        else:
+            state['x'] = pred_x
+            state['p'] = pred_p
+        self.kalman_time[idx] = now
+        return max(0, int(round(state['x']))), observation_used
+
+    def read_ocr(self, roi):
+        if self.ocr is None:
+            return None
+        st = time.time()
+        try:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            min_side = min(gray.shape[:2])
+            scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
+            resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            blurred = cv2.medianBlur(resized, 3)
+            binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+            proc = cv2.copyMakeBorder(binary, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
+            proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
+            result = self.ocr.ocr(proc, det=False, cls=False)
+            digits = ''
+            best_conf = 0.0
+            if result and len(result) > 0:
+                texts = []
+                for item in result[0]:
+                    if len(item) <= 1 or len(item[1]) < 2:
+                        continue
+                    text, conf = item[1][0], float(item[1][1])
+                    if conf >= OCR_CONF_THRESHOLD:
+                        texts.append(text)
+                        best_conf = max(best_conf, conf)
+                digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
+            if digits and best_conf >= OCR_CONF_THRESHOLD:
+                return int(digits), best_conf
+        except Exception:
+            pass
+        finally:
+            self.last_latency_ms = (time.time() - st) * 1000.0
+            if self.perf_cb:
+                try:
+                    self.perf_cb({'ocr_time_ms': self.last_latency_ms})
+                except Exception:
+                    pass
+        return None
+
+    def submit_frame(self, frame_id, frame):
+        if not self.running:
+            return
+        if self.q.full():
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self.q.put_nowait((frame_id, frame))
+        except queue.Full:
+            pass
+
+    def get_latest(self):
+        with self.lock:
+            snapshot = dict(self.latest_snapshot)
+            snapshot['values'] = list(snapshot.get('values', []))
+            snapshot['types'] = list(snapshot.get('types', []))
+            ages = []
+            now = time.time()
+            for t in self.last_update_time:
+                ages.append(max(0, int((now - t) * 1000)))
+            snapshot['ages'] = ages if ages else snapshot.get('ages', [])
+            return snapshot
+
+    def process_frame(self, frame_id, frame):
+        self.tick += 1
+        now = time.time()
+        ocr_vals = []
+        ocr_types = []
+        if not self.regions:
+            with self.lock:
+                self.latest_snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': frame_id, 'ts': int(now * 1000)}
+            return
+        scale_factor = SCALE_PERCENT / 100.0
+        for idx, r in enumerate(self.regions):
+            try:
+                px = int(round(r['x'] * scale_factor))
+                py = int(round(r['y'] * scale_factor))
+                pw = int(round(r['w'] * scale_factor))
+                ph = int(round(r['h'] * scale_factor))
+                roi = frame[py:py+ph, px:px+pw]
+                if roi.size == 0:
+                    raise ValueError("empty roi")
+                if idx >= len(self.prev_rois):
+                    self.prev_rois.append(None)
+                raw = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
+                diff = 0.3 * (self.prev_change[idx] if idx < len(self.prev_change) else 0.0) + 0.7 * raw
+                if idx < len(self.prev_change):
+                    self.prev_change[idx] = diff
+                else:
+                    self.prev_change.append(diff)
+                self.prev_rois[idx] = roi
+                prev_v = self.prev_vals[idx] if idx < len(self.prev_vals) else None
+                need_read = diff >= 0.002 or prev_v is None or self.tick - self.last_read_tick[idx] >= 3
+                measurement = None
+                observed = False
+                if need_read:
+                    measurement = self.read_ocr(roi.copy())
+                    self.last_read_tick[idx] = self.tick
+                    observed = measurement is not None
+                filtered, obs_used = self.apply_kalman(idx, measurement if observed else None, now)
+                if idx >= len(self.histories):
+                    self.histories.append(deque(maxlen=5))
+                self.histories[idx].append(filtered)
+                smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else filtered
+                stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
+                if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
+                    smoothed = prev_v
+                final_v = max(0, smoothed)
+                if idx < len(self.prev_vals):
+                    self.prev_vals[idx] = final_v
+                else:
+                    self.prev_vals.append(final_v)
+                if idx < len(self.stable_counts):
+                    self.stable_counts[idx] = stable + 1 if final_v == prev_v else 0
+                else:
+                    self.stable_counts.append(0)
+                ocr_vals.append(final_v)
+                ocr_types.append('obs' if obs_used else 'pred')
+            except Exception:
+                ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
+                ocr_types.append('pred')
+        with self.lock:
+            self.latest_snapshot = {'values': ocr_vals, 'ages': [], 'types': ocr_types, 'frame_id': frame_id, 'ts': int(now * 1000)}
+
+    def run(self):
+        while self.running:
+            try:
+                frame_id, frame = self.q.get(timeout=0.1)
+                self.process_frame(frame_id, frame)
+            except queue.Empty:
+                continue
+            except Exception:
+                pass
+
+    def stop(self):
+        self.running = False
+
 class NvidiaSmiThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
@@ -1152,187 +1374,47 @@ class DataWorker(QThread):
         self.paused = False
         self.save_worker = SaveWorker()
         self.save_worker.start()
-        self.regions = []
-        self.prev_rois = []
-        self.prev_vals = []
-        self.prev_change = []
-        self.histories = []
-        self.last_read_tick = []
-        self.stable_counts = []
-        self.last_update_time = []
-        self.kalman_states = []
-        self.kalman_time = []
-        self.tick = 0
-        self.force_cpu = FORCE_CPU_OCR
-        self.ocr_gpu_enabled = False
-        self.ocr_gpu = None
-        self.ocr_cpu = None
-        self.ocr = None
-        self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self.force_cpu = True
         self.ocr_lock = threading.Lock()
-        self.ocr_tasks = []
+        self.ocr = None
+        self.ocr_worker = OcrWorker(self.status_signal.emit, self.perf_signal.emit)
         self.prev_small = None
         self.prev_pos = None
         self.prev_vel = (0.0, 0.0)
         self.prev_time = None
-        self.vram_low_since = None
-        self.vram_high_since = None
-        self.last_vram_check = 0.0
-        self.gpu_forced_off = True
         self.reload_regions()
 
-    def apply_kalman(self, idx, measurement, now, measurement_valid):
-        if idx >= len(self.kalman_states):
-            self.kalman_states.append({'x': 0.0, 'v': 0.0, 'p': 25.0})
-            self.kalman_time.append(now)
-        state = self.kalman_states[idx]
-        last_t = self.kalman_time[idx] if idx < len(self.kalman_time) else now
-        dt = max(now - last_t, 1e-3)
-        pred_x = state['x'] + state['v'] * dt
-        pred_p = state['p'] + 5.0 * dt
-        observation_used = False
-        if measurement_valid and measurement is not None:
-            meas_val, meas_conf = measurement if isinstance(measurement, (list, tuple)) and len(measurement) >= 2 else (measurement, 1.0)
-            prev_v = self.prev_vals[idx] if idx < len(self.prev_vals) else None
-            if prev_v is not None and abs(float(meas_val) - float(prev_v)) > OCR_JUMP_THRESHOLD and meas_conf < 0.9:
-                meas_val = None
-            else:
-                meas_val = float(meas_val)
-            measurement = meas_val
-            allowed = max(1.5, 80.0 * dt)
-            fresh = idx >= len(self.prev_vals) or self.prev_vals[idx] is None
-            if measurement is not None and (fresh or abs(measurement - pred_x) <= allowed):
-                k = pred_p / (pred_p + 16.0)
-                state['x'] = pred_x + k * (measurement - pred_x)
-                state['v'] = (state['x'] - pred_x) / dt
-                state['p'] = (1.0 - k) * pred_p
-                self.last_update_time[idx] = now
-                observation_used = True
-            else:
-                state['x'] = pred_x
-                state['p'] = pred_p
-        else:
-            state['x'] = pred_x
-            state['p'] = pred_p
-        self.kalman_time[idx] = now
-        return max(0, int(round(state['x']))), observation_used
-
     def init_ocr_instances(self):
-        total_vram = get_total_vram_bytes()
-        if total_vram > 0 and total_vram <= 4 * 1024 * 1024 * 1024:
-            self.force_cpu = True
-            self.gpu_forced_off = True
-            self.status_signal.emit("显存<=4GB，默认使用CPU OCR")
-        self.init_gpu_ocr()
-        self.init_cpu_ocr()
-        self.select_active_ocr()
+        self.force_cpu = True
+        self.emit_status_snapshot()
 
     def init_gpu_ocr(self):
-        if self.ocr_gpu is not None or self.force_cpu or self.gpu_forced_off or not torch.cuda.is_available():
-            return
-        try:
-            with StdSilencer():
-                self.ocr_gpu = PaddleOCR(use_angle_cls=False, use_gpu=True, gpu_mem=500)
-            self.ocr_gpu_enabled = True
-        except Exception as e:
-            self.status_signal.emit(f"GPU OCR 初始化失败: {e}")
-            self.ocr_gpu = None
-            self.ocr_gpu_enabled = False
+        return
 
     def init_cpu_ocr(self):
-        if self.ocr_cpu is not None:
-            return
-        try:
-            with StdSilencer():
-                self.ocr_cpu = PaddleOCR(use_angle_cls=False, use_gpu=False)
-        except Exception as e:
-            self.status_signal.emit(f"CPU OCR 初始化失败: {e}")
-            self.ocr_cpu = None
+        return
 
     def drop_gpu_ocr(self):
-        try:
-            if self.ocr_gpu is not None:
-                del self.ocr_gpu
-        except Exception:
-            pass
-        self.ocr_gpu = None
-        self.ocr_gpu_enabled = False
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+        return
 
     def release_ocr_resources(self):
-        try:
-            for i, t in enumerate(self.ocr_tasks):
-                if t is not None and t.done():
-                    continue
-                self.ocr_tasks[i] = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        return
 
     def select_active_ocr(self):
-        with self.ocr_lock:
-            if not self.force_cpu and self.ocr_gpu is not None and self.ocr_gpu_enabled:
-                self.ocr = self.ocr_gpu
-            elif self.ocr_cpu is not None:
-                self.ocr = self.ocr_cpu
-            else:
-                self.ocr = None
+        return
 
     def restore_ocr(self):
-        self.select_active_ocr()
-        if self.ocr is None:
-            self.status_signal.emit("未找到可用的OCR实例")
+        self.emit_status_snapshot()
 
     def set_force_cpu(self, force_cpu, drop_gpu=False):
-        if self.force_cpu == force_cpu and not drop_gpu:
-            return
-        self.force_cpu = force_cpu
-        if drop_gpu:
-            self.drop_gpu_ocr()
-        self.release_ocr_resources()
-        if not self.force_cpu:
-            self.init_gpu_ocr()
-        self.restore_ocr()
-        mode_txt = "CPU" if self.force_cpu or self.ocr_gpu is None else "GPU"
-        self.status_signal.emit(f"OCR 已切换至 {mode_txt} 模式")
+        self.force_cpu = True
+        self.status_signal.emit("OCR 已锁定 CPU 模式")
 
     def manage_ocr_mode(self):
-        if not torch.cuda.is_available() or self.gpu_forced_off:
-            return
-        now = time.time()
-        if now - self.last_vram_check < 0.5:
-            return
-        self.last_vram_check = now
-        free = get_free_vram_bytes()
-        if not self.force_cpu and free < GPU_VRAM_LOW:
-            if self.vram_low_since is None:
-                self.vram_low_since = now
-            if now - self.vram_low_since >= GPU_HYSTERESIS_SEC:
-                self.ocr_gpu_enabled = False
-                self.set_force_cpu(True, drop_gpu=True)
-                self.vram_high_since = None
-        else:
-            self.vram_low_since = None
-        if self.force_cpu and free >= GPU_VRAM_HIGH and not self.gpu_forced_off:
-            if self.vram_high_since is None:
-                self.vram_high_since = now
-            if now - self.vram_high_since >= GPU_HYSTERESIS_SEC:
-                self.ocr_gpu_enabled = True
-                self.set_force_cpu(False)
-                self.vram_low_since = None
-        elif self.force_cpu:
-            self.vram_high_since = None
+        return
 
     def emit_status_snapshot(self):
-        mode_txt = "未初始化"
-        if self.ocr is not None:
-            mode_txt = "GPU" if self.ocr is self.ocr_gpu else "CPU"
-        self.status_signal.emit(f"OCR 已切换至 {mode_txt} 模式")
+        self.status_signal.emit("OCR 已切换至 CPU 模式")
 
     def set_paused(self, paused):
         self.paused = paused
@@ -1344,70 +1426,21 @@ class DataWorker(QThread):
             return 0
 
     def reload_regions(self):
-        try:
-            with open(REGION_FILE, 'r', encoding='utf-8') as f:
-                self.regions = json.load(f)
-        except:
-            self.regions = []
-        self.prev_rois = [None] * len(self.regions)
-        self.prev_vals = [None] * len(self.regions)
-        self.prev_change = [0.0] * len(self.regions)
-        self.histories = [deque(maxlen=5) for _ in self.regions]
-        self.last_read_tick = [0] * len(self.regions)
-        self.stable_counts = [0] * len(self.regions)
-        now_ts = time.time()
-        self.last_update_time = [now_ts] * len(self.regions)
-        self.kalman_states = [{'x': 0.0, 'v': 0.0, 'p': 25.0} for _ in self.regions]
-        self.kalman_time = [now_ts] * len(self.regions)
-        self.ocr_tasks = [None] * len(self.regions)
-
-    def read_ocr(self, roi, frame_id, region_idx):
-        st = time.time()
-        try:
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            min_side = min(gray.shape[:2])
-            scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
-            resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            blurred = cv2.medianBlur(resized, 3)
-            binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-            proc = cv2.copyMakeBorder(binary, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
-            proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
-            with self.ocr_lock:
-                if self.ocr is None:
-                    return None
-                result = self.ocr.ocr(proc, det=False, cls=False)
-            digits = ''
-            best_conf = 0.0
-            if result and len(result) > 0:
-                texts = []
-                for item in result[0]:
-                    if len(item) <= 1 or len(item[1]) < 2:
-                        continue
-                    text, conf = item[1][0], float(item[1][1])
-                    if conf >= OCR_CONF_THRESHOLD:
-                        texts.append(text)
-                        best_conf = max(best_conf, conf)
-                digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
-            if digits and best_conf >= OCR_CONF_THRESHOLD:
-                return frame_id, region_idx, (int(digits), best_conf)
-            return frame_id, region_idx, None
-        except:
-            return frame_id, region_idx, None
-        finally:
-            self.perf_signal.emit({'ocr_time_ms': (time.time() - st) * 1000.0})
+        if hasattr(self, 'ocr_worker') and self.ocr_worker is not None:
+            self.ocr_worker.reload_regions()
+            self.regions = list(self.ocr_worker.regions)
 
     def run(self):
-        self.init_ocr_instances()
+        if self.ocr_worker is not None and not self.ocr_worker.is_alive():
+            self.ocr_worker.start()
         self.emit_status_snapshot()
         while self.running:
             if self.paused:
-                time.sleep(0.05)
+                time.sleep(0.01)
                 continue
-            self.manage_ocr_mode()
             try:
                 data = self.queue.get(timeout=0.1)
                 full_img, small_img, frame_id, mx, my, click, source, save, prediction_error = data
-                self.tick += 1
                 now = time.time()
                 if self.prev_time is None:
                     self.prev_time = now
@@ -1431,88 +1464,17 @@ class DataWorker(QThread):
                 self.prev_pos = (mx, my)
                 self.prev_vel = (vel_x, vel_y)
                 self.prev_time = now
-
-                ocr_vals = []
-                ocr_ages = []
-                ocr_types = []
-                if self.regions:
-                    for idx, r in enumerate(self.regions):
-                        try:
-                            scale_factor = SCALE_PERCENT / 100.0
-                            px = int(round(r['x'] * scale_factor))
-                            py = int(round(r['y'] * scale_factor))
-                            pw = int(round(r['w'] * scale_factor))
-                            ph = int(round(r['h'] * scale_factor))
-                            if pw <= 0 or ph <= 0:
-                                raise ValueError
-                            x1 = max(0, px)
-                            y1 = max(0, py)
-                            x2 = min(full_img.shape[1], px + pw)
-                            y2 = min(full_img.shape[0], py + ph)
-                            if x2 <= x1 or y2 <= y1:
-                                raise ValueError
-                            roi = full_img[y1:y2, x1:x2]
-                            if idx >= len(self.prev_rois):
-                                self.prev_rois.append(None)
-                                self.prev_vals.append(None)
-                                self.prev_change.append(0.0)
-                                self.histories.append(deque(maxlen=5))
-                                self.last_read_tick.append(0)
-                                self.stable_counts.append(0)
-                                ts_now = time.time()
-                                self.last_update_time.append(ts_now)
-                                self.kalman_states.append({'x': 0.0, 'v': 0.0, 'p': 25.0})
-                                self.kalman_time.append(ts_now)
-                            raw = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
-                            diff = 0.3 * self.prev_change[idx] + 0.7 * raw
-                            self.prev_change[idx] = diff
-                            self.prev_rois[idx] = roi
-                            prev_v = self.prev_vals[idx]
-                            need_read = diff >= 0.002 or prev_v is None or self.tick - self.last_read_tick[idx] >= 3
-                            measurement = None
-                            candidate_new = False
-                            if idx < len(self.ocr_tasks) and self.ocr_tasks[idx] is not None and self.ocr_tasks[idx].done():
-                                try:
-                                    res = self.ocr_tasks[idx].result()
-                                except Exception:
-                                    res = None
-                                if res is not None:
-                                    task_frame, task_idx, meas = res
-                                    if task_frame == frame_id and task_idx == idx:
-                                        measurement = meas
-                                        candidate_new = True
-                                        self.last_read_tick[idx] = self.tick
-                                self.ocr_tasks[idx] = None
-                            if need_read and (idx >= len(self.ocr_tasks) or self.ocr_tasks[idx] is None):
-                                if idx >= len(self.ocr_tasks):
-                                    self.ocr_tasks.append(None)
-                                self.ocr_tasks[idx] = self.ocr_pool.submit(self.read_ocr, roi.copy(), frame_id, idx)
-                                self.last_read_tick[idx] = self.tick
-                            filtered, observed = self.apply_kalman(idx, measurement, now, candidate_new)
-                            self.histories[idx].append(filtered)
-                            smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else filtered
-                            stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
-                            if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
-                                smoothed = prev_v
-                            final_v = max(0, smoothed)
-                            self.prev_vals[idx] = final_v
-                            if final_v == prev_v:
-                                self.stable_counts[idx] = stable + 1
-                            else:
-                                self.stable_counts[idx] = 0
-                            ocr_vals.append(final_v)
-                            age_ms = int((time.time() - self.last_update_time[idx]) * 1000) if idx < len(self.last_update_time) else 0
-                            ocr_ages.append(max(0, age_ms))
-                            ocr_types.append('obs' if observed else 'pred')
-                        except:
-                            ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
-                            age_ms = int((time.time() - self.last_update_time[idx]) * 1000) if idx < len(self.last_update_time) else 0
-                            ocr_ages.append(max(0, age_ms))
-                            ocr_types.append('pred')
-                    self.ocr_result.emit({'values': ocr_vals, 'ages': ocr_ages, 'types': ocr_types, 'frame_id': frame_id, 'ts': int(time.time() * 1000)})
+                if self.ocr_worker is not None:
+                    self.ocr_worker.submit_frame(frame_id, full_img)
+                    snapshot = self.ocr_worker.get_latest()
                 else:
-                    self.ocr_result.emit({'values': [], 'ages': [], 'types': [], 'frame_id': frame_id, 'ts': int(time.time() * 1000)})
-
+                    snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': None}
+                ocr_vals = snapshot.get('values', [])
+                ocr_ages = snapshot.get('ages', [])
+                ocr_types = snapshot.get('types', [])
+                snap_frame = snapshot.get('frame_id') if isinstance(snapshot, dict) else None
+                emit_frame_id = snap_frame if snap_frame is not None else frame_id
+                self.ocr_result.emit({'values': ocr_vals, 'ages': ocr_ages, 'types': ocr_types, 'frame_id': emit_frame_id, 'ts': int(time.time() * 1000)})
                 if save:
                     ts = int(time.time() * 1000)
                     meta = {
@@ -1531,18 +1493,20 @@ class DataWorker(QThread):
                         'prediction_error': float(prediction_error)
                     }
                     self.save_worker.enqueue(full_img, meta)
-
                 self.queue.task_done()
             except queue.Empty:
                 pass
-            except Exception as e:
+            except Exception:
                 pass
 
     def stop(self):
         self.running = False
         self.save_worker.stop()
         self.save_worker.join()
-        self.ocr_pool.shutdown(wait=False)
+        if hasattr(self, 'ocr_worker') and self.ocr_worker is not None:
+            self.ocr_worker.stop()
+            if self.ocr_worker.is_alive():
+                self.ocr_worker.join()
         self.wait()
 
 class InferenceThread(QThread):
@@ -1730,7 +1694,7 @@ class MainWin(QMainWindow):
         except Exception as e:
             self.update_status_text(f"截屏初始化失败: {e}")
 
-        self.queue = queue.Queue(maxsize=1)
+        self.queue = queue.Queue(maxsize=8)
         self.worker = DataWorker(self.queue)
         self.worker.start()
 
@@ -1971,13 +1935,7 @@ class MainWin(QMainWindow):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         batch_size = 16
-        free_vram = get_free_vram_bytes()
-        if torch.cuda.is_available() and free_vram < 1024**3:
-            batch_size = 8
-            self.ocr_forced_cpu = True
-            self.worker.set_force_cpu(True, drop_gpu=True)
-        else:
-            self.ocr_forced_cpu = False
+        self.ocr_forced_cpu = True
         self.mode = "OPTIMIZING"
         self.update_mode()
         self.bar.show()
@@ -1990,9 +1948,7 @@ class MainWin(QMainWindow):
         self.opt_thread.start()
 
     def opt_done(self):
-        if self.ocr_forced_cpu and get_free_vram_bytes() >= 1024**3:
-            self.worker.set_force_cpu(False)
-            self.ocr_forced_cpu = False
+        self.ocr_forced_cpu = False
         self.worker.restore_ocr()
         self.load_model()
         self.bar.hide()
@@ -2110,31 +2066,7 @@ class MainWin(QMainWindow):
                     vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
                 except Exception:
                     pass
-            elif pynvml is not None and platform.system() == 'Windows':
-                if self.nvidia_thread is None:
-                    self.nvidia_thread = NvidiaSmiThread()
-                    self.nvidia_thread.start()
-                stats = self.nvidia_thread.result
-                gpu_u, vram_u, vram_t, gpu_temp, gpu_power, gpu_fan = stats if len(stats) == 6 else (0, 0, 1, 0, 0, 0)
-                gpu_display = f"{gpu_u}%"
-                vram_total = max(vram_t, 1)
-                vram_display = f"{vram_u/1024:.1f}/{vram_total/1024:.1f}GB"
 
-        if torch.cuda.is_available():
-            vram_limit_mb = 3500
-            vram_recover_mb = 2800
-            if vram_u >= vram_limit_mb and not self.worker.force_cpu:
-                self.worker.set_force_cpu(True, drop_gpu=True)
-                self.vram_auto_cpu = True
-                self.ocr_forced_cpu = True
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-            elif self.vram_auto_cpu and vram_u < vram_recover_mb:
-                self.worker.set_force_cpu(False)
-                self.vram_auto_cpu = False
-                self.ocr_forced_cpu = False
         scale = SCALE_PERCENT
         if platform.system() == 'Windows':
             try:
