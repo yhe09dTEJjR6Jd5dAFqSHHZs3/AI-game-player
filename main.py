@@ -56,6 +56,7 @@ INPUT_W, INPUT_H = 320, 180
 SEQ_LEN = 4
 MAX_OCR = 16
 OCR_CONF_THRESHOLD = 0.6
+OCR_JUMP_THRESHOLD = 200.0
 OCR_AGE_MAX_MS = 5000.0
 POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
@@ -225,7 +226,6 @@ class PoolCacheManager:
                         continue
                     try:
                         ts = int(meta.get('ts', 0))
-                        img_path = meta.get('img', '')
                         img_b64 = meta.get('img_b64', '')
                         img_bytes = base64.b64decode(img_b64.encode('ascii')) if isinstance(img_b64, str) and img_b64 else None
                         mx, my, click = float(meta.get('mx', 0.0)), float(meta.get('my', 0.0)), float(meta.get('click', 0.0))
@@ -245,17 +245,8 @@ class PoolCacheManager:
                         self.prev_vals = cur_vals
                     feat = pack_ocr(ocr_vals, deltas, ocr_age)
                     weight = ExperiencePool.calc_weight_static(region_types, ocr_vals, deltas, click, novelty, complexity, pred_err)
-                    size = 512
-                    if img_bytes is not None:
-                        size += len(img_bytes)
-                    elif os.path.exists(img_path):
-                        size += os.path.getsize(img_path)
-                        try:
-                            with open(img_path, 'rb') as fb:
-                                img_bytes = fb.read()
-                        except Exception:
-                            img_bytes = None
-                    entry = {'ts': ts, 'img': img_path, 'img_bytes': img_bytes, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
+                    size = 512 + (len(img_bytes) if img_bytes is not None else 0)
+                    entry = {'ts': ts, 'img': '', 'img_bytes': img_bytes, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
                     batch.append(entry)
                     self.last_key = decode_key(cur.key())
                     if len(batch) >= chunk_size:
@@ -839,7 +830,7 @@ class SaveWorker(threading.Thread):
         self.env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 2, subdir=True, max_dbs=1, lock=True)
         self.next_id = read_index_value(self.env)
 
-    def enqueue(self, path, img, meta):
+    def enqueue(self, img, meta):
         if self.q.full():
             try:
                 self.q.get_nowait()
@@ -847,7 +838,7 @@ class SaveWorker(threading.Thread):
             except queue.Empty:
                 return
         try:
-            self.q.put_nowait((path, img, meta))
+            self.q.put_nowait((img, meta))
         except queue.Full:
             pass
 
@@ -856,12 +847,13 @@ class SaveWorker(threading.Thread):
             return
         try:
             with self.env.begin(write=True) as txn:
-                for path, img, meta in self.buffer:
+                for img, meta in self.buffer:
                     try:
                         ok, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                         if not ok:
                             continue
                         meta['img_b64'] = base64.b64encode(enc.tobytes()).decode('ascii')
+                        meta['img'] = ''
                     except Exception:
                         continue
                     meta['id'] = self.next_id
@@ -878,9 +870,9 @@ class SaveWorker(threading.Thread):
     def run(self):
         while self.running or not self.q.empty():
             try:
-                path, img, meta = self.q.get(timeout=0.1)
+                img, meta = self.q.get(timeout=0.1)
                 payload = json.dumps(meta, ensure_ascii=False)
-                self.buffer.append((path, img, meta))
+                self.buffer.append((img, meta))
                 self.buffer_bytes += len(payload.encode('utf-8')) + img.nbytes
                 now = time.time()
                 if self.buffer_bytes >= self.flush_threshold or now - self.last_flush >= 1.0:
@@ -980,9 +972,16 @@ class DataWorker(QThread):
         pred_x = state['x'] + state['v'] * dt
         pred_p = state['p'] + 5.0 * dt
         if measurement_valid and measurement is not None:
+            meas_val, meas_conf = measurement if isinstance(measurement, (list, tuple)) and len(measurement) >= 2 else (measurement, 1.0)
+            prev_v = self.prev_vals[idx] if idx < len(self.prev_vals) else None
+            if prev_v is not None and abs(float(meas_val) - float(prev_v)) > OCR_JUMP_THRESHOLD and meas_conf < 0.9:
+                meas_val = None
+            else:
+                meas_val = float(meas_val)
+            measurement = meas_val
             allowed = max(1.5, 80.0 * dt)
             fresh = idx >= len(self.prev_vals) or self.prev_vals[idx] is None
-            if fresh or abs(measurement - pred_x) <= allowed:
+            if measurement is not None and (fresh or abs(measurement - pred_x) <= allowed):
                 k = pred_p / (pred_p + 16.0)
                 state['x'] = pred_x + k * (measurement - pred_x)
                 state['v'] = (state['x'] - pred_x) / dt
@@ -1243,7 +1242,7 @@ class DataWorker(QThread):
                                 except Exception:
                                     res = None
                                 if res is not None:
-                                    measurement = res[0]
+                                    measurement = res
                                     candidate_new = True
                                     self.last_read_tick[idx] = self.tick
                                 self.ocr_tasks[idx] = None
@@ -1277,11 +1276,9 @@ class DataWorker(QThread):
 
                 if save:
                     ts = int(time.time() * 1000)
-                    name = f"{ts}.jpg"
-                    path = os.path.join(IMG_DIR, name)
                     meta = {
                         'ts': ts,
-                        'img': path,
+                        'img': '',
                         'mx': mx,
                         'my': my,
                         'click': click,
@@ -1292,7 +1289,7 @@ class DataWorker(QThread):
                         'complexity': float(complexity),
                         'prediction_error': float(prediction_error)
                     }
-                    self.save_worker.enqueue(path, full_img, meta)
+                    self.save_worker.enqueue(full_img, meta)
 
                 self.queue.task_done()
             except queue.Empty:
@@ -1879,7 +1876,11 @@ class MainWin(QMainWindow):
         qd = 0.0
         if hasattr(now_io, 'busy_time'):
             busy_ms = max(now_io.busy_time - getattr(self.prev_disk_io, 'busy_time', 0), 0)
-            qd = busy_ms / (dt * 1000.0)
+            if platform.system() != 'Windows' or busy_ms > 0:
+                qd = busy_ms / (dt * 1000.0)
+            else:
+                iops = ops / dt if dt > 0 else 0.0
+                qd = iops * (lat_ms / 1000.0)
         else:
             iops = ops / dt if dt > 0 else 0.0
             qd = iops * (lat_ms / 1000.0)
@@ -1960,7 +1961,8 @@ class MainWin(QMainWindow):
                 except Exception as e:
                     self.update_status_text(f"截屏失败: {e}")
                     return
-            img = np.array(self.sct.grab(self.monitor))
+            shot = self.sct.grab(self.monitor)
+            img = np.frombuffer(shot.raw, dtype=np.uint8).reshape((shot.height, shot.width, 4))
             cap_end = time.time()
             self.capture_latency_ms = (cap_end - cap_start) * 1000.0
             if self.prev_capture_ts is not None:
