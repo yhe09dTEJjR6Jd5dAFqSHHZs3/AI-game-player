@@ -32,8 +32,7 @@ import importlib
 import importlib.util
 import logging
 import warnings
-import pytesseract
-from pytesseract import Output
+from rapidocr_onnxruntime import RapidOCR
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*pynvml.*deprecated.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=r".*torch\.cuda\.amp\.GradScaler.*deprecated.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=r"Warning: you have set wrong precision for backend:cuda")
@@ -1201,10 +1200,9 @@ class OcrWorker(threading.Thread):
 
     def init_ocr(self):
         try:
-            pytesseract.get_tesseract_version()
-            self.ocr = pytesseract
+            self.ocr = RapidOCR()
             if self.status_cb:
-                self.status_cb("OCR 已切换至 CPU 轻量模式")
+                self.status_cb("OCR 已切换至 RapidOCR 模式")
         except Exception as e:
             self.ocr = None
             if self.status_cb:
@@ -1234,7 +1232,8 @@ class OcrWorker(threading.Thread):
                 parsed = None
         for c in confs:
             try:
-                best_conf = max(best_conf, float(c) / 100.0)
+                v = float(c)
+                best_conf = max(best_conf, v if v <= 1.0 else v / 100.0)
             except Exception:
                 continue
         return parsed, best_conf
@@ -1264,17 +1263,17 @@ class OcrWorker(threading.Thread):
             if scale > 1.0:
                 proc = cv2.resize(proc, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-            data = self.ocr.image_to_data(proc, output_type=Output.DICT, config="--psm 7 -c tessedit_char_whitelist=0123456789.,+-")
+            result, _ = self.ocr(proc)
             texts = []
             confs = []
-            for t, c in zip(data.get('text', []), data.get('conf', [])):
-                if t is None:
+            for item in result or []:
+                if len(item) < 3:
                     continue
-                t = str(t).strip()
+                t = str(item[1]).strip()
                 if not t:
                     continue
                 texts.append(t)
-                confs.append(c)
+                confs.append(item[2])
             val, conf = self.parse_ocr_result(texts, confs)
             if val is not None:
                 return val, conf
