@@ -426,12 +426,21 @@ def read_index_value(env):
 SCREEN_W, SCREEN_H, SCREEN_LEFT, SCREEN_TOP = get_screen_size()
 LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H = compute_letterbox_params(SCREEN_W, SCREEN_H, INPUT_W, INPUT_H)
 SCALE_PERCENT = 100
-if platform.system() == 'Windows':
-    try:
-        import ctypes
-        SCALE_PERCENT = ctypes.windll.shcore.GetScaleFactorForDevice(0)
-    except Exception:
-        SCALE_PERCENT = 100
+
+def get_scale_ratio():
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        return 1.0, 1.0
+    geo = screen.geometry()
+    logical_w = max(1, geo.width())
+    logical_h = max(1, geo.height())
+    return SCREEN_W / float(logical_w), SCREEN_H / float(logical_h)
+
+def get_scale_percent():
+    sx, sy = get_scale_ratio()
+    return int(round(max(sx, sy) * 100))
+
+SCALE_PERCENT = get_scale_percent()
 
 def update_input_resolution(new_w, new_h):
     global INPUT_W, INPUT_H, LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H
@@ -442,8 +451,11 @@ def clamp01(v):
     return max(0.0, min(1.0, v))
 
 def screen_to_letter_norm(x, y):
-    lx = (x - SCREEN_LEFT) * LB_SCALE + LB_LEFT
-    ly = (y - SCREEN_TOP) * LB_SCALE + LB_TOP
+    scale_x, scale_y = get_scale_ratio()
+    px = SCREEN_LEFT + (x - SCREEN_LEFT) * scale_x
+    py = SCREEN_TOP + (y - SCREEN_TOP) * scale_y
+    lx = (px - SCREEN_LEFT) * LB_SCALE + LB_LEFT
+    ly = (py - SCREEN_TOP) * LB_SCALE + LB_TOP
     return clamp01(lx / INPUT_W), clamp01(ly / INPUT_H)
 
 def letter_norm_to_screen(nx, ny):
@@ -451,9 +463,9 @@ def letter_norm_to_screen(nx, ny):
     ly = clamp01(ny) * INPUT_H
     sx = (lx - LB_LEFT) / LB_SCALE + SCREEN_LEFT
     sy = (ly - LB_TOP) / LB_SCALE + SCREEN_TOP
-    if SCALE_PERCENT != 100:
-        sx = SCREEN_LEFT + (sx - SCREEN_LEFT) * 100.0 / SCALE_PERCENT
-        sy = SCREEN_TOP + (sy - SCREEN_TOP) * 100.0 / SCALE_PERCENT
+    scale_x, scale_y = get_scale_ratio()
+    sx = SCREEN_LEFT + (sx - SCREEN_LEFT) / max(scale_x, 1e-6)
+    sy = SCREEN_TOP + (sy - SCREEN_TOP) / max(scale_y, 1e-6)
     sx = max(SCREEN_LEFT, min(SCREEN_LEFT + SCREEN_W - 1, sx))
     sy = max(SCREEN_TOP, min(SCREEN_TOP + SCREEN_H - 1, sy))
     return sx, sy
@@ -1198,21 +1210,11 @@ class OcrWorker(threading.Thread):
         self.status_cb = status_cb
         self.perf_cb = perf_cb
         self.running = True
-        self.q = queue.Queue(maxsize=4)
+        self.q = queue.Queue(maxsize=1)
         self.lock = threading.Lock()
         self.regions = []
-        self.prev_rois = []
-        self.prev_vals = []
-        self.prev_change = []
-        self.histories = []
-        self.last_read_tick = []
-        self.stable_counts = []
         self.last_update_time = []
-        self.kalman_states = []
-        self.kalman_time = []
         self.start_ts = time.time()
-        self.history = deque(maxlen=32)
-        self.tick = 0
         self.ocr = None
         self.latest_snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': None, 'ts': int(time.time() * 1000)}
         self.last_latency_ms = 0.0
@@ -1236,51 +1238,11 @@ class OcrWorker(threading.Thread):
                 self.regions = json.load(f)
         except Exception:
             self.regions = []
-        self.prev_rois = [None] * len(self.regions)
-        self.prev_vals = [None] * len(self.regions)
-        self.prev_change = [0.0] * len(self.regions)
-        self.histories = [deque(maxlen=5) for _ in self.regions]
-        self.last_read_tick = [0] * len(self.regions)
-        self.stable_counts = [0] * len(self.regions)
         now_ts = time.time()
         self.start_ts = now_ts
         self.last_update_time = [now_ts] * len(self.regions)
-        self.kalman_states = [{'x': 0.0, 'v': 0.0, 'p': 25.0} for _ in self.regions]
-        self.kalman_time = [now_ts] * len(self.regions)
-        self.history.clear()
         with self.lock:
-            self.latest_snapshot = {'values': [0]*len(self.regions), 'ages': [0]*len(self.regions), 'types': ['pred']*len(self.regions), 'frame_id': None, 'ts': int(now_ts * 1000)}
-
-    def apply_kalman(self, idx, measurement, now):
-        prev_v = self.prev_vals[idx] if idx < len(self.prev_vals) else None
-        dt = max(now - self.kalman_time[idx], 1e-3)
-        state = self.kalman_states[idx]
-        pred_x = state['x'] + state['v'] * dt
-        pred_p = state['p'] + (dt * 8.0) ** 2
-        observation_used = False
-        if measurement is not None:
-            meas_val, _ = measurement
-            meas_val = float(meas_val)
-            if meas_val is not None:
-                k = pred_p / (pred_p + 16.0)
-                state['x'] = pred_x + k * (meas_val - pred_x)
-                state['v'] = (state['x'] - pred_x) / dt
-                state['p'] = (1.0 - k) * pred_p
-                self.last_update_time[idx] = now
-                observation_used = True
-            else:
-                state['x'] = pred_x
-                state['p'] = pred_p
-        else:
-            inertia = math.exp(-dt * 0.35)
-            state['v'] = state['v'] * inertia
-            if prev_v is not None:
-                state['x'] = pred_x * inertia + prev_v * (1.0 - inertia)
-            else:
-                state['x'] = pred_x
-            state['p'] = pred_p * 1.1
-        self.kalman_time[idx] = now
-        return max(0.0, float(state['x'])), observation_used
+            self.latest_snapshot = {'values': [0]*len(self.regions), 'ages': [0]*len(self.regions), 'types': ['obs']*len(self.regions), 'frame_id': None, 'ts': int(now_ts * 1000)}
 
     def parse_ocr_result(self, result):
         parsed = None
@@ -1294,13 +1256,12 @@ class OcrWorker(threading.Thread):
                 if len(text_info) < 2:
                     continue
                 text, conf = text_info[0], float(text_info[1])
-                if conf >= OCR_CONF_THRESHOLD:
-                    texts.append(text)
-                    best_conf = max(best_conf, conf)
+                texts.append(text)
+                best_conf = max(best_conf, conf)
             merged = ''.join(texts)
-            m = re.search(r"\d+(?:\.\d+)?", merged)
+            m = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", merged)
             if m:
-                parsed = m.group(0)
+                parsed = m.group(0).replace(',', '')
         return parsed, best_conf
 
     def read_ocr(self, roi):
@@ -1323,19 +1284,16 @@ class OcrWorker(threading.Thread):
             scale = target_h / float(proc.shape[0])
             target_w = max(1, int(proc.shape[1] * scale))
             proc = cv2.resize(proc, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-            small_numeric = max(h, w) <= 120
-            modes = [(False, small_numeric)]
-            if not small_numeric:
-                modes.append((True, False))
-            for det_mode, force_small in modes:
-                parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=det_mode, rec=True))
-                if parsed and best_conf >= OCR_CONF_THRESHOLD:
-                    try:
-                        return float(parsed), best_conf
-                    except Exception:
-                        pass
-                if force_small:
-                    break
+            parsed, best_conf = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=False, rec=True))
+            if best_conf < OCR_CONF_THRESHOLD:
+                parsed2, conf2 = self.parse_ocr_result(self.ocr.ocr(proc, cls=False, det=True, rec=True))
+                if conf2 >= best_conf:
+                    parsed, best_conf = parsed2, conf2
+            if parsed:
+                try:
+                    return float(parsed), best_conf
+                except Exception:
+                    pass
         except Exception:
             pass
         finally:
@@ -1350,11 +1308,11 @@ class OcrWorker(threading.Thread):
     def submit_frame(self, frame_id, frame):
         if not self.running:
             return
-        if self.q.full():
-            try:
+        try:
+            while True:
                 self.q.get_nowait()
-            except queue.Empty:
-                pass
+        except queue.Empty:
+            pass
         try:
             self.q.put_nowait((frame_id, frame))
         except queue.Full:
@@ -1372,49 +1330,16 @@ class OcrWorker(threading.Thread):
             snapshot['ages'] = ages if ages else snapshot.get('ages', [])
             return snapshot
 
-    def _compose_snapshot(self, values, types, frame_id, ts_ms, last_update):
-        ref_time = ts_ms / 1000.0
-        ages = [max(0, int((ref_time - t) * 1000)) for t in last_update] if last_update else []
-        return {'values': values, 'ages': ages, 'types': types, 'frame_id': frame_id, 'ts': ts_ms}
-
     def get_for_timestamp(self, target_ts):
-        with self.lock:
-            hist = list(self.history)
-            last_update = list(self.last_update_time)
-        if not hist:
-            snap = self.get_latest()
-            snap['ts'] = target_ts
-            snap['ages'] = [max(0, int((target_ts/1000.0 - t) * 1000)) for t in last_update] if last_update else snap.get('ages', [])
-            return snap
-        hist = sorted(hist, key=lambda x: x.get('ts', 0))
-        if target_ts <= hist[0].get('ts', 0):
-            base = hist[0]
-            return self._compose_snapshot(list(base.get('values', [])), list(base.get('types', [])), base.get('frame_id'), target_ts, last_update)
-        if target_ts >= hist[-1].get('ts', 0):
-            base = hist[-1]
-            return self._compose_snapshot(list(base.get('values', [])), list(base.get('types', [])), base.get('frame_id'), target_ts, last_update)
-        for i in range(1, len(hist)):
-            t0 = hist[i-1].get('ts', 0)
-            t1 = hist[i].get('ts', 0)
-            if t0 <= target_ts <= t1 and t1 > t0:
-                r = (target_ts - t0) / float(t1 - t0)
-                v0 = list(hist[i-1].get('values', []))
-                v1 = list(hist[i].get('values', []))
-                m = max(len(v0), len(v1))
-                blended = []
-                for j in range(m):
-                    a0 = v0[j] if j < len(v0) else 0.0
-                    a1 = v1[j] if j < len(v1) else 0.0
-                    blended.append((1 - r) * a0 + r * a1)
-                types = list(hist[i-1].get('types', [])) if r < 0.5 else list(hist[i].get('types', []))
-                return self._compose_snapshot(blended, types, hist[i].get('frame_id'), target_ts, last_update)
-        latest = hist[-1]
-        return self._compose_snapshot(list(latest.get('values', [])), list(latest.get('types', [])), latest.get('frame_id'), target_ts, last_update)
+        snap = self.get_latest()
+        snap['ts'] = target_ts
+        if self.last_update_time:
+            ref_time = target_ts / 1000.0
+            snap['ages'] = [max(0, int((ref_time - t) * 1000)) for t in self.last_update_time]
+        return snap
 
     def process_frame(self, frame_id, frame):
-        self.tick += 1
         now = time.time()
-        is_warmup = (now - self.start_ts) < 10.0
         ocr_vals = []
         ocr_types = []
         if not self.regions:
@@ -1422,15 +1347,18 @@ class OcrWorker(threading.Thread):
                 ts_ms = int(now * 1000)
                 snap = {'values': [], 'ages': [], 'types': [], 'frame_id': frame_id, 'ts': ts_ms}
                 self.latest_snapshot = snap
-                self.history.append(snap)
             return
-        
+
         frame_h, frame_w = frame.shape[:2]
-        scale_factor = max(SCALE_PERCENT, 1) / 100.0
-        logical_w = SCREEN_W / scale_factor
-        logical_h = SCREEN_H / scale_factor
-        scale_x = frame_w / max(logical_w, 1)
-        scale_y = frame_h / max(logical_h, 1)
+        logical_w = SCREEN_W
+        logical_h = SCREEN_H
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.geometry()
+            logical_w = max(1, geo.width())
+            logical_h = max(1, geo.height())
+        scale_x = frame_w / float(logical_w)
+        scale_y = frame_h / float(logical_h)
 
         for idx, r in enumerate(self.regions):
             try:
@@ -1445,48 +1373,22 @@ class OcrWorker(threading.Thread):
                 if x2 <= x1 or y2 <= y1:
                     raise ValueError("invalid roi bounds")
                 roi = frame[y1:y2, x1:x2]
-                if idx >= len(self.prev_rois):
-                    self.prev_rois.append(None)
-                raw = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
-                diff = 0.3 * (self.prev_change[idx] if idx < len(self.prev_change) else 0.0) + 0.7 * raw
-                if idx < len(self.prev_change):
-                    self.prev_change[idx] = diff
+                measurement = self.read_ocr(roi.copy())
+                if measurement is not None:
+                    val = float(measurement[0])
+                    self.last_update_time[idx] = now
                 else:
-                    self.prev_change.append(diff)
-                self.prev_rois[idx] = roi
-                prev_v = self.prev_vals[idx] if idx < len(self.prev_vals) else None
-                need_read = diff >= 0.002 or prev_v is None or self.tick - self.last_read_tick[idx] >= 3
-                measurement = None
-                observed = False
-                if need_read:
-                    measurement = self.read_ocr(roi.copy())
-                    self.last_read_tick[idx] = self.tick
-                    observed = measurement is not None
-                filtered, obs_used = self.apply_kalman(idx, measurement if observed else None, now)
-                if idx >= len(self.histories):
-                    self.histories.append(deque(maxlen=5))
-                self.histories[idx].append(filtered)
-                smoothed = float(np.median(self.histories[idx])) if self.histories[idx] else filtered
-                stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
-                final_v = max(0.0, smoothed)
-                if idx < len(self.prev_vals):
-                    self.prev_vals[idx] = final_v
-                else:
-                    self.prev_vals.append(final_v)
-                if idx < len(self.stable_counts):
-                    self.stable_counts[idx] = stable + 1 if prev_v is not None and abs(final_v - prev_v) < 1e-3 else 0
-                else:
-                    self.stable_counts.append(0)
-                ocr_vals.append(final_v)
-                ocr_types.append('obs' if obs_used else 'pred')
+                    val = 0.0
+                ocr_vals.append(max(0.0, val))
+                ocr_types.append('obs')
             except Exception:
-                ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
-                ocr_types.append('pred')
+                ocr_vals.append(0.0)
+                ocr_types.append('obs')
         with self.lock:
             ts_ms = int(now * 1000)
-            snap = {'values': ocr_vals, 'ages': [], 'types': ocr_types, 'frame_id': frame_id, 'ts': ts_ms}
+            ages = [max(0, int((now - t) * 1000)) for t in self.last_update_time] if self.last_update_time else []
+            snap = {'values': ocr_vals, 'ages': ages, 'types': ocr_types, 'frame_id': frame_id, 'ts': ts_ms}
             self.latest_snapshot = snap
-            self.history.append(snap)
 
     def run(self):
         while self.running:
@@ -2517,13 +2419,7 @@ class MainWin(QMainWindow):
                 gpu_display = f"{gpu_u:.0f}%"
                 vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
 
-        scale = SCALE_PERCENT
-        if platform.system() == 'Windows':
-            try:
-                import ctypes
-                scale = ctypes.windll.shcore.GetScaleFactorForDevice(0)
-            except Exception:
-                scale = SCALE_PERCENT
+        scale = get_scale_percent()
 
         self.lbl_cpu.setText(f"处理器: {cpu}%")
         self.lbl_mem.setText(f"内存: {mem:.1f}%")
