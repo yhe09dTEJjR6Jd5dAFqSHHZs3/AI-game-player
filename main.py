@@ -34,20 +34,23 @@ import importlib.util
 import logging
 import warnings
 
+# ------------------- 警告过滤器设置 -------------------
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 logging.getLogger("ppocr.utils.logging").setLevel(logging.ERROR)
 logging.getLogger("ppocr.utility").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", message=r"`torch.cuda.amp.GradScaler.*deprecated`")
-warnings.filterwarnings("ignore", message=r"The parameter use_angle_cls has been deprecated")
-warnings.filterwarnings("ignore", message=r"Warning: you have set wrong precision for backend:cuda")
-warnings.filterwarnings("ignore", message=r"FutureWarning: The pynvml package is deprecated")
-warnings.filterwarnings("ignore", message=r"UserWarning: Please use the new API settings to control TF32 behavior")
+
+# 过滤特定的弃用警告和FutureWarning
+warnings.filterwarnings("ignore", category=FutureWarning, message=r".*pynvml.*deprecated.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*torch\.cuda\.amp\.GradScaler.*deprecated.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=r"The parameter use_angle_cls has been deprecated")
+warnings.filterwarnings("ignore", category=UserWarning, message=r"Warning: you have set wrong precision for backend:cuda")
+warnings.filterwarnings("ignore", category=UserWarning, message=r"Please use the new API settings to control TF32 behavior")
+# -----------------------------------------------------
 
 try:
     import win32pdh
 except Exception:
     win32pdh = None
-
 
 try:
     if torch.cuda.is_available():
@@ -64,6 +67,7 @@ LOG_DB = os.path.join(DATA_DIR, "data.lmdb")
 LOG_INDEX_FILE = os.path.join(DATA_DIR, "index.meta")
 REGION_FILE = os.path.join(BASE_DIR, "regions.json")
 PRIORITY_FILE = os.path.join(DATA_DIR, "priorities.npy")
+
 INPUT_W, INPUT_H = 320, 180
 SEQ_LEN = 4
 MAX_OCR = 16
@@ -74,20 +78,26 @@ POOL_MAX_BYTES = 10 * 1024 * 1024 * 1024
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 GPU_VRAM_LOW = 600 * 1024 * 1024
 GPU_VRAM_HIGH = 1200 * 1024 * 1024
-GPU_HYSTERESIS_SEC = 2.5
 FORCE_CPU_OCR = True
-pynvml = None
 
+pynvml = None
 
 def load_pynvml():
     global pynvml
     if pynvml is not None:
         return
-    for name in ("pynvml", "nvidia.nvml"):
+    # 优先尝试标准导入
+    try:
+        import pynvml as pv
+        pynvml = pv
+        return
+    except ImportError:
+        pass
+    # 尝试 nvidia-ml-py 的别名
+    for name in ("nvidia.nvml", "nvidia_ml_py"):
         try:
             if importlib.util.find_spec(name) is not None:
-                module_name = "pynvml" if name == "nvidia.nvml" else name
-                pynvml = importlib.import_module(module_name)
+                pynvml = importlib.import_module(name)
                 return
         except Exception:
             continue
@@ -122,6 +132,7 @@ class CtypesMouse:
         self.INPUT = INPUT
         self.INPUT_MOUSE = 0
         self.MOUSEEVENTF_MOVE = 0x0001
+        self.MOUSEEVENTF_ABSOLUTE = 0x8000
         self.MOUSEEVENTF_LEFTDOWN = 0x0002
         self.MOUSEEVENTF_LEFTUP = 0x0004
         self.POINT = wintypes.POINT
@@ -188,53 +199,6 @@ class InputController:
         except Exception:
             pass
 
-class WindowsDiskStats:
-    def __init__(self):
-        self.available = False
-        self.query = None
-        if platform.system() != 'Windows' or win32pdh is None:
-            return
-        try:
-            obj = resolve_perf_name('PhysicalDisk')
-            inst = resolve_perf_name('_Total')
-            c_qd = resolve_perf_name('Current Disk Queue Length')
-            c_lat = resolve_perf_name('Avg. Disk sec/Transfer')
-            c_bps = resolve_perf_name('Disk Bytes/sec')
-            path_qd = f"\\\\{obj}({inst})\\{c_qd}"
-            path_lat = f"\\\\{obj}({inst})\\{c_lat}"
-            path_bps = f"\\\\{obj}({inst})\\{c_bps}"
-            self.query = win32pdh.OpenQuery()
-            self.counter_qd = win32pdh.AddCounter(self.query, path_qd)
-            self.counter_lat = win32pdh.AddCounter(self.query, path_lat)
-            self.counter_bps = win32pdh.AddCounter(self.query, path_bps)
-            self.available = True
-            win32pdh.CollectQueryData(self.query)
-        except Exception:
-            self.available = False
-
-    def read_value(self, counter):
-        try:
-            return float(win32pdh.GetFormattedCounterValue(counter, win32pdh.PDH_FMT_DOUBLE)[1])
-        except Exception:
-            return None
-
-    def collect(self):
-        if not self.available:
-            return None
-        try:
-            win32pdh.CollectQueryData(self.query)
-            qd = self.read_value(self.counter_qd)
-            lat = self.read_value(self.counter_lat)
-            bps = self.read_value(self.counter_bps)
-            if qd is None or lat is None or bps is None:
-                return None
-            return {'qd': max(qd, 0.0), 'lat_ms': max(lat, 0.0) * 1000.0, 'throughput_mb': max(bps, 0.0) / (1024 * 1024)}
-        except Exception:
-            return None
-
-
-WINDOWS_DISK = WindowsDiskStats()
-
 for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
     os.makedirs(d, exist_ok=True)
 
@@ -247,8 +211,7 @@ if not os.path.exists(REGION_FILE):
         json.dump([], f)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if importlib.util.find_spec("pynvml") is not None:
-    import pynvml
+load_pynvml()
 
 def letterbox(img, new_w, new_h):
     h, w = img.shape[:2]
@@ -272,44 +235,6 @@ def get_screen_size():
     with mss.mss() as sct:
         monitor = sct.monitors[1]
         return monitor['width'], monitor['height'], monitor['left'], monitor['top']
-
-def get_free_vram_bytes():
-    if not torch.cuda.is_available():
-        return float('inf')
-    try:
-        free, _ = torch.cuda.mem_get_info()
-        return float(free)
-    except Exception:
-        pass
-    if pynvml is not None:
-        try:
-            pynvml.nvmlInit()
-            if pynvml.nvmlDeviceGetCount() > 0:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                return float(info.free)
-        except Exception:
-            return 0.0
-    return 0.0
-
-def get_total_vram_bytes():
-    if not torch.cuda.is_available():
-        return 0.0
-    try:
-        props = torch.cuda.get_device_properties(0)
-        return float(getattr(props, 'total_memory', 0.0))
-    except Exception:
-        pass
-    if pynvml is not None:
-        try:
-            pynvml.nvmlInit()
-            if pynvml.nvmlDeviceGetCount() > 0:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                info = pynvml.nvmlDeviceMemoryInfo(handle)
-                return float(info.total)
-        except Exception:
-            return 0.0
-    return 0.0
 
 def encode_key(v):
     return int(v).to_bytes(8, byteorder='big', signed=False)
@@ -391,10 +316,6 @@ class PoolCacheManager:
     def get_snapshot(self):
         with self.lock:
             return self.data, self.total_bytes
-
-    def get_total_bytes(self):
-        with self.lock:
-            return self.total_bytes
 
     def cache_meta(self, meta):
         if meta is None or 'id' not in meta:
@@ -1097,6 +1018,7 @@ class OptimizerThread(QThread):
         reg_loss = nn.SmoothL1Loss(reduction='none')
         bce = nn.BCELoss(reduction='none')
 
+        # Updated GradScaler usage
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
         epochs = 3 if os.path.exists(weight_path) else 5
@@ -1360,27 +1282,37 @@ class OcrWorker(threading.Thread):
             return None
         st = time.time()
         try:
+            # 简化预处理，避免破坏文字特征
             min_side = min(roi.shape[:2])
-            scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
-            proc = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
-            proc = cv2.filter2D(proc, -1, kernel)
-            result = self.ocr.ocr(proc)
+            if min_side < 10: return None
+            # 适当放大以提高小字体识别率
+            scale = 2 if min_side < 50 else 1
+            if scale > 1:
+                proc = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            else:
+                proc = roi
+            
+            result = self.ocr.ocr(proc, cls=False, det=True, rec=True)
             parsed = None
             best_conf = 0.0
-            if result and len(result) > 0:
+            
+            # 增强解析逻辑，处理PaddleOCR返回None的情况
+            if result and len(result) > 0 and result[0]:
                 texts = []
                 for item in result[0]:
-                    if len(item) <= 1 or len(item[1]) < 2:
-                        continue
-                    text, conf = item[1][0], float(item[1][1])
+                    if not item or len(item) < 2: continue
+                    text_info = item[1]
+                    if len(text_info) < 2: continue
+                    text, conf = text_info[0], float(text_info[1])
                     if conf >= OCR_CONF_THRESHOLD:
                         texts.append(text)
                         best_conf = max(best_conf, conf)
                 merged = ''.join(texts)
+                # 宽松正则匹配
                 m = re.search(r"\d+(?:\.\d+)?", merged)
                 if m:
                     parsed = m.group(0)
+            
             if parsed and best_conf >= OCR_CONF_THRESHOLD:
                 try:
                     return int(round(float(parsed))), best_conf
@@ -1473,19 +1405,19 @@ class OcrWorker(threading.Thread):
                 self.latest_snapshot = snap
                 self.history.append(snap)
             return
+        
         frame_h, frame_w = frame.shape[:2]
+        # 修正：MSS抓取的图像已经是物理分辨率，直接基于SCREEN_W比较即可
+        # 如果有DPI缩放，regions的坐标可能是逻辑坐标，需要根据缩放比例调整
         scale_x = frame_w / max(SCREEN_W, 1)
         scale_y = frame_h / max(SCREEN_H, 1)
-        if platform.system() == 'Windows':
-            try:
-                from PyQt5.QtWidgets import QApplication
-                screen = QApplication.primaryScreen()
-                if screen is not None:
-                    ratio = float(screen.devicePixelRatio())
-                    scale_x = max(scale_x, ratio)
-                    scale_y = max(scale_y, ratio)
-            except Exception:
-                pass
+        
+        # 尝试检测系统DPI缩放
+        if platform.system() == 'Windows' and abs(scale_x - 1.0) < 0.1:
+            # 如果SCREEN_W和frame_w接近，说明它们是同一个单位。
+            # 但regions可能是基于逻辑像素的，如果开启了DPI缩放，frame_w通常会比逻辑SCREEN_W大
+            pass 
+
         for idx, r in enumerate(self.regions):
             try:
                 px = int(round(r['x'] * scale_x))
@@ -2489,6 +2421,7 @@ class MainWin(QMainWindow):
                 if device_count > 0:
                     pid = os.getpid()
                     selected = None
+                    # 尝试寻找运行当前进程的GPU
                     for idx in range(device_count):
                         handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
                         try:
@@ -2498,6 +2431,8 @@ class MainWin(QMainWindow):
                         if any(getattr(p, 'pid', None) == pid for p in procs):
                             selected = (handle, idx)
                             break
+                    
+                    # 如果找不到，尝试根据环境变量
                     if selected is None:
                         env_idx = None
                         try:
@@ -2506,16 +2441,14 @@ class MainWin(QMainWindow):
                                 env_idx = int(env_vis.split(',')[0].strip())
                         except Exception:
                             env_idx = None
-                        torch_idx = None
-                        try:
-                            torch_idx = torch.cuda.current_device()
-                        except Exception:
-                            torch_idx = None
-                        prefer_idx = env_idx if env_idx is not None else torch_idx
-                        if prefer_idx is not None and 0 <= prefer_idx < device_count:
-                            selected = (pynvml.nvmlDeviceGetHandleByIndex(prefer_idx), prefer_idx)
+                        
+                        if env_idx is not None and 0 <= env_idx < device_count:
+                            selected = (pynvml.nvmlDeviceGetHandleByIndex(env_idx), env_idx)
+                    
+                    # 兜底：直接使用第0号设备
                     if selected is None:
                         selected = (pynvml.nvmlDeviceGetHandleByIndex(0), 0)
+                    
                     self.nvml_handle, self.nvml_index = selected
             except Exception:
                 self.nvml_handle = None
@@ -2533,15 +2466,17 @@ class MainWin(QMainWindow):
         gpu_power = 0.0
         gpu_fan = 0.0
         gpu_data_available = False
+        
         if torch.cuda.is_available():
             used_nvml = False
             if self.ensure_nvml_handle():
                 try:
                     util = pynvml.nvmlDeviceGetUtilizationRates(self.nvml_handle)
                     mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.nvml_handle)
-                    gpu_temp = float(pynvml.nvmlDeviceGetTemperature(self.nvml_handle, pynvml.NVML_TEMPERATURE_GPU))
-                    gpu_power = float(pynvml.nvmlDeviceGetPowerUsage(self.nvml_handle)) / 1000.0
-                    gpu_fan = float(pynvml.nvmlDeviceGetFanSpeed(self.nvml_handle))
+                    try:
+                        gpu_temp = float(pynvml.nvmlDeviceGetTemperature(self.nvml_handle, pynvml.NVML_TEMPERATURE_GPU))
+                    except: gpu_temp = 0.0
+                    
                     gpu_u = float(util.gpu)
                     vram_u = mem_info.used / (1024 * 1024)
                     vram_t = max(mem_info.total / (1024 * 1024), 1)
@@ -2549,6 +2484,7 @@ class MainWin(QMainWindow):
                     gpu_data_available = True
                 except Exception:
                     used_nvml = False
+            
             if not used_nvml and self.nvidia_thread is not None:
                 try:
                     gpu_u, vram_u, vram_t, gpu_temp, gpu_power, gpu_fan = self.nvidia_thread.result
@@ -2556,6 +2492,7 @@ class MainWin(QMainWindow):
                     gpu_data_available = True
                 except Exception:
                     pass
+            
             if gpu_data_available:
                 gpu_display = f"{gpu_u:.0f}%"
                 vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
@@ -2569,7 +2506,7 @@ class MainWin(QMainWindow):
                 scale = SCALE_PERCENT
 
         self.lbl_cpu.setText(f"处理器: {cpu}%")
-        self.lbl_mem.setText(f"内存: {mem}%")
+        self.lbl_mem.setText(f"内存: {mem:.1f}%")
         self.lbl_gpu.setText(f"显卡: {gpu_display}")
         self.lbl_vram.setText(f"显存: {vram_display}")
         self.lbl_res.setText(f"分辨率: {SCREEN_W}x{SCREEN_H} ({scale}%)")
