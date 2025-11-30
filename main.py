@@ -1275,7 +1275,7 @@ class OcrWorker(threading.Thread):
     def init_ocr(self):
         try:
             with StdSilencer():
-                self.ocr = PaddleOCR(use_angle_cls=False, use_gpu=False)
+                self.ocr = PaddleOCR(lang="ch", ocr_version='PP-OCRv4', show_log=False)
             if self.status_cb:
                 self.status_cb("OCR 已切换至 CPU 模式")
         except Exception as e:
@@ -1345,7 +1345,7 @@ class OcrWorker(threading.Thread):
             binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
             proc = cv2.copyMakeBorder(binary, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
             proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
-            result = self.ocr.ocr(proc, det=False, cls=False)
+            result = self.ocr.ocr(proc)
             digits = ''
             best_conf = 0.0
             if result and len(result) > 0:
