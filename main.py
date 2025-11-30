@@ -67,7 +67,7 @@ CACHE_MAX_BYTES = 256 * 1024 * 1024
 GPU_VRAM_LOW = 600 * 1024 * 1024
 GPU_VRAM_HIGH = 1200 * 1024 * 1024
 GPU_HYSTERESIS_SEC = 2.5
-FORCE_CPU_OCR = False
+FORCE_CPU_OCR = True
 pynvml = None
 
 def resolve_perf_name(name):
@@ -455,6 +455,11 @@ if platform.system() == 'Windows':
     except Exception:
         SCALE_PERCENT = 100
 
+def update_input_resolution(new_w, new_h):
+    global INPUT_W, INPUT_H, LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H
+    INPUT_W, INPUT_H = int(new_w), int(new_h)
+    LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H = compute_letterbox_params(SCREEN_W, SCREEN_H, INPUT_W, INPUT_H)
+
 def clamp01(v):
     return max(0.0, min(1.0, v))
 
@@ -479,16 +484,19 @@ class PathPlanner:
     def __init__(self):
         self.path = deque()
         self.current = (0.5, 0.5)
+        self.filtered_current = (0.5, 0.5)
         self.last_plan_time = 0.0
         self.last_target = (0.5, 0.5)
         self.lock_window = 0.2
         self.target_tolerance = 0.02
         self.deviation_tolerance = 0.01
+        self.filter_alpha = 0.35
 
     def reset(self, pos=None):
         self.path.clear()
         if pos is not None:
             self.current = (clamp01(pos[0]), clamp01(pos[1]))
+        self.filtered_current = self.current
 
     def plan(self, start, target, velocity):
         sx, sy = clamp01(start[0]), clamp01(start[1])
@@ -504,11 +512,15 @@ class PathPlanner:
             self.path.append((clamp01(px), clamp01(py)))
         self.last_plan_time = time.time()
         self.last_target = (tx, ty)
+        self.filtered_current = self.current
 
     def next_point(self):
         if self.path:
             self.current = self.path.popleft()
-        return self.current
+        fx = self.filtered_current[0] + self.filter_alpha * (self.current[0] - self.filtered_current[0])
+        fy = self.filtered_current[1] + self.filter_alpha * (self.current[1] - self.filtered_current[1])
+        self.filtered_current = (clamp01(fx), clamp01(fy))
+        return self.filtered_current
 
     def idle(self):
         return len(self.path) == 0
@@ -1166,7 +1178,7 @@ class DataWorker(QThread):
         self.vram_low_since = None
         self.vram_high_since = None
         self.last_vram_check = 0.0
-        self.gpu_forced_off = False
+        self.gpu_forced_off = True
         self.reload_regions()
 
     def apply_kalman(self, idx, measurement, now, measurement_valid):
@@ -1178,6 +1190,7 @@ class DataWorker(QThread):
         dt = max(now - last_t, 1e-3)
         pred_x = state['x'] + state['v'] * dt
         pred_p = state['p'] + 5.0 * dt
+        observation_used = False
         if measurement_valid and measurement is not None:
             meas_val, meas_conf = measurement if isinstance(measurement, (list, tuple)) and len(measurement) >= 2 else (measurement, 1.0)
             prev_v = self.prev_vals[idx] if idx < len(self.prev_vals) else None
@@ -1194,6 +1207,7 @@ class DataWorker(QThread):
                 state['v'] = (state['x'] - pred_x) / dt
                 state['p'] = (1.0 - k) * pred_p
                 self.last_update_time[idx] = now
+                observation_used = True
             else:
                 state['x'] = pred_x
                 state['p'] = pred_p
@@ -1201,7 +1215,7 @@ class DataWorker(QThread):
             state['x'] = pred_x
             state['p'] = pred_p
         self.kalman_time[idx] = now
-        return max(0, int(round(state['x'])))
+        return max(0, int(round(state['x']))), observation_used
 
     def init_ocr_instances(self):
         total_vram = get_total_vram_bytes()
@@ -1347,7 +1361,7 @@ class DataWorker(QThread):
         self.kalman_time = [now_ts] * len(self.regions)
         self.ocr_tasks = [None] * len(self.regions)
 
-    def read_ocr(self, roi):
+    def read_ocr(self, roi, frame_id, region_idx):
         st = time.time()
         try:
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -1375,10 +1389,10 @@ class DataWorker(QThread):
                         best_conf = max(best_conf, conf)
                 digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
             if digits and best_conf >= OCR_CONF_THRESHOLD:
-                return int(digits), best_conf
-            return None
+                return frame_id, region_idx, (int(digits), best_conf)
+            return frame_id, region_idx, None
         except:
-            return None
+            return frame_id, region_idx, None
         finally:
             self.perf_signal.emit({'ocr_time_ms': (time.time() - st) * 1000.0})
 
@@ -1392,7 +1406,7 @@ class DataWorker(QThread):
             self.manage_ocr_mode()
             try:
                 data = self.queue.get(timeout=0.1)
-                full_img, small_img, mx, my, click, source, save, prediction_error = data
+                full_img, small_img, frame_id, mx, my, click, source, save, prediction_error = data
                 self.tick += 1
                 now = time.time()
                 if self.prev_time is None:
@@ -1420,6 +1434,7 @@ class DataWorker(QThread):
 
                 ocr_vals = []
                 ocr_ages = []
+                ocr_types = []
                 if self.regions:
                     for idx, r in enumerate(self.regions):
                         try:
@@ -1462,16 +1477,18 @@ class DataWorker(QThread):
                                 except Exception:
                                     res = None
                                 if res is not None:
-                                    measurement = res
-                                    candidate_new = True
-                                    self.last_read_tick[idx] = self.tick
+                                    task_frame, task_idx, meas = res
+                                    if task_frame == frame_id and task_idx == idx:
+                                        measurement = meas
+                                        candidate_new = True
+                                        self.last_read_tick[idx] = self.tick
                                 self.ocr_tasks[idx] = None
                             if need_read and (idx >= len(self.ocr_tasks) or self.ocr_tasks[idx] is None):
                                 if idx >= len(self.ocr_tasks):
                                     self.ocr_tasks.append(None)
-                                self.ocr_tasks[idx] = self.ocr_pool.submit(self.read_ocr, roi.copy())
+                                self.ocr_tasks[idx] = self.ocr_pool.submit(self.read_ocr, roi.copy(), frame_id, idx)
                                 self.last_read_tick[idx] = self.tick
-                            filtered = self.apply_kalman(idx, measurement, now, candidate_new)
+                            filtered, observed = self.apply_kalman(idx, measurement, now, candidate_new)
                             self.histories[idx].append(filtered)
                             smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else filtered
                             stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
@@ -1486,17 +1503,20 @@ class DataWorker(QThread):
                             ocr_vals.append(final_v)
                             age_ms = int((time.time() - self.last_update_time[idx]) * 1000) if idx < len(self.last_update_time) else 0
                             ocr_ages.append(max(0, age_ms))
+                            ocr_types.append('obs' if observed else 'pred')
                         except:
                             ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
                             age_ms = int((time.time() - self.last_update_time[idx]) * 1000) if idx < len(self.last_update_time) else 0
                             ocr_ages.append(max(0, age_ms))
-                    self.ocr_result.emit({'values': ocr_vals, 'ages': ocr_ages, 'ts': int(time.time() * 1000)})
+                            ocr_types.append('pred')
+                    self.ocr_result.emit({'values': ocr_vals, 'ages': ocr_ages, 'types': ocr_types, 'frame_id': frame_id, 'ts': int(time.time() * 1000)})
                 else:
-                    self.ocr_result.emit({'values': [], 'ages': [], 'ts': int(time.time() * 1000)})
+                    self.ocr_result.emit({'values': [], 'ages': [], 'types': [], 'frame_id': frame_id, 'ts': int(time.time() * 1000)})
 
                 if save:
                     ts = int(time.time() * 1000)
                     meta = {
+                        'frame_id': frame_id,
                         'ts': ts,
                         'img': '',
                         'mx': mx,
@@ -1505,6 +1525,7 @@ class DataWorker(QThread):
                         'source': source,
                         'ocr': [float(v) for v in ocr_vals],
                         'ocr_age': [float(a) for a in ocr_ages],
+                        'ocr_types': ocr_types,
                         'novelty': float(novelty),
                         'complexity': float(complexity),
                         'prediction_error': float(prediction_error)
@@ -1535,6 +1556,14 @@ class InferenceThread(QThread):
 
     def run(self):
         while self.running:
+            if torch.cuda.is_available():
+                try:
+                    free, total = torch.cuda.mem_get_info()
+                    used_ratio = 1.0 - (float(free) / max(float(total), 1.0))
+                    if used_ratio >= 0.9:
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
             self.owner.loop()
             time.sleep(self.owner.loop_sleep)
 
@@ -1723,7 +1752,12 @@ class MainWin(QMainWindow):
         self.latest_ocr = pack_ocr([])
         self.prev_ocr_vals = [0]*MAX_OCR
         self.seq_frames = deque(maxlen=SEQ_LEN)
+        self.ocr_frame_map = {}
         self.seq_ocr = deque(maxlen=SEQ_LEN)
+        self.frame_counter = 0
+        self.latest_frame_id = 0
+        self.high_latency_streak = 0
+        self.resolution_scaled = False
         self.press_thresh = 0.7
         self.release_thresh = 0.3
         self.min_press = 0.12
@@ -1993,13 +2027,9 @@ class MainWin(QMainWindow):
                 pass
 
     def update_ocr(self, vals):
-        raw_vals = []
-        ages = []
-        if isinstance(vals, dict):
-            raw_vals = vals.get('values', [])
-            ages = vals.get('ages', [])
-        else:
-            raw_vals = vals
+        frame_id = vals.get('frame_id') if isinstance(vals, dict) else None
+        raw_vals = vals.get('values', []) if isinstance(vals, dict) else vals
+        ages = vals.get('ages', []) if isinstance(vals, dict) else []
         full_vals = [0]*MAX_OCR
         deltas = [0]*MAX_OCR
         age_buf = [0]*MAX_OCR
@@ -2012,6 +2042,40 @@ class MainWin(QMainWindow):
             age_buf[i] = a
         self.latest_ocr = pack_ocr(full_vals, deltas, age_buf)
         self.seq_ocr.append(self.latest_ocr)
+        if frame_id is not None:
+            self.latest_frame_id = max(self.latest_frame_id, frame_id)
+            self.ocr_frame_map[frame_id] = self.latest_ocr
+            if self.seq_frames:
+                oldest_id = self.seq_frames[0][0]
+                drop_keys = [k for k in list(self.ocr_frame_map.keys()) if k < oldest_id]
+                for k in drop_keys:
+                    self.ocr_frame_map.pop(k, None)
+
+    def get_ocr_for_frame(self, frame_id):
+        if frame_id is not None and frame_id in self.ocr_frame_map:
+            return self.ocr_frame_map[frame_id]
+        if not self.ocr_frame_map:
+            return self.latest_ocr
+        candidates = [fid for fid in self.ocr_frame_map.keys() if frame_id is None or fid <= frame_id]
+        if candidates:
+            return self.ocr_frame_map[max(candidates)]
+        return self.latest_ocr
+
+    def maybe_scale_down_resolution(self):
+        if self.resolution_scaled:
+            return
+        if self.loop_latency_ms > 100.0:
+            self.high_latency_streak += 1
+        else:
+            self.high_latency_streak = 0
+        if self.high_latency_streak >= 3:
+            update_input_resolution(max(80, INPUT_W // 2), max(45, INPUT_H // 2))
+            self.seq_frames.clear()
+            self.seq_ocr.clear()
+            self.ocr_frame_map.clear()
+            self.resolution_scaled = True
+            self.high_latency_streak = 0
+            self.path_planner.reset((self.smooth_x, self.smooth_y))
 
     def update_stats(self):
         cpu = self.process.cpu_percent()
@@ -2142,11 +2206,15 @@ class MainWin(QMainWindow):
                 self.frame_interval_ms = (cap_start - self.prev_capture_ts) * 1000.0
             self.prev_capture_ts = cap_start
             frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            self.frame_counter += 1
+            frame_id = self.frame_counter
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             proc = preprocess_frame(rgb)
-            self.seq_frames.append(proc)
-            self.seq_ocr.append(self.latest_ocr)
-
+            self.seq_frames.append((frame_id, proc))
+            valid_ids = {fid for fid, _ in self.seq_frames}
+            drop_keys = [k for k in list(self.ocr_frame_map.keys()) if k not in valid_ids]
+            for k in drop_keys:
+                self.ocr_frame_map.pop(k, None)
             mx, my = self.mouse.position
             nx, ny = screen_to_letter_norm(mx, my)
             click = 1.0 if self.mouse_pressed else 0.0
@@ -2154,15 +2222,13 @@ class MainWin(QMainWindow):
             prediction_error = 0.0
 
             if self.mode == "TRAINING":
-                seq_imgs = list(self.seq_frames)
-                seq_ocr = list(self.seq_ocr)
+                seq_frames = list(self.seq_frames)
                 if self.stop_flag.is_set():
                     return
-                while len(seq_imgs) < SEQ_LEN:
-                    seq_imgs.insert(0, np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32))
-                    seq_ocr.insert(0, pack_ocr([]))
-                seq_imgs = torch.tensor(np.stack(seq_imgs)[None, ...], dtype=torch.float32, device=DEVICE)
-                seq_ocr = torch.tensor(np.stack(seq_ocr)[None, ...], dtype=torch.float32, device=DEVICE)
+                while len(seq_frames) < SEQ_LEN:
+                    seq_frames.insert(0, (None, np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32)))
+                seq_imgs = torch.tensor(np.stack([img for _, img in seq_frames])[None, ...], dtype=torch.float32, device=DEVICE)
+                seq_ocr = torch.tensor(np.stack([self.get_ocr_for_frame(fid) for fid, _ in seq_frames])[None, ...], dtype=torch.float32, device=DEVICE)
 
                 infer_st = time.time()
                 with torch.no_grad():
@@ -2251,10 +2317,11 @@ class MainWin(QMainWindow):
                 except queue.Empty:
                     pass
             try:
-                self.queue.put_nowait((frame, small, nx, ny, click, source, save, prediction_error))
+                self.queue.put_nowait((frame, small, frame_id, nx, ny, click, source, save, prediction_error))
             except queue.Full:
                 pass
             self.loop_latency_ms = (time.time() - loop_start) * 1000.0
+            self.maybe_scale_down_resolution()
 
         except Exception: pass
 
