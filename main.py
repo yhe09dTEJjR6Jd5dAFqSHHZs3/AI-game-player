@@ -14,7 +14,6 @@ import psutil
 import cv2
 import numpy as np
 import mss
-import base64
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -35,6 +34,11 @@ import logging
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 logging.getLogger("ppocr.utils.logging").setLevel(logging.ERROR)
 logging.getLogger("ppocr.utility").setLevel(logging.ERROR)
+
+try:
+    import win32pdh
+except Exception:
+    win32pdh = None
 
 
 try:
@@ -65,6 +69,45 @@ GPU_VRAM_HIGH = 1200 * 1024 * 1024
 GPU_HYSTERESIS_SEC = 2.5
 FORCE_CPU_OCR = False
 pynvml = None
+
+class WindowsDiskStats:
+    def __init__(self):
+        self.available = False
+        self.query = None
+        if platform.system() != 'Windows' or win32pdh is None:
+            return
+        try:
+            self.query = win32pdh.OpenQuery()
+            self.counter_qd = win32pdh.AddCounter(self.query, r'\\PhysicalDisk(_Total)\\Current Disk Queue Length')
+            self.counter_lat = win32pdh.AddCounter(self.query, r'\\PhysicalDisk(_Total)\\Avg. Disk sec/Transfer')
+            self.counter_bps = win32pdh.AddCounter(self.query, r'\\PhysicalDisk(_Total)\\Disk Bytes/sec')
+            self.available = True
+            win32pdh.CollectQueryData(self.query)
+        except Exception:
+            self.available = False
+
+    def read_value(self, counter):
+        try:
+            return float(win32pdh.GetFormattedCounterValue(counter, win32pdh.PDH_FMT_DOUBLE)[1])
+        except Exception:
+            return None
+
+    def collect(self):
+        if not self.available:
+            return None
+        try:
+            win32pdh.CollectQueryData(self.query)
+            qd = self.read_value(self.counter_qd)
+            lat = self.read_value(self.counter_lat)
+            bps = self.read_value(self.counter_bps)
+            if qd is None or lat is None or bps is None:
+                return None
+            return {'qd': max(qd, 0.0), 'lat_ms': max(lat, 0.0) * 1000.0, 'throughput_mb': max(bps, 0.0) / (1024 * 1024)}
+        except Exception:
+            return None
+
+
+WINDOWS_DISK = WindowsDiskStats()
 
 for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -148,6 +191,23 @@ def encode_key(v):
 def decode_key(b):
     return int.from_bytes(b, byteorder='big', signed=False)
 
+def pack_entry(meta, img_bytes):
+    meta_bytes = json.dumps(meta, ensure_ascii=False).encode('utf-8')
+    header = len(meta_bytes).to_bytes(4, byteorder='big', signed=False)
+    return header + meta_bytes + (img_bytes if img_bytes is not None else b'')
+
+def unpack_entry(buf):
+    if buf is None or len(buf) < 4:
+        return {}, b''
+    meta_len = int.from_bytes(buf[:4], byteorder='big', signed=False)
+    meta_bytes = buf[4:4+meta_len]
+    try:
+        meta = json.loads(meta_bytes.decode('utf-8')) if meta_bytes else {}
+    except Exception:
+        meta = {}
+    img_bytes = buf[4+meta_len:] if len(buf) > 4 + meta_len else b''
+    return meta, img_bytes
+
 class StdSilencer:
     def __enter__(self):
         self.stdout = sys.stdout
@@ -220,14 +280,12 @@ class PoolCacheManager:
                 has = cur.set_range(start_key) if start_key is not None else cur.first()
                 while has:
                     try:
-                        meta = json.loads(cur.value().decode('utf-8'))
+                        meta, img_bytes = unpack_entry(cur.value())
                     except Exception:
                         has = cur.next()
                         continue
                     try:
                         ts = int(meta.get('ts', 0))
-                        img_b64 = meta.get('img_b64', '')
-                        img_bytes = base64.b64decode(img_b64.encode('ascii')) if isinstance(img_b64, str) and img_b64 else None
                         mx, my, click = float(meta.get('mx', 0.0)), float(meta.get('my', 0.0)), float(meta.get('click', 0.0))
                         ocr_vals = [float(x) for x in meta.get('ocr', [])]
                         ocr_age = [float(x) for x in meta.get('ocr_age', [])]
@@ -318,6 +376,11 @@ class PathPlanner:
     def __init__(self):
         self.path = deque()
         self.current = (0.5, 0.5)
+        self.last_plan_time = 0.0
+        self.last_target = (0.5, 0.5)
+        self.lock_window = 0.2
+        self.target_tolerance = 0.02
+        self.deviation_tolerance = 0.01
 
     def reset(self, pos=None):
         self.path.clear()
@@ -336,6 +399,8 @@ class PathPlanner:
             px = a * a * a * sx + 3 * a * a * t * c1[0] + 3 * a * t * t * c2[0] + t * t * t * tx
             py = a * a * a * sy + 3 * a * a * t * c1[1] + 3 * a * t * t * c2[1] + t * t * t * ty
             self.path.append((clamp01(px), clamp01(py)))
+        self.last_plan_time = time.time()
+        self.last_target = (tx, ty)
 
     def next_point(self):
         if self.path:
@@ -344,6 +409,18 @@ class PathPlanner:
 
     def idle(self):
         return len(self.path) == 0
+
+    def should_replan(self, current, target):
+        if self.idle():
+            return True
+        now = time.time()
+        if now - self.last_plan_time < self.lock_window:
+            dist_target = ((target[0] - self.last_target[0]) ** 2 + (target[1] - self.last_target[1]) ** 2) ** 0.5
+            head = self.path[0] if self.path else self.current
+            deviation = ((current[0] - head[0]) ** 2 + (current[1] - head[1]) ** 2) ** 0.5
+            if dist_target <= self.target_tolerance and deviation <= self.deviation_tolerance:
+                return False
+        return True
 
 def pack_ocr(vals, deltas=None, ages=None):
     buf = [0]*MAX_OCR
@@ -468,10 +545,11 @@ class SumTree:
         self.capacity = cap
         self.size = capacity
         self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+        self.epsilon = 1e-6
 
     def build(self, values):
         n = min(len(values), self.capacity)
-        self.tree[self.capacity:self.capacity + n] = values[:n]
+        self.tree[self.capacity:self.capacity + n] = np.asarray(values[:n], dtype=np.float32) + self.epsilon
         for i in range(self.capacity - 1, 0, -1):
             self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
 
@@ -483,18 +561,23 @@ class SumTree:
         if idx < 0 or idx >= self.size:
             return
         pos = self.capacity + idx
-        self.tree[pos] = float(value)
+        self.tree[pos] = float(value) + self.epsilon
         pos //= 2
         while pos >= 1:
             self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
             pos //= 2
 
+    def recalibrate(self):
+        for i in range(self.capacity - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
     def sample(self, batch_size):
         res = []
         weights = []
-        if self.total <= 0:
+        total = max(self.total, self.epsilon)
+        if total <= 0:
             return res, weights
-        segment = self.total / batch_size
+        segment = total / batch_size
         for i in range(batch_size):
             target = random.random() * segment + i * segment
             res.append(self._find(target))
@@ -810,11 +893,16 @@ class OptimizerThread(QThread):
                     for j in idx_arr:
                         tree.update(int(j), ds.compute_priority_value(int(j)))
 
+                if (step + 1) % 128 == 0:
+                    tree.recalibrate()
+
                 self.progress_sig.emit(int(((ep * steps) + step + 1) / (epochs * steps) * 100))
 
             self.progress_sig.emit(int((ep + 1) / epochs * 100))
 
-        torch.save(model.state_dict(), weight_path)
+        tmp_path = weight_path + '.tmp'
+        torch.save(model.state_dict(), tmp_path)
+        os.replace(tmp_path, weight_path)
         self.status_sig.emit("优化完成")
         self.finished_sig.emit()
 
@@ -852,12 +940,11 @@ class SaveWorker(threading.Thread):
                         ok, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                         if not ok:
                             continue
-                        meta['img_b64'] = base64.b64encode(enc.tobytes()).decode('ascii')
                         meta['img'] = ''
                     except Exception:
                         continue
                     meta['id'] = self.next_id
-                    data = json.dumps(meta, ensure_ascii=False).encode('utf-8')
+                    data = pack_entry(meta, enc.tobytes())
                     txn.put(encode_key(self.next_id), data)
                     self.next_id += 1
             atomic_write_text(LOG_INDEX_FILE, str(self.next_id))
@@ -1874,7 +1961,12 @@ class MainWin(QMainWindow):
         ops = max((now_io.read_count - self.prev_disk_io.read_count) + (now_io.write_count - self.prev_disk_io.write_count), 1)
         lat_ms = max((now_io.read_time - self.prev_disk_io.read_time) + (now_io.write_time - self.prev_disk_io.write_time), 0) / ops
         qd = 0.0
-        if hasattr(now_io, 'busy_time'):
+        win_disk = WINDOWS_DISK.collect()
+        if win_disk is not None:
+            io_throughput = win_disk['throughput_mb']
+            lat_ms = win_disk['lat_ms']
+            qd = win_disk['qd']
+        elif hasattr(now_io, 'busy_time'):
             busy_ms = max(now_io.busy_time - getattr(self.prev_disk_io, 'busy_time', 0), 0)
             if platform.system() != 'Windows' or busy_ms > 0:
                 qd = busy_ms / (dt * 1000.0)
@@ -2014,7 +2106,7 @@ class MainWin(QMainWindow):
                 planned_target_y = (1 - blend) * self.smooth_y + blend * target_y
                 target_pair = (planned_target_x, planned_target_y)
                 dist = ((target_pair[0] - self.last_target[0]) ** 2 + (target_pair[1] - self.last_target[1]) ** 2) ** 0.5
-                if self.path_planner.idle() or dist >= 0.005:
+                if self.path_planner.should_replan((self.smooth_x, self.smooth_y), target_pair) or dist >= 0.05:
                     self.path_planner.plan((self.smooth_x, self.smooth_y), target_pair, (dx, dy))
                     self.last_target = target_pair
                 nx, ny = self.path_planner.next_point()
