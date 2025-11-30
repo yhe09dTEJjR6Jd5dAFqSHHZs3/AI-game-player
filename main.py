@@ -871,13 +871,14 @@ class DataWorker(QThread):
         self.last_read_tick = []
         self.stable_counts = []
         self.last_update_time = []
+        self.kalman_states = []
+        self.kalman_time = []
         self.tick = 0
         self.force_cpu = FORCE_CPU_OCR
         self.ocr_gpu_enabled = False
         self.ocr_gpu = None
         self.ocr_cpu = None
         self.ocr = None
-        self.init_ocr_instances()
         self.ocr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.ocr_lock = threading.Lock()
         self.ocr_tasks = []
@@ -889,6 +890,33 @@ class DataWorker(QThread):
         self.vram_high_since = None
         self.last_vram_check = 0.0
         self.reload_regions()
+
+    def apply_kalman(self, idx, measurement, now, measurement_valid):
+        if idx >= len(self.kalman_states):
+            self.kalman_states.append({'x': 0.0, 'v': 0.0, 'p': 25.0})
+            self.kalman_time.append(now)
+        state = self.kalman_states[idx]
+        last_t = self.kalman_time[idx] if idx < len(self.kalman_time) else now
+        dt = max(now - last_t, 1e-3)
+        pred_x = state['x'] + state['v'] * dt
+        pred_p = state['p'] + 5.0 * dt
+        if measurement_valid and measurement is not None:
+            allowed = max(1.5, 80.0 * dt)
+            fresh = idx >= len(self.prev_vals) or self.prev_vals[idx] is None
+            if fresh or abs(measurement - pred_x) <= allowed:
+                k = pred_p / (pred_p + 16.0)
+                state['x'] = pred_x + k * (measurement - pred_x)
+                state['v'] = (state['x'] - pred_x) / dt
+                state['p'] = (1.0 - k) * pred_p
+                self.last_update_time[idx] = now
+            else:
+                state['x'] = pred_x
+                state['p'] = pred_p
+        else:
+            state['x'] = pred_x
+            state['p'] = pred_p
+        self.kalman_time[idx] = now
+        return max(0, int(round(state['x'])))
 
     def init_ocr_instances(self):
         try:
@@ -996,6 +1024,8 @@ class DataWorker(QThread):
         self.stable_counts = [0] * len(self.regions)
         now_ts = time.time()
         self.last_update_time = [now_ts] * len(self.regions)
+        self.kalman_states = [{'x': 0.0, 'v': 0.0, 'p': 25.0} for _ in self.regions]
+        self.kalman_time = [now_ts] * len(self.regions)
         self.ocr_tasks = [None] * len(self.regions)
 
     def read_ocr(self, roi):
@@ -1032,6 +1062,8 @@ class DataWorker(QThread):
             self.perf_signal.emit({'ocr_time_ms': (time.time() - st) * 1000.0})
 
     def run(self):
+        self.init_ocr_instances()
+        self.emit_status_snapshot()
         while self.running:
             if self.paused:
                 time.sleep(0.05)
@@ -1080,14 +1112,17 @@ class DataWorker(QThread):
                                 self.histories.append(deque(maxlen=5))
                                 self.last_read_tick.append(0)
                                 self.stable_counts.append(0)
-                                self.last_update_time.append(time.time())
+                                ts_now = time.time()
+                                self.last_update_time.append(ts_now)
+                                self.kalman_states.append({'x': 0.0, 'v': 0.0, 'p': 25.0})
+                                self.kalman_time.append(ts_now)
                             raw = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
                             diff = 0.3 * self.prev_change[idx] + 0.7 * raw
                             self.prev_change[idx] = diff
                             self.prev_rois[idx] = roi
                             prev_v = self.prev_vals[idx]
                             need_read = diff >= 0.002 or prev_v is None or self.tick - self.last_read_tick[idx] >= 3
-                            candidate = prev_v
+                            measurement = None
                             candidate_new = False
                             if idx < len(self.ocr_tasks) and self.ocr_tasks[idx] is not None and self.ocr_tasks[idx].done():
                                 try:
@@ -1095,9 +1130,8 @@ class DataWorker(QThread):
                                 except Exception:
                                     res = None
                                 if res is not None:
-                                    candidate = res[0]
+                                    measurement = res[0]
                                     candidate_new = True
-                                    self.last_update_time[idx] = time.time()
                                     self.last_read_tick[idx] = self.tick
                                 self.ocr_tasks[idx] = None
                             if need_read and (idx >= len(self.ocr_tasks) or self.ocr_tasks[idx] is None):
@@ -1105,12 +1139,9 @@ class DataWorker(QThread):
                                     self.ocr_tasks.append(None)
                                 self.ocr_tasks[idx] = self.ocr_pool.submit(self.read_ocr, roi.copy())
                                 self.last_read_tick[idx] = self.tick
-                            if candidate is None:
-                                candidate = 0
-                            elif candidate_new:
-                                self.last_update_time[idx] = time.time()
-                            self.histories[idx].append(candidate)
-                            smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else candidate
+                            filtered = self.apply_kalman(idx, measurement, now, candidate_new)
+                            self.histories[idx].append(filtered)
+                            smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else filtered
                             stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
                             if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
                                 smoothed = prev_v
