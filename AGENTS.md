@@ -31,7 +31,6 @@
 Python版本：3.10.11
 CUDA Toolkit：11.8
 cuDNN版本：8.9.7 (for CUDA 11.x)
-CPU版本的PaddleOCR
 NumPy：1.26.4
 OpenCV：4.10
 
