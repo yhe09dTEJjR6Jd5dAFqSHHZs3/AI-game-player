@@ -340,6 +340,10 @@ class PoolCacheManager:
             cls._instance.last_key = -1
             cls._instance.prev_vals = []
             cls._instance.region_signature = None
+            cls._instance.meta_cache = {}
+            cls._instance.meta_order = deque()
+            cls._instance.meta_bytes = 0
+            cls._instance.meta_limit = CACHE_MAX_BYTES
         return cls._instance
 
     def reset_if_region_changed(self, region_types):
@@ -368,6 +372,27 @@ class PoolCacheManager:
     def get_total_bytes(self):
         with self.lock:
             return self.total_bytes
+
+    def cache_meta(self, meta):
+        if meta is None or 'id' not in meta:
+            return
+        key = meta['id']
+        size = len(json.dumps(meta, ensure_ascii=False))
+        with self.lock:
+            if key in self.meta_cache:
+                return
+            self.meta_cache[key] = meta
+            self.meta_order.append((key, size))
+            self.meta_bytes += size
+            while self.meta_bytes > self.meta_limit and self.meta_order:
+                old, s = self.meta_order.popleft()
+                if old in self.meta_cache:
+                    del self.meta_cache[old]
+                self.meta_bytes -= s
+
+    def get_meta(self, key):
+        with self.lock:
+            return self.meta_cache.get(key)
 
     def load_from_db(self, region_types, chunk_size=256):
         self.reset_if_region_changed(region_types)
@@ -404,12 +429,22 @@ class PoolCacheManager:
                             self.prev_vals = [0] * len(region_types)
                         deltas = [cur_vals[i] - (self.prev_vals[i] if i < len(self.prev_vals) else 0) for i in range(len(region_types))]
                         self.prev_vals = cur_vals
-                    feat = pack_ocr(ocr_vals, deltas, ocr_age)
                     weight = ExperiencePool.calc_weight_static(region_types, ocr_vals, deltas, click, novelty, complexity, pred_err)
-                    size = 512 + (len(img_bytes) if img_bytes is not None else 0)
-                    entry = {'ts': ts, 'img_bytes': None, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err, 'id': decode_key(cur.key())}
+                    item_id = decode_key(cur.key())
+                    entry = {'ts': ts, 'weight': weight, 'size': 128, 'id': item_id}
+                    meta_payload = {
+                        'id': item_id,
+                        'ts': ts,
+                        'mx': mx,
+                        'my': my,
+                        'click': click,
+                        'ocr_vals': ocr_vals,
+                        'ocr_age': ocr_age,
+                        'prediction_error': pred_err
+                    }
+                    self.cache_meta(meta_payload)
                     batch.append(entry)
-                    self.last_key = decode_key(cur.key())
+                    self.last_key = item_id
                     if len(batch) >= chunk_size:
                         self._commit_batch(batch)
                         batch = []
@@ -908,6 +943,38 @@ class ExperiencePool(Dataset):
             self.cache_bytes -= s
         return img
 
+    def fetch_meta(self, idx):
+        if idx < 0 or idx >= len(self.data):
+            return None
+        item = self.data[idx]
+        key = item.get('id')
+        cached = POOL_CACHE.get_meta(key)
+        if cached:
+            return cached
+        if self.env is None:
+            return None
+        try:
+            with self.env.begin(write=False) as txn:
+                raw = txn.get(encode_key(int(key)))
+                if raw is None:
+                    return None
+                meta, _ = unpack_entry(raw)
+                meta = meta or {}
+                payload = {
+                    'id': key,
+                    'ts': int(meta.get('ts', 0)),
+                    'mx': float(meta.get('mx', 0.0)),
+                    'my': float(meta.get('my', 0.0)),
+                    'click': float(meta.get('click', 0.0)),
+                    'ocr_vals': [float(x) for x in meta.get('ocr', [])],
+                    'ocr_age': [float(x) for x in meta.get('ocr_age', [])],
+                    'prediction_error': float(meta.get('prediction_error', 0.0))
+                }
+                POOL_CACHE.cache_meta(payload)
+                return payload
+        except Exception:
+            return None
+
     def __len__(self):
         return len(self.data)
 
@@ -919,34 +986,42 @@ class ExperiencePool(Dataset):
         for _ in range(pad):
             seq_imgs.append(np.zeros((4, INPUT_H, INPUT_W), dtype=np.float32))
             seq_ocr.append(pack_ocr([]))
+        prev_vals = [0.0] * len(self.region_types)
         for j in range(start, idx + 1):
-            item = self.data[j]
-            img = self.cache_image(item)
+            meta = self.fetch_meta(j) or {'id': self.data[j].get('id'), 'ts': self.data[j].get('ts', 0), 'mx': 0.0, 'my': 0.0, 'click': 0.0, 'ocr_vals': [], 'ocr_age': []}
+            img = self.cache_image(meta)
             img = self.augment_image(img)
             seq_imgs.append(img)
-            seq_ocr.append(item['ocr'])
-        mx, my, click = self.data[idx]['mx'], self.data[idx]['my'], self.data[idx]['click']
-        prev = self.data[idx-1] if idx > 0 else self.data[idx]
-        dx, dy = mx - prev['mx'], my - prev['my']
+            cur_vals = meta.get('ocr_vals', [])
+            padded_vals = cur_vals[:len(self.region_types)] + [0] * max(0, len(self.region_types) - len(cur_vals))
+            deltas = [padded_vals[i] - (prev_vals[i] if i < len(prev_vals) else 0) for i in range(len(padded_vals))]
+            prev_vals = padded_vals
+            seq_ocr.append(pack_ocr(cur_vals, deltas, meta.get('ocr_age', [])))
+
+        meta_idx = self.fetch_meta(idx) or {'id': self.data[idx].get('id'), 'ts': self.data[idx].get('ts', 0), 'mx': 0.0, 'my': 0.0, 'click': 0.0, 'ocr_vals': [], 'ocr_age': []}
+        mx, my, click = meta_idx.get('mx', 0.0), meta_idx.get('my', 0.0), meta_idx.get('click', 0.0)
+        prev_meta = self.fetch_meta(idx - 1) if idx > 0 else meta_idx
+        if prev_meta is None:
+            prev_meta = meta_idx
+        dx, dy = mx - prev_meta.get('mx', 0.0), my - prev_meta.get('my', 0.0)
         mag = (dx**2 + dy**2) ** 0.5
         if mag < 1e-3:
             direction = 8
         else:
             angle = (np.arctan2(dy, dx) + np.pi) / (2 * np.pi)
             direction = int(angle * 8) % 8
-        next1 = self.data[min(len(self.data)-1, idx+1)]
-        next2 = self.data[min(len(self.data)-1, idx+2)]
-        next3 = self.data[min(len(self.data)-1, idx+3)]
-        d1 = torch.tensor([next1['mx']-mx, next1['my']-my], dtype=torch.float32)
-        d2 = torch.tensor([next2['mx']-mx, next2['my']-my], dtype=torch.float32)
-        d3 = torch.tensor([next3['mx']-mx, next3['my']-my], dtype=torch.float32)
+        next1 = self.fetch_meta(min(len(self.data)-1, idx+1)) or meta_idx
+        next2 = self.fetch_meta(min(len(self.data)-1, idx+2)) or meta_idx
+        next3 = self.fetch_meta(min(len(self.data)-1, idx+3)) or meta_idx
+        d1 = torch.tensor([next1.get('mx', 0.0)-mx, next1.get('my', 0.0)-my], dtype=torch.float32)
+        d2 = torch.tensor([next2.get('mx', 0.0)-mx, next2.get('my', 0.0)-my], dtype=torch.float32)
+        d3 = torch.tensor([next3.get('mx', 0.0)-mx, next3.get('my', 0.0)-my], dtype=torch.float32)
         delta_target = torch.cat([d1, d2, d3])
-        recency_ratio = 0.0
-        if self.max_ts > self.min_ts:
-            recency_ratio = (self.data[idx]['ts'] - self.min_ts) / (self.max_ts - self.min_ts)
-        else:
-            recency_ratio = (idx + 1) / max(1, len(self.data))
-        w = torch.tensor(self.data[idx]['weight'] * (0.5 + 0.5 * recency_ratio), dtype=torch.float32)
+        sample_ts = self.data[idx].get('ts', 0)
+        age_hours = max(0.0, (self.max_ts - sample_ts) / 1000.0 / 3600.0)
+        recency_weight = math.pow(0.999, age_hours)
+        base_weight = self.data[idx].get('weight', 1.0)
+        w = torch.tensor(base_weight * recency_weight, dtype=torch.float32)
         return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w, torch.tensor(idx, dtype=torch.long)
 
     def augment_image(self, img):
@@ -1004,14 +1079,29 @@ class OptimizerThread(QThread):
         epochs = 3 if os.path.exists(weight_path) else 5
         model.train()
 
+        target_batch = 16
+        effective_batch = min(target_batch, self.batch_size)
+        if torch.cuda.is_available():
+            try:
+                free, _ = torch.cuda.mem_get_info()
+                free_mb = free / (1024 * 1024)
+                if free_mb < 800:
+                    effective_batch = 4
+                elif free_mb < 1400:
+                    effective_batch = 8
+            except Exception:
+                pass
+        accum_steps = max(1, math.ceil(target_batch / max(1, effective_batch)))
+        self.status_sig.emit(f"批大小:{effective_batch} | 累积步数:{accum_steps}")
+
         for ep in range(epochs):
             weights = ds.get_priority_weights()
             tree = SumTree(len(weights))
             tree.build(weights)
-            steps = math.ceil(len(ds) / self.batch_size)
+            steps = math.ceil(len(ds) / max(1, effective_batch))
             self.status_sig.emit(f"正在优化模型: 第 {ep+1}/{epochs} 轮")
             for step in range(steps):
-                idxs, _ = tree.sample(self.batch_size)
+                idxs, _ = tree.sample(effective_batch)
                 if not idxs:
                     break
                 fixed = []
@@ -1028,7 +1118,8 @@ class OptimizerThread(QThread):
                 delta_t = torch.stack([b[4] for b in batch]).to(DEVICE)
                 ws = torch.stack([b[5] for b in batch]).to(DEVICE)
                 idx_tensor = torch.stack([b[6] for b in batch])
-                opt.zero_grad(set_to_none=True)
+                if step % accum_steps == 0:
+                    opt.zero_grad(set_to_none=True)
 
                 if scaler:
                     with torch.amp.autocast('cuda'):
@@ -1039,9 +1130,10 @@ class OptimizerThread(QThread):
                         l_delta = reg_loss(delta_out, delta_t).mean(dim=1)
                         comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta
                         loss = (comb * ws).sum() / (ws.sum() + 1e-6)
-                    scaler.scale(loss).backward()
-                    scaler.step(opt)
-                    scaler.update()
+                    scaler.scale(loss / accum_steps).backward()
+                    if (step + 1) % accum_steps == 0 or step == steps - 1:
+                        scaler.step(opt)
+                        scaler.update()
                 else:
                     out, logits, delta_out = model(imgs, ocrs)
                     l_pos = reg_loss(out[:, :2], targs[:, :2]).mean(dim=1)
@@ -1050,8 +1142,9 @@ class OptimizerThread(QThread):
                     l_delta = reg_loss(delta_out, delta_t).mean(dim=1)
                     comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta
                     loss = (comb * ws).sum() / (ws.sum() + 1e-6)
-                    loss.backward()
-                    opt.step()
+                    (loss / accum_steps).backward()
+                    if (step + 1) % accum_steps == 0 or step == steps - 1:
+                        opt.step()
 
                 with torch.no_grad():
                     loss_arr = comb.detach().cpu().numpy()
@@ -1608,17 +1701,36 @@ class InferenceThread(QThread):
         self.running = False
 
     def run(self):
-        while self.running:
-            if torch.cuda.is_available():
-                try:
-                    free, total = torch.cuda.mem_get_info()
-                    used_ratio = 1.0 - (float(free) / max(float(total), 1.0))
-                    if used_ratio >= 0.9:
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-            self.process_loop()
-            time.sleep(self.owner.loop_sleep)
+        sct = None
+        try:
+            sct = mss.mss()
+            self.owner.sct = sct
+            try:
+                self.owner.monitor = sct.monitors[1]
+            except Exception:
+                self.owner.monitor = None
+            while self.running:
+                if torch.cuda.is_available():
+                    try:
+                        free, total = torch.cuda.mem_get_info()
+                        used_ratio = 1.0 - (float(free) / max(float(total), 1.0))
+                        if used_ratio >= 0.9:
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                loop_start = time.time()
+                self.process_loop()
+                elapsed = time.time() - loop_start
+                target_int = 1.0 / max(self.owner.target_fps, 1.0)
+                sleep_dur = max(self.owner.loop_sleep, target_int - elapsed)
+                if sleep_dur > 0:
+                    time.sleep(sleep_dur)
+        finally:
+            try:
+                if sct is not None:
+                    sct.close()
+            except Exception:
+                pass
 
     def process_loop(self):
         w = self.owner
@@ -1931,11 +2043,6 @@ class MainWin(QMainWindow):
 
         self.sct = None
         self.monitor = None
-        try:
-            self.sct = mss.mss()
-            self.monitor = self.sct.monitors[1]
-        except Exception as e:
-            self.update_status_text(f"截屏初始化失败: {e}")
 
         self.queue = queue.Queue(maxsize=8)
         self.worker = DataWorker(self.queue)
@@ -1993,6 +2100,7 @@ class MainWin(QMainWindow):
         self.prev_capture_ts = None
         self.process = psutil.Process(os.getpid())
         self.loop_sleep = 0.001
+        self.target_fps = 60
         self.plot_pause_until = 0.0
 
         self.key_signal.connect(self.handle_key_event)
@@ -2171,12 +2279,13 @@ class MainWin(QMainWindow):
     def do_select(self):
         if self.mode != "LEARNING": return
         self.mode = "SELECT"
-        self.overlay.hide()
+        self.overlay.raise_()
+        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         dlg = RegionEditor()
         if dlg.exec_() == QDialog.Accepted:
             self.worker.reload_regions()
             self.overlay.reload()
-        self.overlay.show()
+        self.overlay.raise_()
         self.mode = "LEARNING"
 
     def do_opt(self):
@@ -2369,11 +2478,20 @@ class MainWin(QMainWindow):
             self.loop_sleep = 0.001
 
         backlog = self.worker.get_backlog() if hasattr(self, 'worker') and self.worker is not None else 0
+        target_fps = 60
+        vram_ratio = (vram_u / vram_t) if vram_t else 0.0
+        if load > 95 or vram_ratio >= 0.9 or backlog > 200:
+            target_fps = 15
+        elif load > 80 or vram_ratio >= 0.8 or backlog > 120:
+            target_fps = 30
+        if self.target_fps != target_fps:
+            self.target_fps = target_fps
+
         pause_worker = load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95) or backlog > 200
         self.worker.set_paused(pause_worker)
 
         self.last_load = load
-        self.last_vram_ratio = (vram_u / vram_t) if vram_t else 0.0
+        self.last_vram_ratio = vram_ratio
         self.last_backlog = backlog
 
         for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0]):
