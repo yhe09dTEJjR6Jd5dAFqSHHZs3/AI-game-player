@@ -5,6 +5,7 @@ import json
 import lmdb
 import math
 import random
+import re
 import threading
 import queue
 import concurrent.futures
@@ -1337,16 +1338,12 @@ class OcrWorker(threading.Thread):
             return None
         st = time.time()
         try:
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            min_side = min(gray.shape[:2])
+            min_side = min(roi.shape[:2])
             scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
-            resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            blurred = cv2.medianBlur(resized, 3)
-            binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-            proc = cv2.copyMakeBorder(binary, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
-            proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
+            proc = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            proc = cv2.GaussianBlur(proc, (3, 3), 0)
             result = self.ocr.ocr(proc)
-            digits = ''
+            parsed = None
             best_conf = 0.0
             if result and len(result) > 0:
                 texts = []
@@ -1357,9 +1354,15 @@ class OcrWorker(threading.Thread):
                     if conf >= OCR_CONF_THRESHOLD:
                         texts.append(text)
                         best_conf = max(best_conf, conf)
-                digits = ''.join([c for c in ''.join(texts) if c.isdigit()])
-            if digits and best_conf >= OCR_CONF_THRESHOLD:
-                return int(digits), best_conf
+                merged = ''.join(texts)
+                m = re.search(r"\d+(?:\.\d+)?", merged)
+                if m:
+                    parsed = m.group(0)
+            if parsed and best_conf >= OCR_CONF_THRESHOLD:
+                try:
+                    return int(round(float(parsed))), best_conf
+                except Exception:
+                    pass
         except Exception:
             pass
         finally:
@@ -1447,16 +1450,32 @@ class OcrWorker(threading.Thread):
                 self.latest_snapshot = snap
                 self.history.append(snap)
             return
-        scale_factor = SCALE_PERCENT / 100.0
+        frame_h, frame_w = frame.shape[:2]
+        scale_x = frame_w / max(SCREEN_W, 1)
+        scale_y = frame_h / max(SCREEN_H, 1)
+        if platform.system() == 'Windows':
+            try:
+                from PyQt5.QtWidgets import QApplication
+                screen = QApplication.primaryScreen()
+                if screen is not None:
+                    ratio = float(screen.devicePixelRatio())
+                    scale_x = max(scale_x, ratio)
+                    scale_y = max(scale_y, ratio)
+            except Exception:
+                pass
         for idx, r in enumerate(self.regions):
             try:
-                px = int(round(r['x'] * scale_factor))
-                py = int(round(r['y'] * scale_factor))
-                pw = int(round(r['w'] * scale_factor))
-                ph = int(round(r['h'] * scale_factor))
-                roi = frame[py:py+ph, px:px+pw]
-                if roi.size == 0:
-                    raise ValueError("empty roi")
+                px = int(round(r['x'] * scale_x))
+                py = int(round(r['y'] * scale_y))
+                pw = int(round(r['w'] * scale_x))
+                ph = int(round(r['h'] * scale_y))
+                x1 = max(0, min(px, frame_w - 1))
+                y1 = max(0, min(py, frame_h - 1))
+                x2 = max(x1 + 1, min(px + pw, frame_w))
+                y2 = max(y1 + 1, min(py + ph, frame_h))
+                if x2 <= x1 or y2 <= y1:
+                    raise ValueError("invalid roi bounds")
+                roi = frame[y1:y2, x1:x2]
                 if idx >= len(self.prev_rois):
                     self.prev_rois.append(None)
                 raw = 1.0 if self.prev_rois[idx] is None else float(np.mean(cv2.absdiff(roi, self.prev_rois[idx]))) / 255.0
@@ -2119,6 +2138,11 @@ class MainWin(QMainWindow):
         self.stat_timer.timeout.connect(self.update_stats)
         self.stat_timer.start(500)
 
+        if torch.cuda.is_available():
+            self.ensure_nvml_handle()
+            self.nvidia_thread = NvidiaSmiThread()
+            self.nvidia_thread.start()
+
     def load_model(self):
         path = os.path.join(MODEL_DIR, "brain.pth")
         if os.path.exists(path):
@@ -2419,6 +2443,19 @@ class MainWin(QMainWindow):
                 self.last_scale_change = now
                 self.path_planner.reset((self.smooth_x, self.smooth_y))
 
+    def ensure_nvml_handle(self):
+        if not torch.cuda.is_available() or pynvml is None:
+            return False
+        if not self.nvml_checked:
+            try:
+                pynvml.nvmlInit()
+                if pynvml.nvmlDeviceGetCount() > 0:
+                    self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            except Exception:
+                self.nvml_handle = None
+            self.nvml_checked = True
+        return self.nvml_handle is not None
+
     def update_stats(self):
         cpu = self.process.cpu_percent()
         mem = self.process.memory_info().rss / max(psutil.virtual_memory().total, 1) * 100
@@ -2429,57 +2466,33 @@ class MainWin(QMainWindow):
         gpu_temp = 0.0
         gpu_power = 0.0
         gpu_fan = 0.0
+        gpu_data_available = False
         if torch.cuda.is_available():
-            if not self.nvml_checked and pynvml is not None:
-                try:
-                    pynvml.nvmlInit()
-                    if pynvml.nvmlDeviceGetCount() > 0:
-                        self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                except Exception:
-                    self.nvml_handle = None
-                self.nvml_checked = True
-            if self.nvml_handle is not None:
+            used_nvml = False
+            if self.ensure_nvml_handle():
                 try:
                     util = pynvml.nvmlDeviceGetUtilizationRates(self.nvml_handle)
                     mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.nvml_handle)
-                    gpu_u = float(util.gpu)
-                    vram_u = mem_info.used / (1024 * 1024)
-                    vram_t = max(mem_info.total / (1024 * 1024), 1)
                     gpu_temp = float(pynvml.nvmlDeviceGetTemperature(self.nvml_handle, pynvml.NVML_TEMPERATURE_GPU))
                     gpu_power = float(pynvml.nvmlDeviceGetPowerUsage(self.nvml_handle)) / 1000.0
                     gpu_fan = float(pynvml.nvmlDeviceGetFanSpeed(self.nvml_handle))
-                    gpu_display = f"{gpu_u}%"
-                    vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
+                    gpu_u = float(util.gpu)
+                    vram_u = mem_info.used / (1024 * 1024)
+                    vram_t = max(mem_info.total / (1024 * 1024), 1)
+                    used_nvml = True
+                    gpu_data_available = True
+                except Exception:
+                    used_nvml = False
+            if not used_nvml and self.nvidia_thread is not None:
+                try:
+                    gpu_u, vram_u, vram_t, gpu_temp, gpu_power, gpu_fan = self.nvidia_thread.result
+                    vram_t = max(vram_t, 1.0)
+                    gpu_data_available = True
                 except Exception:
                     pass
-            elif not self.nvidia_smi_checked:
-                self.nvidia_smi_checked = True
-                try:
-                    subprocess.check_output([
-                        "nvidia-smi",
-                        "--query-gpu=utilization.gpu,memory.used,memory.total",
-                        "--format=csv,noheader,nounits"
-                    ], stderr=subprocess.DEVNULL)
-                    self.nvidia_smi_available = True
-                except Exception:
-                    self.nvidia_smi_available = False
-            if self.nvidia_smi_available and self.nvml_handle is None:
-                try:
-                    out = subprocess.check_output([
-                        "nvidia-smi",
-                        "--query-gpu=utilization.gpu,memory.used,memory.total",
-                        "--format=csv,noheader,nounits"
-                    ], stderr=subprocess.DEVNULL, text=True).strip()
-                    if out:
-                        parts = out.split('\n')[0].split(',')
-                        if len(parts) >= 3:
-                            gpu_u = float(parts[0].strip())
-                            vram_u = float(parts[1].strip())
-                            vram_t = max(float(parts[2].strip()), 1.0)
-                            gpu_display = f"{gpu_u}%"
-                            vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
-                except Exception:
-                    pass
+            if gpu_data_available:
+                gpu_display = f"{gpu_u:.0f}%"
+                vram_display = f"{vram_u/1024:.1f}/{vram_t/1024:.1f}GB"
 
         scale = SCALE_PERCENT
         if platform.system() == 'Windows':
