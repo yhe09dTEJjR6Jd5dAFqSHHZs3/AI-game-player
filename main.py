@@ -717,6 +717,8 @@ class SumTree:
         return res_idx if res_idx < self.size else self.size - 1
 
 class ExperiencePool(Dataset):
+    change_trace = []
+
     def __init__(self):
         self.cache = {}
         self.cache_order = deque()
@@ -828,10 +830,15 @@ class ExperiencePool(Dataset):
             return max(0.05, action_boost * novelty_boost * complexity_boost * err_boost)
         score = 0.0
         total = 0.0
+        if len(ExperiencePool.change_trace) != len(region_types):
+            ExperiencePool.change_trace = [0.0] * len(region_types)
+        momentum = 0.0
         for idx, t in enumerate(region_types):
             if idx < len(deltas):
-                d = deltas[idx]
+                d = float(deltas[idx])
                 total += abs(d)
+                ExperiencePool.change_trace[idx] = 0.85 * ExperiencePool.change_trace[idx] + 0.15 * d
+                momentum += abs(ExperiencePool.change_trace[idx])
                 if t == 'blue':
                     score += d
                 else:
@@ -839,7 +846,8 @@ class ExperiencePool(Dataset):
         norm = total + 1e-3
         direction = score / norm
         base = 1.0 + 0.5 * direction
-        magnitude = 1.0 + float(np.log1p(total))
+        consistency = clamp01(momentum / norm)
+        magnitude = 1.0 + float(np.log1p(0.7 * total + 0.3 * momentum)) * (0.7 + 0.6 * consistency)
         if score < 0:
             base *= 0.5
         reward_boost = base * magnitude
@@ -1135,6 +1143,7 @@ class OcrWorker(threading.Thread):
         self.last_update_time = []
         self.kalman_states = []
         self.kalman_time = []
+        self.history = deque(maxlen=32)
         self.tick = 0
         self.ocr = None
         self.latest_snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': None, 'ts': int(time.time() * 1000)}
@@ -1169,6 +1178,7 @@ class OcrWorker(threading.Thread):
         self.last_update_time = [now_ts] * len(self.regions)
         self.kalman_states = [{'x': 0.0, 'v': 0.0, 'p': 25.0} for _ in self.regions]
         self.kalman_time = [now_ts] * len(self.regions)
+        self.history.clear()
         with self.lock:
             self.latest_snapshot = {'values': [0]*len(self.regions), 'ages': [0]*len(self.regions), 'types': ['pred']*len(self.regions), 'frame_id': None, 'ts': int(now_ts * 1000)}
 
@@ -1265,6 +1275,45 @@ class OcrWorker(threading.Thread):
             snapshot['ages'] = ages if ages else snapshot.get('ages', [])
             return snapshot
 
+    def _compose_snapshot(self, values, types, frame_id, ts_ms, last_update):
+        ref_time = ts_ms / 1000.0
+        ages = [max(0, int((ref_time - t) * 1000)) for t in last_update] if last_update else []
+        return {'values': values, 'ages': ages, 'types': types, 'frame_id': frame_id, 'ts': ts_ms}
+
+    def get_for_timestamp(self, target_ts):
+        with self.lock:
+            hist = list(self.history)
+            last_update = list(self.last_update_time)
+        if not hist:
+            snap = self.get_latest()
+            snap['ts'] = target_ts
+            snap['ages'] = [max(0, int((target_ts/1000.0 - t) * 1000)) for t in last_update] if last_update else snap.get('ages', [])
+            return snap
+        hist = sorted(hist, key=lambda x: x.get('ts', 0))
+        if target_ts <= hist[0].get('ts', 0):
+            base = hist[0]
+            return self._compose_snapshot(list(base.get('values', [])), list(base.get('types', [])), base.get('frame_id'), target_ts, last_update)
+        if target_ts >= hist[-1].get('ts', 0):
+            base = hist[-1]
+            return self._compose_snapshot(list(base.get('values', [])), list(base.get('types', [])), base.get('frame_id'), target_ts, last_update)
+        for i in range(1, len(hist)):
+            t0 = hist[i-1].get('ts', 0)
+            t1 = hist[i].get('ts', 0)
+            if t0 <= target_ts <= t1 and t1 > t0:
+                r = (target_ts - t0) / float(t1 - t0)
+                v0 = list(hist[i-1].get('values', []))
+                v1 = list(hist[i].get('values', []))
+                m = max(len(v0), len(v1))
+                blended = []
+                for j in range(m):
+                    a0 = v0[j] if j < len(v0) else 0.0
+                    a1 = v1[j] if j < len(v1) else 0.0
+                    blended.append((1 - r) * a0 + r * a1)
+                types = list(hist[i-1].get('types', [])) if r < 0.5 else list(hist[i].get('types', []))
+                return self._compose_snapshot(blended, types, hist[i].get('frame_id'), target_ts, last_update)
+        latest = hist[-1]
+        return self._compose_snapshot(list(latest.get('values', [])), list(latest.get('types', [])), latest.get('frame_id'), target_ts, last_update)
+
     def process_frame(self, frame_id, frame):
         self.tick += 1
         now = time.time()
@@ -1272,7 +1321,10 @@ class OcrWorker(threading.Thread):
         ocr_types = []
         if not self.regions:
             with self.lock:
-                self.latest_snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': frame_id, 'ts': int(now * 1000)}
+                ts_ms = int(now * 1000)
+                snap = {'values': [], 'ages': [], 'types': [], 'frame_id': frame_id, 'ts': ts_ms}
+                self.latest_snapshot = snap
+                self.history.append(snap)
             return
         scale_factor = SCALE_PERCENT / 100.0
         for idx, r in enumerate(self.regions):
@@ -1324,7 +1376,10 @@ class OcrWorker(threading.Thread):
                 ocr_vals.append(self.prev_vals[idx] if idx < len(self.prev_vals) else 0)
                 ocr_types.append('pred')
         with self.lock:
-            self.latest_snapshot = {'values': ocr_vals, 'ages': [], 'types': ocr_types, 'frame_id': frame_id, 'ts': int(now * 1000)}
+            ts_ms = int(now * 1000)
+            snap = {'values': ocr_vals, 'ages': [], 'types': ocr_types, 'frame_id': frame_id, 'ts': ts_ms}
+            self.latest_snapshot = snap
+            self.history.append(snap)
 
     def run(self):
         while self.running:
@@ -1440,7 +1495,7 @@ class DataWorker(QThread):
                 continue
             try:
                 data = self.queue.get(timeout=0.1)
-                full_img, small_img, frame_id, mx, my, click, source, save, prediction_error = data
+                full_img, small_img, frame_id, frame_ts, mx, my, click, source, save, prediction_error = data
                 now = time.time()
                 if self.prev_time is None:
                     self.prev_time = now
@@ -1460,26 +1515,28 @@ class DataWorker(QThread):
                 if self.prev_small is not None:
                     diff = small_img.astype(np.float32) - self.prev_small.astype(np.float32)
                     novelty = clamp01(float(np.mean(diff * diff)) / (255.0 * 255.0) * 3.0)
-                self.prev_small = small_img.copy()
+                    self.prev_small = small_img.copy()
                 self.prev_pos = (mx, my)
                 self.prev_vel = (vel_x, vel_y)
                 self.prev_time = now
                 if self.ocr_worker is not None:
                     self.ocr_worker.submit_frame(frame_id, full_img)
-                    snapshot = self.ocr_worker.get_latest()
+                    snapshot = self.ocr_worker.get_for_timestamp(frame_ts)
                 else:
                     snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': None}
                 ocr_vals = snapshot.get('values', [])
                 ocr_ages = snapshot.get('ages', [])
                 ocr_types = snapshot.get('types', [])
                 snap_frame = snapshot.get('frame_id') if isinstance(snapshot, dict) else None
-                emit_frame_id = snap_frame if snap_frame is not None else frame_id
-                self.ocr_result.emit({'values': ocr_vals, 'ages': ocr_ages, 'types': ocr_types, 'frame_id': emit_frame_id, 'ts': int(time.time() * 1000)})
+                emit_frame_id = frame_id
+                ocr_ts = snapshot.get('ts', frame_ts) if isinstance(snapshot, dict) else frame_ts
+                self.ocr_result.emit({'values': ocr_vals, 'ages': ocr_ages, 'types': ocr_types, 'frame_id': emit_frame_id, 'ts': ocr_ts, 'ocr_frame_id': snap_frame})
                 if save:
                     ts = int(time.time() * 1000)
                     meta = {
                         'frame_id': frame_id,
                         'ts': ts,
+                        'frame_ts': frame_ts,
                         'img': '',
                         'mx': mx,
                         'my': my,
@@ -1488,6 +1545,8 @@ class DataWorker(QThread):
                         'ocr': [float(v) for v in ocr_vals],
                         'ocr_age': [float(a) for a in ocr_ages],
                         'ocr_types': ocr_types,
+                        'ocr_ts': ocr_ts,
+                        'ocr_frame_id': snap_frame,
                         'novelty': float(novelty),
                         'complexity': float(complexity),
                         'prediction_error': float(prediction_error)
@@ -1722,6 +1781,12 @@ class MainWin(QMainWindow):
         self.latest_frame_id = 0
         self.high_latency_streak = 0
         self.resolution_scaled = False
+        self.default_input = (INPUT_W, INPUT_H)
+        self.low_latency_streak = 0
+        self.last_scale_change = time.time()
+        self.last_load = 0.0
+        self.last_vram_ratio = 0.0
+        self.last_backlog = 0
         self.press_thresh = 0.7
         self.release_thresh = 0.3
         self.min_press = 0.12
@@ -2017,21 +2082,44 @@ class MainWin(QMainWindow):
             return self.ocr_frame_map[max(candidates)]
         return self.latest_ocr
 
-    def maybe_scale_down_resolution(self):
-        if self.resolution_scaled:
-            return
-        if self.loop_latency_ms > 100.0:
-            self.high_latency_streak += 1
+    def maybe_adjust_resolution(self):
+        now = time.time()
+        load = self.last_load
+        vram_ratio = self.last_vram_ratio
+        backlog = self.last_backlog
+        if not self.resolution_scaled:
+            pressure = self.loop_latency_ms > 100.0 or load > 92.0 or backlog > 250 or vram_ratio >= 0.92
+            if pressure:
+                self.high_latency_streak += 1
+            else:
+                self.high_latency_streak = max(0, self.high_latency_streak - 1)
+            if self.high_latency_streak >= 3 and now - self.last_scale_change > 1.0:
+                update_input_resolution(max(80, INPUT_W // 2), max(45, INPUT_H // 2))
+                self.seq_frames.clear()
+                self.seq_ocr.clear()
+                self.ocr_frame_map.clear()
+                self.resolution_scaled = True
+                self.high_latency_streak = 0
+                self.low_latency_streak = 0
+                self.last_scale_change = now
+                self.path_planner.reset((self.smooth_x, self.smooth_y))
         else:
-            self.high_latency_streak = 0
-        if self.high_latency_streak >= 3:
-            update_input_resolution(max(80, INPUT_W // 2), max(45, INPUT_H // 2))
-            self.seq_frames.clear()
-            self.seq_ocr.clear()
-            self.ocr_frame_map.clear()
-            self.resolution_scaled = True
-            self.high_latency_streak = 0
-            self.path_planner.reset((self.smooth_x, self.smooth_y))
+            perf_ok = self.loop_latency_ms < 70.0 and load < 65.0 and backlog < 80 and vram_ratio < 0.7
+            if perf_ok:
+                self.low_latency_streak += 1
+            else:
+                self.low_latency_streak = 0
+            if self.low_latency_streak >= 8 and now - self.last_scale_change > 3.0:
+                target_w, target_h = self.default_input
+                update_input_resolution(target_w, target_h)
+                self.seq_frames.clear()
+                self.seq_ocr.clear()
+                self.ocr_frame_map.clear()
+                self.resolution_scaled = False
+                self.low_latency_streak = 0
+                self.high_latency_streak = 0
+                self.last_scale_change = now
+                self.path_planner.reset((self.smooth_x, self.smooth_y))
 
     def update_stats(self):
         cpu = self.process.cpu_percent()
@@ -2097,6 +2185,10 @@ class MainWin(QMainWindow):
         pause_worker = load > 95 or (torch.cuda.is_available() and (vram_u / vram_t) * 100 >= 95) or backlog > 200
         self.worker.set_paused(pause_worker)
 
+        self.last_load = load
+        self.last_vram_ratio = (vram_u / vram_t) if vram_t else 0.0
+        self.last_backlog = backlog
+
         for l, v in zip([self.d_cpu, self.d_mem, self.d_gpu, self.d_vram], [cpu, mem, gpu_u, (vram_u/vram_t)*100 if vram_t else 0]):
             l.pop(0)
             l.append(v)
@@ -2137,6 +2229,7 @@ class MainWin(QMainWindow):
             if self.prev_capture_ts is not None:
                 self.frame_interval_ms = (cap_start - self.prev_capture_ts) * 1000.0
             self.prev_capture_ts = cap_start
+            frame_ts = int(cap_start * 1000)
             frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
             self.frame_counter += 1
             frame_id = self.frame_counter
@@ -2249,11 +2342,11 @@ class MainWin(QMainWindow):
                 except queue.Empty:
                     pass
             try:
-                self.queue.put_nowait((frame, small, frame_id, nx, ny, click, source, save, prediction_error))
+                self.queue.put_nowait((frame, small, frame_id, frame_ts, nx, ny, click, source, save, prediction_error))
             except queue.Full:
                 pass
             self.loop_latency_ms = (time.time() - loop_start) * 1000.0
-            self.maybe_scale_down_resolution()
+            self.maybe_adjust_resolution()
 
         except Exception: pass
 
