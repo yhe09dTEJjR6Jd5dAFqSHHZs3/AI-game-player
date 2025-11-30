@@ -1209,6 +1209,7 @@ class OcrWorker(threading.Thread):
         self.last_update_time = []
         self.kalman_states = []
         self.kalman_time = []
+        self.start_ts = time.time()
         self.history = deque(maxlen=32)
         self.tick = 0
         self.ocr = None
@@ -1241,6 +1242,7 @@ class OcrWorker(threading.Thread):
         self.last_read_tick = [0] * len(self.regions)
         self.stable_counts = [0] * len(self.regions)
         now_ts = time.time()
+        self.start_ts = now_ts
         self.last_update_time = [now_ts] * len(self.regions)
         self.kalman_states = [{'x': 0.0, 'v': 0.0, 'p': 25.0} for _ in self.regions]
         self.kalman_time = [now_ts] * len(self.regions)
@@ -1255,9 +1257,10 @@ class OcrWorker(threading.Thread):
         pred_x = state['x'] + state['v'] * dt
         pred_p = state['p'] + (dt * 8.0) ** 2
         observation_used = False
+        is_warmup = (now - self.start_ts) < 10.0
         if measurement is not None:
             meas_val, meas_conf = measurement
-            if prev_v is not None and abs(float(meas_val) - float(prev_v)) > OCR_JUMP_THRESHOLD and meas_conf < 0.9:
+            if not is_warmup and prev_v is not None and abs(float(meas_val) - float(prev_v)) > OCR_JUMP_THRESHOLD and meas_conf < 0.9:
                 meas_val = None
             else:
                 meas_val = float(meas_val)
@@ -1396,6 +1399,7 @@ class OcrWorker(threading.Thread):
     def process_frame(self, frame_id, frame):
         self.tick += 1
         now = time.time()
+        is_warmup = (now - self.start_ts) < 10.0
         ocr_vals = []
         ocr_types = []
         if not self.regions:
@@ -1454,7 +1458,7 @@ class OcrWorker(threading.Thread):
                 self.histories[idx].append(filtered)
                 smoothed = int(round(float(np.median(self.histories[idx])))) if self.histories[idx] else filtered
                 stable = self.stable_counts[idx] if idx < len(self.stable_counts) else 0
-                if prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
+                if not is_warmup and prev_v is not None and abs(smoothed - prev_v) > 1 and diff < 0.01 and stable < 5:
                     smoothed = prev_v
                 final_v = max(0, smoothed)
                 if idx < len(self.prev_vals):
