@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import json
+import lmdb
 import math
 import random
 import threading
@@ -46,16 +47,17 @@ BASE_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "AAA")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 IMG_DIR = os.path.join(DATA_DIR, "images")
 MODEL_DIR = os.path.join(BASE_DIR, "models")
-LOG_FILE = os.path.join(DATA_DIR, "data.csv")
+LOG_DB = os.path.join(DATA_DIR, "data.lmdb")
+LOG_INDEX_FILE = os.path.join(DATA_DIR, "index.meta")
 REGION_FILE = os.path.join(BASE_DIR, "regions.json")
 PRIORITY_FILE = os.path.join(DATA_DIR, "priorities.npy")
 
 for d in [BASE_DIR, DATA_DIR, IMG_DIR, MODEL_DIR]:
     os.makedirs(d, exist_ok=True)
 
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, 'w', encoding='utf-8') as f:
-        f.write("timestamp,img_path,mx,my,click,source,ocr,ocr_age,novelty,complexity\n")
+if not os.path.exists(LOG_DB):
+    env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 2, subdir=True, max_dbs=1, lock=False)
+    env.close()
 
 if not os.path.exists(REGION_FILE):
     with open(REGION_FILE, 'w', encoding='utf-8') as f:
@@ -72,7 +74,7 @@ CACHE_MAX_BYTES = 256 * 1024 * 1024
 pynvml = None
 POOL_DATA_CACHE = deque()
 POOL_TOTAL_BYTES_CACHE = 0
-POOL_LAST_READ_POS = 0
+POOL_LAST_KEY = -1
 POOL_PREV_VALS_CACHE = []
 POOL_REGION_SIGNATURE = None
 POOL_LOCK = threading.Lock()
@@ -122,6 +124,34 @@ def get_free_vram_bytes():
             return 0.0
     return 0.0
 
+def encode_key(v):
+    return int(v).to_bytes(8, byteorder='big', signed=False)
+
+def decode_key(b):
+    return int.from_bytes(b, byteorder='big', signed=False)
+
+def atomic_write_text(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(str(text))
+    os.replace(tmp, path)
+
+def read_index_value(env):
+    if os.path.exists(LOG_INDEX_FILE):
+        try:
+            with open(LOG_INDEX_FILE, 'r', encoding='utf-8') as f:
+                return int(f.read().strip() or '0')
+        except Exception:
+            pass
+    try:
+        with env.begin(write=False) as txn:
+            cur = txn.cursor()
+            if cur.last():
+                return decode_key(cur.key()) + 1
+    except Exception:
+        pass
+    return 0
+
 SCREEN_W, SCREEN_H, SCREEN_LEFT, SCREEN_TOP = get_screen_size()
 LB_SCALE, LB_LEFT, LB_TOP, LB_W, LB_H = compute_letterbox_params(SCREEN_W, SCREEN_H, INPUT_W, INPUT_H)
 SCALE_PERCENT = 100
@@ -151,6 +181,37 @@ def letter_norm_to_screen(nx, ny):
     sx = max(SCREEN_LEFT, min(SCREEN_LEFT + SCREEN_W - 1, sx))
     sy = max(SCREEN_TOP, min(SCREEN_TOP + SCREEN_H - 1, sy))
     return sx, sy
+
+class PathPlanner:
+    def __init__(self):
+        self.path = deque()
+        self.current = (0.5, 0.5)
+
+    def reset(self, pos=None):
+        self.path.clear()
+        if pos is not None:
+            self.current = (clamp01(pos[0]), clamp01(pos[1]))
+
+    def plan(self, start, target, velocity):
+        sx, sy = clamp01(start[0]), clamp01(start[1])
+        tx, ty = clamp01(target[0]), clamp01(target[1])
+        vx, vy = clamp01(0.5 + 0.5 * velocity[0]) - 0.5, clamp01(0.5 + 0.5 * velocity[1]) - 0.5
+        c1 = (sx + vx * 0.4, sy + vy * 0.4)
+        c2 = (tx - vx * 0.3, ty - vy * 0.3)
+        self.path.clear()
+        for t in np.linspace(0.0, 1.0, 8):
+            a = 1 - t
+            px = a * a * a * sx + 3 * a * a * t * c1[0] + 3 * a * t * t * c2[0] + t * t * t * tx
+            py = a * a * a * sy + 3 * a * a * t * c1[1] + 3 * a * t * t * c2[1] + t * t * t * ty
+            self.path.append((clamp01(px), clamp01(py)))
+
+    def next_point(self):
+        if self.path:
+            self.current = self.path.popleft()
+        return self.current
+
+    def idle(self):
+        return len(self.path) == 0
 
 def pack_ocr(vals, deltas=None, ages=None):
     buf = [0]*MAX_OCR
@@ -343,45 +404,40 @@ class ExperiencePool(Dataset):
             return []
 
     def load_data(self):
-        global POOL_DATA_CACHE, POOL_TOTAL_BYTES_CACHE, POOL_LAST_READ_POS, POOL_PREV_VALS_CACHE, POOL_REGION_SIGNATURE
+        global POOL_DATA_CACHE, POOL_TOTAL_BYTES_CACHE, POOL_LAST_KEY, POOL_PREV_VALS_CACHE, POOL_REGION_SIGNATURE
         try:
             with POOL_LOCK:
                 region_sig = tuple(self.region_types)
                 if POOL_REGION_SIGNATURE != region_sig:
                     POOL_DATA_CACHE = deque()
                     POOL_TOTAL_BYTES_CACHE = 0
-                    POOL_LAST_READ_POS = 0
+                    POOL_LAST_KEY = -1
                     POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
                     POOL_REGION_SIGNATURE = region_sig
-                if not os.path.exists(LOG_FILE):
+                if not os.path.exists(LOG_DB):
                     return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
-                file_size = os.path.getsize(LOG_FILE)
-                if file_size < POOL_LAST_READ_POS:
-                    POOL_DATA_CACHE = deque()
-                    POOL_TOTAL_BYTES_CACHE = 0
-                    POOL_LAST_READ_POS = 0
-                    POOL_PREV_VALS_CACHE = [0] * len(self.region_types)
-                with open(LOG_FILE, 'r', encoding='utf-8') as f:
-                    if POOL_LAST_READ_POS == 0:
-                        f.readline()
-                    else:
-                        f.seek(POOL_LAST_READ_POS)
-                    while True:
-                        line = f.readline()
-                        if not line:
-                            break
-                        parts = line.strip().split(',')
-                        if len(parts) < 6:
+                env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 2, subdir=True, max_dbs=1, readonly=True, lock=False, readahead=False)
+                with env.begin(write=False) as txn:
+                    cur = txn.cursor()
+                    start_key = encode_key(POOL_LAST_KEY + 1) if POOL_LAST_KEY >= 0 else None
+                    has = cur.set_range(start_key) if start_key is not None else cur.first()
+                    while has:
+                        try:
+                            meta = json.loads(cur.value().decode('utf-8'))
+                        except Exception:
+                            has = cur.next()
                             continue
                         try:
-                            ts = int(parts[0])
-                            img_path = parts[1]
-                            mx, my, click = float(parts[2]), float(parts[3]), float(parts[4])
-                            ocr_vals = [float(x) for x in parts[6].split('|') if x != ''] if len(parts) >= 7 else []
-                            ocr_age = [float(x) for x in parts[7].split('|') if x != ''] if len(parts) >= 8 else [0.0] * len(ocr_vals)
-                            novelty = float(parts[8]) if len(parts) >= 9 else 0.0
-                            complexity = float(parts[9]) if len(parts) >= 10 else 0.0
+                            ts = int(meta.get('ts', 0))
+                            img_path = meta.get('img', '')
+                            mx, my, click = float(meta.get('mx', 0.0)), float(meta.get('my', 0.0)), float(meta.get('click', 0.0))
+                            ocr_vals = [float(x) for x in meta.get('ocr', [])]
+                            ocr_age = [float(x) for x in meta.get('ocr_age', [])]
+                            novelty = float(meta.get('novelty', 0.0))
+                            complexity = float(meta.get('complexity', 0.0))
+                            pred_err = float(meta.get('prediction_error', 0.0))
                         except Exception:
+                            has = cur.next()
                             continue
                         cur_vals = ocr_vals[:len(self.region_types)] + [0] * max(0, len(self.region_types) - len(ocr_vals))
                         deltas = [cur_vals[i] - (POOL_PREV_VALS_CACHE[i] if i < len(POOL_PREV_VALS_CACHE) else 0) for i in range(len(self.region_types))]
@@ -390,17 +446,19 @@ class ExperiencePool(Dataset):
                             deltas = cur_vals
                         POOL_PREV_VALS_CACHE = cur_vals
                         feat = pack_ocr(ocr_vals, deltas, ocr_age)
-                        weight = self.calc_weight(ocr_vals, deltas, click, novelty, complexity)
+                        weight = self.calc_weight(ocr_vals, deltas, click, novelty, complexity, pred_err)
                         size = 512
                         if os.path.exists(img_path):
                             size += os.path.getsize(img_path)
-                        entry = {'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size}
+                        entry = {'ts': ts, 'img': img_path, 'mx': mx, 'my': my, 'click': click, 'ocr': feat, 'weight': weight, 'size': size, 'prediction_error': pred_err}
                         POOL_DATA_CACHE.append(entry)
                         POOL_TOTAL_BYTES_CACHE += size
                         while POOL_TOTAL_BYTES_CACHE > POOL_MAX_BYTES and POOL_DATA_CACHE:
                             dropped = POOL_DATA_CACHE.popleft()
                             POOL_TOTAL_BYTES_CACHE -= dropped.get('size', 0)
-                    POOL_LAST_READ_POS = f.tell()
+                        POOL_LAST_KEY = decode_key(cur.key())
+                        has = cur.next()
+                env.close()
                 return list(POOL_DATA_CACHE), POOL_TOTAL_BYTES_CACHE
         except Exception:
             return [], 0
@@ -461,14 +519,16 @@ class ExperiencePool(Dataset):
         scaled = (base * (float(self.priorities[idx]) + 1e-3)) ** 1.2
         return float(max(scaled, 1e-3))
 
-    def calc_weight(self, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0):
+    def calc_weight(self, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0, prediction_error=0.0):
         action_boost = 1.0 + 1.5 * abs(click)
         novelty = float(clamp01(novelty))
         complexity = float(clamp01(complexity))
         novelty_boost = 1.0 + 2.0 * novelty
         complexity_boost = 1.0 + 2.0 * complexity
+        err = float(max(prediction_error, 0.0))
+        err_boost = 1.0 + min(err, 5.0)
         if not self.region_types or not ocr:
-            return max(0.05, action_boost * novelty_boost * complexity_boost)
+            return max(0.05, action_boost * novelty_boost * complexity_boost * err_boost)
         score = 0.0
         total = 0.0
         for idx, t in enumerate(self.region_types):
@@ -486,7 +546,7 @@ class ExperiencePool(Dataset):
         if score < 0:
             base *= 0.5
         reward_boost = base * magnitude
-        return max(0.05, reward_boost * action_boost * novelty_boost * complexity_boost)
+        return max(0.05, reward_boost * action_boost * novelty_boost * complexity_boost * err_boost)
 
     def cache_image(self, path):
         if path in self.cache:
@@ -671,8 +731,14 @@ class SaveWorker(threading.Thread):
         super().__init__(daemon=True)
         self.q = queue.Queue(maxsize=256)
         self.running = True
+        self.buffer = []
+        self.buffer_bytes = 0
+        self.flush_threshold = 4096
+        self.last_flush = time.time()
+        self.env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 2, subdir=True, max_dbs=1, lock=True)
+        self.next_id = read_index_value(self.env)
 
-    def enqueue(self, path, img, log_line):
+    def enqueue(self, path, img, meta):
         if self.q.full():
             try:
                 self.q.get_nowait()
@@ -680,25 +746,45 @@ class SaveWorker(threading.Thread):
             except queue.Empty:
                 return
         try:
-            self.q.put_nowait((path, img, log_line))
+            self.q.put_nowait((path, img, meta))
         except queue.Full:
             pass
+
+    def flush_buffer(self):
+        if not self.buffer:
+            return
+        try:
+            with self.env.begin(write=True) as txn:
+                for path, img, meta in self.buffer:
+                    try:
+                        cv2.imwrite(path, img)
+                    except Exception:
+                        continue
+                    meta['id'] = self.next_id
+                    data = json.dumps(meta, ensure_ascii=False).encode('utf-8')
+                    txn.put(encode_key(self.next_id), data)
+                    self.next_id += 1
+            atomic_write_text(LOG_INDEX_FILE, str(self.next_id))
+        except Exception:
+            pass
+        self.buffer.clear()
+        self.buffer_bytes = 0
+        self.last_flush = time.time()
 
     def run(self):
         while self.running or not self.q.empty():
             try:
-                path, img, log_line = self.q.get(timeout=0.1)
-                try:
-                    cv2.imwrite(path, img)
-                except Exception:
-                    pass
-                try:
-                    with open(LOG_FILE, 'a', encoding='utf-8') as f:
-                        f.write(log_line)
-                except Exception:
-                    pass
+                path, img, meta = self.q.get(timeout=0.1)
+                payload = json.dumps(meta, ensure_ascii=False)
+                self.buffer.append((path, img, meta))
+                self.buffer_bytes += len(payload.encode('utf-8')) + img.nbytes
+                now = time.time()
+                if self.buffer_bytes >= self.flush_threshold or now - self.last_flush >= 1.0:
+                    self.flush_buffer()
                 self.q.task_done()
             except queue.Empty:
+                if time.time() - self.last_flush >= 1.0:
+                    self.flush_buffer()
                 continue
 
     def stop(self):
@@ -709,6 +795,12 @@ class SaveWorker(threading.Thread):
                 self.q.task_done()
             except queue.Empty:
                 break
+        self.flush_buffer()
+        try:
+            self.env.sync()
+            self.env.close()
+        except Exception:
+            pass
 
 class NvidiaSmiThread(threading.Thread):
     def __init__(self):
@@ -888,7 +980,7 @@ class DataWorker(QThread):
                 continue
             try:
                 data = self.queue.get(timeout=0.1)
-                full_img, small_img, mx, my, click, source, save = data
+                full_img, small_img, mx, my, click, source, save, prediction_error = data
                 self.tick += 1
                 now = time.time()
                 if self.prev_time is None:
@@ -981,13 +1073,23 @@ class DataWorker(QThread):
                     self.ocr_result.emit({'values': [], 'ages': [], 'ts': int(time.time() * 1000)})
 
                 if save:
-                    ts = str(int(time.time() * 1000))
+                    ts = int(time.time() * 1000)
                     name = f"{ts}.jpg"
                     path = os.path.join(IMG_DIR, name)
-                    ocr_txt = "|".join([str(int(v)) for v in ocr_vals]) if ocr_vals else ""
-                    age_txt = "|".join([str(int(a)) for a in ocr_ages]) if ocr_ages else ""
-                    log_line = f"{ts},{path},{mx:.5f},{my:.5f},{click:.2f},{source},{ocr_txt},{age_txt},{novelty:.6f},{complexity:.6f}\n"
-                    self.save_worker.enqueue(path, small_img, log_line)
+                    meta = {
+                        'ts': ts,
+                        'img': path,
+                        'mx': mx,
+                        'my': my,
+                        'click': click,
+                        'source': source,
+                        'ocr': [float(v) for v in ocr_vals],
+                        'ocr_age': [float(a) for a in ocr_ages],
+                        'novelty': float(novelty),
+                        'complexity': float(complexity),
+                        'prediction_error': float(prediction_error)
+                    }
+                    self.save_worker.enqueue(path, full_img, meta)
 
                 self.queue.task_done()
             except queue.Empty:
@@ -1193,6 +1295,8 @@ class MainWin(QMainWindow):
 
         self.mode = "LEARNING"
         self.smooth_x, self.smooth_y = 0.5, 0.5
+        self.path_planner = PathPlanner()
+        self.last_target = (0.5, 0.5)
         self.dragging = False
         self.last_record = 0
         self.mouse_pressed = False
@@ -1670,6 +1774,7 @@ class MainWin(QMainWindow):
             nx, ny = screen_to_letter_norm(mx, my)
             click = 1.0 if self.mouse_pressed else 0.0
             source = "USER"
+            prediction_error = 0.0
 
             if self.mode == "TRAINING":
                 seq_imgs = list(self.seq_frames)
@@ -1701,8 +1806,16 @@ class MainWin(QMainWindow):
                 target_y = 0.5 * (base_y + delta_y)
                 conf = float(torch.softmax(logits, dim=1)[0].max().cpu())
                 blend = 0.3 + 0.7 * conf
-                self.smooth_x = (1 - blend) * self.smooth_x + blend * target_x
-                self.smooth_y = (1 - blend) * self.smooth_y + blend * target_y
+                planned_target_x = (1 - blend) * self.smooth_x + blend * target_x
+                planned_target_y = (1 - blend) * self.smooth_y + blend * target_y
+                target_pair = (planned_target_x, planned_target_y)
+                dist = ((target_pair[0] - self.last_target[0]) ** 2 + (target_pair[1] - self.last_target[1]) ** 2) ** 0.5
+                if self.path_planner.idle() or dist >= 0.005:
+                    self.path_planner.plan((self.smooth_x, self.smooth_y), target_pair, (dx, dy))
+                    self.last_target = target_pair
+                nx, ny = self.path_planner.next_point()
+                self.smooth_x, self.smooth_y = nx, ny
+                prediction_error = float(-math.log(max(conf, 1e-6)))
 
                 if self.stop_flag.is_set() or self.mode != "TRAINING":
                     return
@@ -1739,6 +1852,8 @@ class MainWin(QMainWindow):
                 source = "AI"
             else:
                 self.smooth_x, self.smooth_y = nx, ny
+                self.path_planner.reset((self.smooth_x, self.smooth_y))
+                self.last_target = (self.smooth_x, self.smooth_y)
                 if self.dragging:
                     self.mouse.release(mouse.Button.left)
                     self.dragging = False
@@ -1759,7 +1874,7 @@ class MainWin(QMainWindow):
                 except queue.Empty:
                     pass
             try:
-                self.queue.put_nowait((frame, small, nx, ny, click, source, save))
+                self.queue.put_nowait((frame, small, nx, ny, click, source, save, prediction_error))
             except queue.Full:
                 pass
             self.loop_latency_ms = (time.time() - loop_start) * 1000.0
