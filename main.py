@@ -1336,8 +1336,8 @@ class DataWorker(QThread):
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             min_side = min(gray.shape[:2])
             scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
-            proc = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            _, proc = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            proc = cv2.copyMakeBorder(resized, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
             proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
             with self.ocr_lock:
                 if self.ocr is None:
