@@ -1337,12 +1337,14 @@ class DataWorker(QThread):
             min_side = min(gray.shape[:2])
             scale = 3 if min_side < 40 else 2 if min_side < 80 else 1
             resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            proc = cv2.copyMakeBorder(resized, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
+            blurred = cv2.medianBlur(resized, 3)
+            binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+            proc = cv2.copyMakeBorder(binary, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
             proc = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
             with self.ocr_lock:
                 if self.ocr is None:
                     return None
-                result = self.ocr.ocr(proc, cls=False)
+                result = self.ocr.ocr(proc, det=False, cls=False)
             digits = ''
             best_conf = 0.0
             if result and len(result) > 0:
@@ -1404,9 +1406,20 @@ class DataWorker(QThread):
                 if self.regions:
                     for idx, r in enumerate(self.regions):
                         try:
-                            roi = full_img[r['y']:r['y']+r['h'], r['x']:r['x']+r['w']]
-                            if roi.size == 0:
+                            scale_factor = SCALE_PERCENT / 100.0
+                            px = int(round(r['x'] * scale_factor))
+                            py = int(round(r['y'] * scale_factor))
+                            pw = int(round(r['w'] * scale_factor))
+                            ph = int(round(r['h'] * scale_factor))
+                            if pw <= 0 or ph <= 0:
                                 raise ValueError
+                            x1 = max(0, px)
+                            y1 = max(0, py)
+                            x2 = min(full_img.shape[1], px + pw)
+                            y2 = min(full_img.shape[0], py + ph)
+                            if x2 <= x1 or y2 <= y1:
+                                raise ValueError
+                            roi = full_img[y1:y2, x1:x2]
                             if idx >= len(self.prev_rois):
                                 self.prev_rois.append(None)
                                 self.prev_vals.append(None)
