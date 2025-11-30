@@ -1243,16 +1243,17 @@ class OcrWorker(threading.Thread):
         if result and len(result) > 0 and result[0]:
             texts = []
             for item in result[0]:
-                if not item or len(item) < 2:
+                if not item:
                     continue
-                text_info = item[1]
-                if len(text_info) < 2:
+                if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], (list, tuple)) and len(item[1]) >= 2:
+                    text, conf = item[1][0], float(item[1][1])
+                elif isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[0], str):
+                    text, conf = item[0], float(item[1])
+                else:
                     continue
-                text, conf = text_info[0], float(text_info[1])
                 texts.append(text)
                 best_conf = max(best_conf, conf)
             merged = ''.join(texts)
-            # 强化正则匹配，支持整数和小数，允许逗号分隔
             m = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", merged)
             if m:
                 try:
