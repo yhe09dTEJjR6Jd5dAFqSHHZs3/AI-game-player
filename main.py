@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import gc
 from torch.utils.data import Dataset
 from pynput import mouse, keyboard
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -88,6 +89,37 @@ def load_pynvml():
             continue
     pynvml = None
 
+def set_high_priority():
+    try:
+        p = psutil.Process(os.getpid())
+        if platform.system() == 'Windows':
+            try:
+                p.nice(psutil.HIGH_PRIORITY_CLASS)
+            except Exception:
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+                except Exception:
+                    pass
+        else:
+            try:
+                p.nice(-10)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def reclaim_memory():
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
 class CtypesMouse:
     def __init__(self):
         import ctypes
@@ -110,6 +142,11 @@ class CtypesMouse:
         self.MOUSEEVENTF_LEFTDOWN = 0x0002
         self.MOUSEEVENTF_LEFTUP = 0x0004
         self.POINT = wintypes.POINT
+        self.SM_XVIRTUALSCREEN = 76
+        self.SM_YVIRTUALSCREEN = 77
+        self.SM_CXVIRTUALSCREEN = 78
+        self.SM_CYVIRTUALSCREEN = 79
+        self.update_virtual_screen()
 
     @property
     def position(self):
@@ -122,11 +159,12 @@ class CtypesMouse:
         self.move_to(pos[0], pos[1])
 
     def move_to(self, x, y):
-        cx, cy = self.position
-        dx, dy = int(x - cx), int(y - cy)
-        if dx == 0 and dy == 0:
-            return
-        self._send(dx, dy, self.MOUSEEVENTF_MOVE)
+        self.update_virtual_screen()
+        vx = int(max(0, min(self.vscreen_w - 1, x - self.vscreen_left)))
+        vy = int(max(0, min(self.vscreen_h - 1, y - self.vscreen_top)))
+        norm_x = int(vx * 65535 / max(self.vscreen_w - 1, 1))
+        norm_y = int(vy * 65535 / max(self.vscreen_h - 1, 1))
+        self._send(norm_x, norm_y, self.MOUSEEVENTF_MOVE | self.MOUSEEVENTF_ABSOLUTE)
 
     def press(self, button):
         if button == mouse.Button.left:
@@ -135,6 +173,21 @@ class CtypesMouse:
     def release(self, button):
         if button == mouse.Button.left:
             self._send(0, 0, self.MOUSEEVENTF_LEFTUP)
+
+    def update_virtual_screen(self):
+        try:
+            self.vscreen_left = int(self.user32.GetSystemMetrics(self.SM_XVIRTUALSCREEN))
+            self.vscreen_top = int(self.user32.GetSystemMetrics(self.SM_YVIRTUALSCREEN))
+            self.vscreen_w = int(self.user32.GetSystemMetrics(self.SM_CXVIRTUALSCREEN))
+            self.vscreen_h = int(self.user32.GetSystemMetrics(self.SM_CYVIRTUALSCREEN))
+            if self.vscreen_w <= 0 or self.vscreen_h <= 0:
+                self.vscreen_left, self.vscreen_top = 0, 0
+                self.vscreen_w = SCREEN_W
+                self.vscreen_h = SCREEN_H
+        except Exception:
+            self.vscreen_left, self.vscreen_top = 0, 0
+            self.vscreen_w = SCREEN_W
+            self.vscreen_h = SCREEN_H
 
     def _send(self, dx, dy, flags):
         extra = self.ctypes.c_ulong(0)
@@ -428,6 +481,46 @@ def update_input_resolution(new_w, new_h):
 
 def clamp01(v):
     return max(0.0, min(1.0, v))
+
+def _normalize_value(raw, axis_len, dpr):
+    try:
+        val = float(raw)
+    except Exception:
+        return 0.0
+    if val <= 1.0:
+        return clamp01(val)
+    logical_limit = axis_len / max(dpr, 1.0)
+    physical = val * max(dpr, 1.0) if val <= logical_limit + 1 else val
+    physical = max(0.0, min(physical, axis_len))
+    return clamp01(physical / max(axis_len, 1.0))
+
+def normalize_region_entry(region):
+    dpr, _ = get_scale_ratio()
+    nx = _normalize_value(region.get('x', 0.0), SCREEN_W, dpr)
+    ny = _normalize_value(region.get('y', 0.0), SCREEN_H, dpr)
+    nw = _normalize_value(region.get('w', 0.0), SCREEN_W, dpr)
+    nh = _normalize_value(region.get('h', 0.0), SCREEN_H, dpr)
+    return {'type': region.get('type', 'red'), 'x': nx, 'y': ny, 'w': nw, 'h': nh}
+
+def normalized_to_physical(region):
+    rx = clamp01(region.get('x', 0.0)) * SCREEN_W
+    ry = clamp01(region.get('y', 0.0)) * SCREEN_H
+    rw = max(1, int(clamp01(region.get('w', 0.0)) * SCREEN_W))
+    rh = max(1, int(clamp01(region.get('h', 0.0)) * SCREEN_H))
+    return int(rx), int(ry), rw, rh
+
+def normalized_to_logical(region):
+    dpr, _ = get_scale_ratio()
+    rx, ry, rw, rh = normalized_to_physical(region)
+    return int(rx / max(dpr, 1.0)), int(ry / max(dpr, 1.0)), max(1, int(rw / max(dpr, 1.0))), max(1, int(rh / max(dpr, 1.0)))
+
+def logical_to_normalized(region):
+    dpr, _ = get_scale_ratio()
+    nx = _normalize_value(region.get('x', 0.0), SCREEN_W, dpr)
+    ny = _normalize_value(region.get('y', 0.0), SCREEN_H, dpr)
+    nw = _normalize_value(region.get('w', 0.0), SCREEN_W, dpr)
+    nh = _normalize_value(region.get('h', 0.0), SCREEN_H, dpr)
+    return {'type': region.get('type', 'red'), 'x': nx, 'y': ny, 'w': nw, 'h': nh}
 
 def screen_to_letter_norm(x, y):
     # 输入的是物理像素坐标
@@ -1190,6 +1283,7 @@ class OcrWorker(threading.Thread):
         self.q = queue.Queue(maxsize=1)
         self.lock = threading.Lock()
         self.regions = []
+        self.regions_phys = []
         self.last_update_time = []
         self.start_ts = time.time()
         self.ocr = None
@@ -1211,9 +1305,14 @@ class OcrWorker(threading.Thread):
     def reload_regions(self):
         try:
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
-                self.regions = json.load(f)
+                raw = json.load(f)
+                self.regions = [normalize_region_entry(r) for r in raw]
         except Exception:
             self.regions = []
+        self.regions_phys = []
+        for r in self.regions:
+            px, py, pw, ph = normalized_to_physical(r)
+            self.regions_phys.append({'type': r.get('type', 'red'), 'x': px, 'y': py, 'w': pw, 'h': ph})
         now_ts = time.time()
         self.start_ts = now_ts
         self.last_update_time = [now_ts] * len(self.regions)
@@ -1289,7 +1388,7 @@ class OcrWorker(threading.Thread):
                     pass
         return None
 
-    def submit_frame(self, frame_id, frame):
+    def submit_frame(self, frame_id, frame, frame_interval_ms):
         if not self.running:
             return
         try:
@@ -1298,7 +1397,7 @@ class OcrWorker(threading.Thread):
         except queue.Empty:
             pass
         try:
-            self.q.put_nowait((frame_id, frame))
+            self.q.put_nowait((frame_id, frame, frame_interval_ms))
         except queue.Full:
             pass
 
@@ -1322,11 +1421,13 @@ class OcrWorker(threading.Thread):
             snap['ages'] = [max(0, int((ref_time - t) * 1000)) for t in self.last_update_time]
         return snap
 
-    def process_frame(self, frame_id, frame):
+    def process_frame(self, frame_id, frame, frame_interval_ms):
         now = time.time()
+        start_time = time.time()
+        allowed_ms = max(frame_interval_ms * 3.0, 1.0)
         ocr_vals = []
         ocr_types = []
-        if not self.regions:
+        if not self.regions_phys:
             with self.lock:
                 ts_ms = int(now * 1000)
                 snap = {'values': [], 'ages': [], 'types': [], 'frame_id': frame_id, 'ts': ts_ms}
@@ -1334,23 +1435,10 @@ class OcrWorker(threading.Thread):
             return
 
         frame_h, frame_w = frame.shape[:2]
-        
-        # 获取 DPI 缩放比例
-        screen = QApplication.primaryScreen()
-        dpr = screen.devicePixelRatio() if screen else 1.0
-        
-        # 此时 frame 来自 MSS，是物理像素
-        # regions 中的坐标是 Qt 逻辑像素
-        # 转换比例 = 物理分辨率 / 逻辑分辨率 * 逻辑坐标
-        # 但通常直接用 dpr 乘即可：x_phys = x_qt * dpr
-        
-        for idx, r in enumerate(self.regions):
+
+        for idx, r in enumerate(self.regions_phys):
             try:
-                # 坐标变换：逻辑 -> 物理
-                px = int(r['x'] * dpr)
-                py = int(r['y'] * dpr)
-                pw = max(1, int(r['w'] * dpr))
-                ph = max(1, int(r['h'] * dpr))
+                px, py, pw, ph = r['x'], r['y'], r['w'], r['h']
                 
                 # 边界检查
                 x1 = max(0, min(px, frame_w - 1))
@@ -1377,7 +1465,11 @@ class OcrWorker(threading.Thread):
             except Exception:
                 ocr_vals.append(0.0)
                 ocr_types.append('obs')
-        
+
+            elapsed_ms = (time.time() - start_time) * 1000.0
+            if elapsed_ms > allowed_ms:
+                return
+
         with self.lock:
             ts_ms = int(now * 1000)
             ages = [max(0, int((now - t) * 1000)) for t in self.last_update_time] if self.last_update_time else []
@@ -1387,8 +1479,8 @@ class OcrWorker(threading.Thread):
     def run(self):
         while self.running:
             try:
-                frame_id, frame = self.q.get(timeout=0.1)
-                self.process_frame(frame_id, frame)
+                frame_id, frame, frame_interval_ms = self.q.get(timeout=0.1)
+                self.process_frame(frame_id, frame, frame_interval_ms)
             except queue.Empty:
                 continue
             except Exception:
@@ -1445,6 +1537,7 @@ class DataWorker(QThread):
         self.prev_pos = None
         self.prev_vel = (0.0, 0.0)
         self.prev_time = None
+        self.prev_frame_ts = None
         self.dynamic_delay = 0.0
         self.reload_regions()
 
@@ -1515,6 +1608,10 @@ class DataWorker(QThread):
                 if self.prev_time is None:
                     self.prev_time = now
                 dt = max(now - self.prev_time, 1e-3)
+                frame_interval_ms = 16.0
+                if self.prev_frame_ts is not None:
+                    frame_interval_ms = max(1.0, float(frame_ts - self.prev_frame_ts))
+                self.prev_frame_ts = frame_ts
                 vel_x = (mx - (self.prev_pos[0] if self.prev_pos else mx)) / dt
                 vel_y = (my - (self.prev_pos[1] if self.prev_pos else my)) / dt
                 acc_x = (vel_x - self.prev_vel[0]) / dt
@@ -1535,7 +1632,7 @@ class DataWorker(QThread):
                 self.prev_vel = (vel_x, vel_y)
                 self.prev_time = now
                 if self.ocr_worker is not None:
-                    self.ocr_worker.submit_frame(frame_id, full_img)
+                    self.ocr_worker.submit_frame(frame_id, full_img, frame_interval_ms)
                     snapshot = self.ocr_worker.get_for_timestamp(frame_ts)
                 else:
                     snapshot = {'values': [], 'ages': [], 'types': [], 'frame_id': None}
@@ -1800,6 +1897,7 @@ class Overlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setGeometry(SCREEN_LEFT, SCREEN_TOP, SCREEN_W, SCREEN_H)
         self.regions = []
+        self.regions_norm = []
         self.values = []
         self.colors = {
             'red': QColor(255, 50, 50),
@@ -1810,15 +1908,20 @@ class Overlay(QWidget):
     def reload(self):
         try:
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
-                self.regions = json.load(f)
-            self.values = [0] * len(self.regions)
+                raw = json.load(f)
+                self.regions_norm = [normalize_region_entry(r) for r in raw]
+            self.regions = []
+            for r in self.regions_norm:
+                x, y, w, h = normalized_to_logical(r)
+                self.regions.append({'type': r.get('type', 'red'), 'x': x, 'y': y, 'w': w, 'h': h})
+            self.values = [0] * len(self.regions_norm)
         except:
             self.regions = []
         self.update()
 
     def update_vals(self, vals):
         payload = vals.get('values', []) if isinstance(vals, dict) else vals
-        if len(payload) == len(self.regions):
+        if len(payload) == len(self.regions_norm):
             self.values = payload
             self.update()
 
@@ -1847,14 +1950,18 @@ class RegionEditor(QDialog):
         self.setCursor(Qt.CrossCursor)
         self.regions = []
         self.modified = False
-        self.original_regions = []
+        self.original_norm = []
         self.current_type = 'red'
         self.start_p = None
         self.temp_rect = None
         try:
             with open(REGION_FILE, 'r', encoding='utf-8') as f:
-                self.regions = json.load(f)
-                self.original_regions = json.loads(json.dumps(self.regions))
+                raw = json.load(f)
+                self.original_norm = [normalize_region_entry(r) for r in raw]
+                self.regions = []
+                for r in self.original_norm:
+                    x, y, w, h = normalized_to_logical(r)
+                    self.regions.append({'type': r.get('type', 'red'), 'x': x, 'y': y, 'w': w, 'h': h})
         except: pass
 
     def finalize_temp_rect(self):
@@ -1870,9 +1977,10 @@ class RegionEditor(QDialog):
 
     def save_and_exit(self):
         self.finalize_temp_rect()
-        if self.modified or self.regions != self.original_regions:
+        normalized = [logical_to_normalized(r) for r in self.regions]
+        if self.modified or normalized != self.original_norm:
             with open(REGION_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.regions, f)
+                json.dump(normalized, f)
         self.accept()
         
     def paintEvent(self, event):
@@ -2182,6 +2290,7 @@ class MainWin(QMainWindow):
                 self.dragging = False
                 self.mode = "LEARNING"
                 self.stop_flag.set()
+            self.cleanup_state_transition()
             self.update_mode()
         else:
             if self.mode == "TRAINING":
@@ -2193,6 +2302,7 @@ class MainWin(QMainWindow):
                 self.mode = "LEARNING"
                 self.stop_flag.set()
                 self.update_mode()
+                self.cleanup_state_transition()
 
     def do_select(self):
         if self.mode != "LEARNING": return
@@ -2214,6 +2324,7 @@ class MainWin(QMainWindow):
         batch_size = 16
         self.ocr_forced_cpu = True
         self.mode = "OPTIMIZING"
+        reclaim_memory()
         self.update_mode()
         self.worker.set_paused(True)
         self.bar.show()
@@ -2234,6 +2345,7 @@ class MainWin(QMainWindow):
         QMessageBox.information(self, "完成", "神经网络优化完成。")
         self.mode = "LEARNING"
         self.update_mode()
+        reclaim_memory()
 
     def update_mode(self):
         txt = "学习模式"
@@ -2246,6 +2358,9 @@ class MainWin(QMainWindow):
             c = "#ffff00"
         self.mode_lbl.setText(f"模式: {txt}")
         self.mode_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {c};")
+
+    def cleanup_state_transition(self):
+        reclaim_memory()
 
     def update_opt_status(self, text):
         self.bar.setFormat(f"{text} - %p%")
@@ -2503,6 +2618,7 @@ class MainWin(QMainWindow):
         return super().eventFilter(obj, event)
 
 if __name__ == "__main__":
+    set_high_priority()
     app = QApplication(sys.argv)
     w = MainWin()
     w.show()
