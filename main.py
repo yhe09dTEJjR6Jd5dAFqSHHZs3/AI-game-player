@@ -5,6 +5,7 @@ import json
 import lmdb
 import math
 import random
+import hashlib
 import re
 import threading
 import queue
@@ -1091,13 +1092,19 @@ class OptimizerThread(QThread):
 
         model = Brain().to(DEVICE)
         weight_path = os.path.join(MODEL_DIR, "brain.pth")
+        opt = optim.AdamW(model.parameters(), lr=8e-4)
         if os.path.exists(weight_path):
             try:
-                model.load_state_dict(torch.load(weight_path, map_location=DEVICE))
-            except:
+                loaded = torch.load(weight_path, map_location=DEVICE)
+                if isinstance(loaded, dict) and 'model' in loaded:
+                    model.load_state_dict(loaded.get('model', {}))
+                    opt_state = loaded.get('optimizer')
+                    if opt_state:
+                        opt.load_state_dict(opt_state)
+                else:
+                    model.load_state_dict(loaded)
+            except Exception:
                 pass
-
-        opt = optim.AdamW(model.parameters(), lr=8e-4)
         reg_loss = nn.SmoothL1Loss(reduction='none')
         bce = nn.BCEWithLogitsLoss(reduction='none')
 
@@ -1189,7 +1196,7 @@ class OptimizerThread(QThread):
             self.progress_sig.emit(int((ep + 1) / epochs * 100))
 
         tmp_path = weight_path + '.tmp'
-        torch.save(model.state_dict(), tmp_path)
+        torch.save({'model': model.state_dict(), 'optimizer': opt.state_dict()}, tmp_path)
         os.replace(tmp_path, weight_path)
         ds.flush_priorities(force=True)
         self.status_sig.emit("优化完成")
@@ -1206,6 +1213,17 @@ class SaveWorker(threading.Thread):
         self.last_flush = time.time()
         self.env = lmdb.open(LOG_DB, map_size=POOL_MAX_BYTES * 4, subdir=True, max_dbs=1, lock=True)
         self.next_id = read_index_value(self.env)
+        self.last_frame_hash = None
+        self.last_mouse_state = None
+        self.last_saved_ts = None
+
+    def _frame_hash(self, img):
+        try:
+            small = cv2.resize(img, (32, 18))
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            return hashlib.sha1(gray.tobytes()).digest()
+        except Exception:
+            return None
 
     def enqueue(self, img, meta):
         if self.q.full():
@@ -1214,6 +1232,16 @@ class SaveWorker(threading.Thread):
                 self.q.task_done()
             except queue.Empty:
                 return
+        frame_hash = self._frame_hash(img)
+        ts = int(meta.get('ts', time.time() * 1000))
+        mouse_state = (meta.get('mx'), meta.get('my'), meta.get('click'))
+        if frame_hash is not None and self.last_frame_hash is not None and self.last_mouse_state is not None and self.last_saved_ts is not None:
+            if frame_hash == self.last_frame_hash and mouse_state == self.last_mouse_state and ts - self.last_saved_ts <= 500:
+                return
+        if frame_hash is not None:
+            self.last_frame_hash = frame_hash
+            self.last_mouse_state = mouse_state
+            self.last_saved_ts = ts
         try:
             self.q.put_nowait((img, meta))
         except queue.Full:
@@ -2147,7 +2175,12 @@ class MainWin(QMainWindow):
         path = os.path.join(MODEL_DIR, "brain.pth")
         if os.path.exists(path):
             try:
-                self.brain.load_state_dict(torch.load(path, map_location=DEVICE))
+                loaded = torch.load(path, map_location=DEVICE)
+                if isinstance(loaded, dict) and 'model' in loaded:
+                    state = loaded.get('model', {})
+                else:
+                    state = loaded
+                self.brain.load_state_dict(state)
                 self.brain.eval()
                 self.update_status_text("模型加载成功")
             except Exception as e:
