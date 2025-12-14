@@ -142,6 +142,7 @@ class CtypesMouse:
         self.MOUSEEVENTF_ABSOLUTE = 0x8000
         self.MOUSEEVENTF_LEFTDOWN = 0x0002
         self.MOUSEEVENTF_LEFTUP = 0x0004
+        self.MOUSEEVENTF_WHEEL = 0x0800
         self.POINT = wintypes.POINT
         self.SM_XVIRTUALSCREEN = 76
         self.SM_YVIRTUALSCREEN = 77
@@ -190,9 +191,14 @@ class CtypesMouse:
             self.vscreen_w = SCREEN_W
             self.vscreen_h = SCREEN_H
 
-    def _send(self, dx, dy, flags):
+    def scroll(self, dx, dy):
+        delta = int(max(-1200, min(1200, dy * 120)))
+        if delta != 0:
+            self._send(0, 0, self.MOUSEEVENTF_WHEEL, delta)
+
+    def _send(self, dx, dy, flags, data=0):
         extra = self.ctypes.c_ulong(0)
-        mi = self.MOUSEINPUT(dx, dy, 0, flags, 0, self.ctypes.pointer(extra))
+        mi = self.MOUSEINPUT(dx, dy, data, flags, 0, self.ctypes.pointer(extra))
         inp = self.INPUT(self.INPUT_MOUSE, self.INPUTUNION(mi))
         self.user32.SendInput(1, self.ctypes.byref(inp), self.ctypes.sizeof(self.INPUT))
 
@@ -224,6 +230,15 @@ class InputController:
     def release(self, button):
         try:
             self.backend.release(button)
+        except Exception:
+            pass
+
+    def scroll(self, dx, dy):
+        try:
+            if hasattr(self.backend, 'scroll'):
+                self.backend.scroll(dx, dy)
+            elif isinstance(self.backend, CtypesMouse):
+                self.backend.scroll(dx, dy)
         except Exception:
             pass
 
@@ -387,6 +402,7 @@ class PoolCacheManager:
                     try:
                         ts = int(meta.get('ts', 0))
                         mx, my, click = float(meta.get('mx', 0.0)), float(meta.get('my', 0.0)), float(meta.get('click', 0.0))
+                        scroll = float(meta.get('scroll', 0.0))
                         ocr_vals = [float(x) for x in meta.get('ocr', [])]
                         ocr_age = [float(x) for x in meta.get('ocr_age', [])]
                         novelty = float(meta.get('novelty', 0.0))
@@ -401,7 +417,7 @@ class PoolCacheManager:
                             self.prev_vals = [0] * len(region_types)
                         deltas = [cur_vals[i] - (self.prev_vals[i] if i < len(self.prev_vals) else 0) for i in range(len(region_types))]
                         self.prev_vals = cur_vals
-                    weight = ExperiencePool.calc_weight_static(region_types, ocr_vals, deltas, click, novelty, complexity, pred_err)
+                    weight = ExperiencePool.calc_weight_static(region_types, ocr_vals, deltas, click, scroll, novelty, complexity, pred_err)
                     item_id = decode_key(cur.key())
                     entry = {'ts': ts, 'weight': weight, 'size': 128, 'id': item_id}
                     meta_payload = {
@@ -410,6 +426,7 @@ class PoolCacheManager:
                         'mx': mx,
                         'my': my,
                         'click': click,
+                        'scroll': scroll,
                         'ocr_vals': ocr_vals,
                         'ocr_age': ocr_age,
                         'prediction_error': pred_err
@@ -679,6 +696,8 @@ class Brain(nn.Module):
         self.layer1 = self._make_layer(32, 64, 2, stride=2)
         self.layer2 = self._make_layer(64, 128, 2, stride=2)
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
+        self.visual_attn = nn.Sequential(nn.Conv2d(256, 128, 1), nn.SiLU(), nn.Conv2d(128, 1, 1))
+        self.channel_attn = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Conv2d(256, 64, 1), nn.SiLU(), nn.Conv2d(64, 256, 1), nn.Sigmoid())
         self.avg = nn.AdaptiveAvgPool2d((1, 1))
         self.ocr_enc = nn.Sequential(nn.Linear(MAX_OCR*3, 128), nn.SiLU(), nn.Linear(128, 64), nn.SiLU())
         self.ocr_attn = nn.MultiheadAttention(64, 4, batch_first=True)
@@ -687,7 +706,7 @@ class Brain(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(256, 128),
             nn.SiLU(),
-            nn.Linear(128, 3)
+            nn.Linear(128, 4)
         )
         self.delta_head = nn.Sequential(nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 2), nn.Tanh())
 
@@ -704,6 +723,9 @@ class Brain(nn.Module):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
+        spatial_mask = torch.sigmoid(self.visual_attn(x))
+        channel_mask = self.channel_attn(x)
+        x = x * (1.0 + spatial_mask) * channel_mask
         x = self.avg(x)
         x = torch.flatten(x, 1).view(b, t, -1)
         ocr_feat = self.ocr_enc(ocr)
@@ -716,7 +738,8 @@ class Brain(nn.Module):
         logits = self.fc(feat)
         pos = torch.sigmoid(logits[:, :2])
         click_logit = logits[:, 2:3]
-        return torch.cat([pos, click_logit], dim=1), dirs, self.delta_head(feat)
+        scroll_val = torch.tanh(logits[:, 3:4])
+        return torch.cat([pos, click_logit, scroll_val], dim=1), dirs, self.delta_head(feat)
 
 class SumTree:
     def __init__(self, capacity):
@@ -896,12 +919,12 @@ class ExperiencePool(Dataset):
         scaled = (base * (float(self.priorities[idx]) + 1e-3)) ** 1.2
         return float(max(scaled, 1e-3))
 
-    def calc_weight(self, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0, prediction_error=0.0):
-        return ExperiencePool.calc_weight_static(self.region_types, ocr, deltas, click, novelty, complexity, prediction_error)
+    def calc_weight(self, ocr, deltas, click=0.0, scroll=0.0, novelty=0.0, complexity=0.0, prediction_error=0.0):
+        return ExperiencePool.calc_weight_static(self.region_types, ocr, deltas, click, scroll, novelty, complexity, prediction_error)
 
     @staticmethod
-    def calc_weight_static(region_types, ocr, deltas, click=0.0, novelty=0.0, complexity=0.0, prediction_error=0.0):
-        action_boost = 1.0 + 1.5 * abs(click)
+    def calc_weight_static(region_types, ocr, deltas, click=0.0, scroll=0.0, novelty=0.0, complexity=0.0, prediction_error=0.0):
+        action_boost = 1.0 + 1.5 * abs(click) + 0.8 * min(abs(scroll), 1.0)
         novelty = float(clamp01(novelty))
         complexity = float(clamp01(complexity))
         novelty_boost = 1.0 + 2.0 * novelty
@@ -994,6 +1017,7 @@ class ExperiencePool(Dataset):
                     'mx': float(meta.get('mx', 0.0)),
                     'my': float(meta.get('my', 0.0)),
                     'click': float(meta.get('click', 0.0)),
+                    'scroll': float(meta.get('scroll', 0.0)),
                     'ocr_vals': [float(x) for x in meta.get('ocr', [])],
                     'ocr_age': [float(x) for x in meta.get('ocr_age', [])],
                     'prediction_error': float(meta.get('prediction_error', 0.0))
@@ -1016,7 +1040,7 @@ class ExperiencePool(Dataset):
             seq_ocr.append(pack_ocr([]))
         prev_vals = [0.0] * len(self.region_types)
         for j in range(start, idx + 1):
-            meta = self.fetch_meta(j) or {'id': self.data[j].get('id'), 'ts': self.data[j].get('ts', 0), 'mx': 0.0, 'my': 0.0, 'click': 0.0, 'ocr_vals': [], 'ocr_age': []}
+            meta = self.fetch_meta(j) or {'id': self.data[j].get('id'), 'ts': self.data[j].get('ts', 0), 'mx': 0.0, 'my': 0.0, 'click': 0.0, 'scroll': 0.0, 'ocr_vals': [], 'ocr_age': []}
             img = self.cache_image(meta)
             img = self.augment_image(img)
             seq_imgs.append(img)
@@ -1026,8 +1050,8 @@ class ExperiencePool(Dataset):
             prev_vals = padded_vals
             seq_ocr.append(pack_ocr(cur_vals, deltas, meta.get('ocr_age', [])))
 
-        meta_idx = self.fetch_meta(idx) or {'id': self.data[idx].get('id'), 'ts': self.data[idx].get('ts', 0), 'mx': 0.0, 'my': 0.0, 'click': 0.0, 'ocr_vals': [], 'ocr_age': []}
-        mx, my, click = meta_idx.get('mx', 0.0), meta_idx.get('my', 0.0), meta_idx.get('click', 0.0)
+        meta_idx = self.fetch_meta(idx) or {'id': self.data[idx].get('id'), 'ts': self.data[idx].get('ts', 0), 'mx': 0.0, 'my': 0.0, 'click': 0.0, 'scroll': 0.0, 'ocr_vals': [], 'ocr_age': []}
+        mx, my, click, scroll = meta_idx.get('mx', 0.0), meta_idx.get('my', 0.0), meta_idx.get('click', 0.0), meta_idx.get('scroll', 0.0)
         prev_meta = self.fetch_meta(idx - 1) if idx > 0 else meta_idx
         if prev_meta is None:
             prev_meta = meta_idx
@@ -1050,7 +1074,7 @@ class ExperiencePool(Dataset):
         recency_weight = math.pow(0.999, age_hours)
         base_weight = self.data[idx].get('weight', 1.0)
         w = torch.tensor(base_weight * recency_weight, dtype=torch.float32)
-        return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w, torch.tensor(idx, dtype=torch.long)
+        return torch.tensor(np.stack(seq_imgs), dtype=torch.float32), torch.tensor(np.stack(seq_ocr), dtype=torch.float32), torch.tensor([mx, my, click, scroll], dtype=torch.float32), torch.tensor(direction, dtype=torch.long), delta_target, w, torch.tensor(idx, dtype=torch.long)
 
     def augment_image(self, img):
         if random.random() < 0.5:
@@ -1161,9 +1185,10 @@ class OptimizerThread(QThread):
                         out, logits, delta_out = model(imgs, ocrs)
                         l_pos = reg_loss(out[:, :2], targs[:, :2]).mean(dim=1)
                         l_click = bce(out[:, 2], targs[:, 2])
+                        l_scroll = reg_loss(out[:, 3], targs[:, 3]).mean(dim=1)
                         l_dir = F.cross_entropy(logits, dirs, reduction='none')
                         l_delta = reg_loss(delta_out, delta_t).mean(dim=1)
-                        comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta
+                        comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta + 0.4 * l_scroll
                         loss = (comb * ws).sum() / (ws.sum() + 1e-6)
                     scaler.scale(loss / accum_steps).backward()
                     if (step + 1) % accum_steps == 0 or step == steps - 1:
@@ -1173,9 +1198,10 @@ class OptimizerThread(QThread):
                     out, logits, delta_out = model(imgs, ocrs)
                     l_pos = reg_loss(out[:, :2], targs[:, :2]).mean(dim=1)
                     l_click = bce(out[:, 2], targs[:, 2])
+                    l_scroll = reg_loss(out[:, 3], targs[:, 3]).mean(dim=1)
                     l_dir = F.cross_entropy(logits, dirs, reduction='none')
                     l_delta = reg_loss(delta_out, delta_t).mean(dim=1)
-                    comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta
+                    comb = l_pos + l_click + 0.5 * l_dir + 0.3 * l_delta + 0.4 * l_scroll
                     loss = (comb * ws).sum() / (ws.sum() + 1e-6)
                     (loss / accum_steps).backward()
                     if (step + 1) % accum_steps == 0 or step == steps - 1:
@@ -1234,7 +1260,7 @@ class SaveWorker(threading.Thread):
                 return
         frame_hash = self._frame_hash(img)
         ts = int(meta.get('ts', time.time() * 1000))
-        mouse_state = (meta.get('mx'), meta.get('my'), meta.get('click'))
+        mouse_state = (meta.get('mx'), meta.get('my'), meta.get('click'), meta.get('scroll'))
         if frame_hash is not None and self.last_frame_hash is not None and self.last_mouse_state is not None and self.last_saved_ts is not None:
             if frame_hash == self.last_frame_hash and mouse_state == self.last_mouse_state and ts - self.last_saved_ts <= 500:
                 return
@@ -1631,7 +1657,7 @@ class DataWorker(QThread):
                 continue
             try:
                 data = self.queue.get(timeout=0.1)
-                full_img, small_img, frame_id, frame_ts, mx, my, click, source, save, prediction_error = data
+                full_img, small_img, frame_id, frame_ts, mx, my, click, scroll_val, source, save, prediction_error = data
                 now = time.time()
                 if self.prev_time is None:
                     self.prev_time = now
@@ -1681,6 +1707,7 @@ class DataWorker(QThread):
                         'mx': mx,
                         'my': my,
                         'click': click,
+                        'scroll': scroll_val,
                         'source': source,
                         'ocr': [float(v) for v in ocr_vals],
                         'ocr_age': [float(a) for a in ocr_ages],
@@ -1799,6 +1826,7 @@ class InferenceThread(QThread):
             mx, my = w.mouse.position
             nx, ny = screen_to_letter_norm(mx, my)
             click = 1.0 if w.mouse_pressed else 0.0
+            scroll_val = w.consume_scroll()
             source = "USER"
             prediction_error = 0.0
 
@@ -1822,6 +1850,9 @@ class InferenceThread(QThread):
 
                 px, py = out[0, :2].cpu().numpy()
                 pc = float(torch.sigmoid(out[0, 2]).cpu())
+                w.ai_scroll_state *= 0.9
+                scroll_pred = float(out[0, 3].cpu()) if out.shape[1] > 3 else 0.0
+                w.ai_scroll_state = 0.85 * w.ai_scroll_state + 0.15 * scroll_pred
                 delta_pred = delta_out[0].cpu().numpy()
                 dx, dy = float(delta_pred[0]), float(delta_pred[1])
                 base_x, base_y = clamp01(float(px)), clamp01(float(py))
@@ -1849,6 +1880,10 @@ class InferenceThread(QThread):
                 if w.stop_flag.is_set() or w.mode != "TRAINING":
                     return
                 w.mouse.position = (int(sx), int(sy))
+                scroll_steps = int(round(max(-1.0, min(1.0, w.ai_scroll_state)) * 3))
+                scroll_val = scroll_steps / 3.0 if scroll_steps != 0 else 0.0
+                if scroll_steps != 0:
+                    w.mouse.scroll(0, scroll_steps)
                 now = time.time()
                 if pc >= w.press_thresh:
                     w.press_frames += 1
@@ -1898,7 +1933,7 @@ class InferenceThread(QThread):
                 except queue.Empty:
                     pass
             try:
-                w.queue.put_nowait((frame, small, frame_id, frame_ts, nx, ny, click, source, save, prediction_error))
+                w.queue.put_nowait((frame, small, frame_id, frame_ts, nx, ny, click, scroll_val, source, save, prediction_error))
             except queue.Full:
                 pass
 
@@ -2108,6 +2143,8 @@ class MainWin(QMainWindow):
         self.dragging = False
         self.last_record = 0
         self.mouse_pressed = False
+        self.scroll_accum = 0.0
+        self.ai_scroll_state = 0.0
         self.latest_ocr = pack_ocr([])
         self.prev_ocr_vals = [0]*MAX_OCR
         self.seq_frames = deque(maxlen=SEQ_LEN)
@@ -2288,11 +2325,17 @@ class MainWin(QMainWindow):
     def setup_listeners(self):
         self.k_listen = keyboard.Listener(on_press=self.on_key)
         self.k_listen.start()
-        self.m_listen = mouse.Listener(on_click=self.on_click)
+        self.m_listen = mouse.Listener(on_click=self.on_click, on_scroll=self.on_scroll)
         self.m_listen.start()
 
     def on_click(self, x, y, b, p):
         self.click_signal.emit(b, p)
+
+    def on_scroll(self, x, y, dx, dy):
+        try:
+            self.scroll_accum += float(dy)
+        except Exception:
+            self.scroll_accum = 0.0
 
     def on_key(self, key):
         self.key_signal.emit(key)
@@ -2302,6 +2345,12 @@ class MainWin(QMainWindow):
             self.mouse_pressed = True
         elif not p and b == mouse.Button.left:
             self.mouse_pressed = False
+
+    def consume_scroll(self):
+        steps = int(round(self.scroll_accum))
+        self.scroll_accum -= steps
+        steps = max(-3, min(3, steps))
+        return steps / 3.0 if steps != 0 else 0.0
 
     def handle_key_event(self, key):
         if key == keyboard.Key.esc:
@@ -2394,6 +2443,8 @@ class MainWin(QMainWindow):
 
     def cleanup_state_transition(self):
         reclaim_memory()
+        self.ai_scroll_state = 0.0
+        self.scroll_accum = 0.0
 
     def update_opt_status(self, text):
         self.bar.setFormat(f"{text} - %p%")
